@@ -1,0 +1,448 @@
+Here is the enhanced prompt, integrating extensive, developer-focused logging while preserving the human-readable reasoning monologue.
+
+The key change is the introduction of a `logging.Logger` object that is injected into the `Agent` and then passed to the `ToolBelt`. This allows for a detailed, technical log stream (for debugging and auditing) that operates *in parallel* to the high-level, narrative `reasoning_monologue` (for the user).
+
+-----
+
+### 🤖 Cursor Prompt:
+
+"Hello Cursor,
+
+I need to build a sophisticated, multi-problem agent system in Python. This agent must be able to solve complex, multi-hop problems requiring **multimodal inputs** (images, audio, text), **deep file parsing** (PDF, Excel, .txt), and **complex logical reasoning** (math, riddles, data filtering).
+
+The agent's design must support two distinct types of output:
+
+1.  **Reasoning Monologue:** A human-readable, first-person "chain-of-thought" narrative.
+2.  **Extensive Logging:** A detailed, developer-facing log stream for debugging, auditing, and tracing every tool call and internal decision.
+
+### 🧠 Core Philosophy
+
+The agent's "brain" is a **planner**. It solves problems by breaking them down and orchestrating a set of powerful tools. It uses tools for two primary purposes:
+
+1.  **Data Retrieval:** Getting information it doesn't have (e.g., `search`, `read_attachment`, `get_structured_data`).
+2.  **Data Processing:** Performing complex logic, math, or data manipulation (e.g., `code_interpreter`).
+
+The `reasoning_monologue` is the *narrative* of this plan. The `logger` is the *verbatim trace* of its execution.
+
+### 🏗️ Core Architecture
+
+#### 1\. System Components
+
+```python
+import logging
+
+# Required Classes and Their Relationships
+Agent
+├── logger (logging.Logger instance)
+├── ToolBelt (composition)
+│   ├── logger (passed from Agent)
+│   ├── code_interpreter()
+│   ├── search()
+│   ├── read_attachment()
+│   ├── analyze_media()
+│   └── get_structured_data()
+└── solve() method
+
+# Required Data Classes
+@dataclass Attachment
+@dataclass SearchResult
+@dataclass RevisionData
+```
+
+#### 2\. Primary Agent Class
+
+```python
+import logging
+from typing import tuple, List, Optional
+
+class Agent:
+    def __init__(self, tool_belt: 'ToolBelt', logger: logging.Logger):
+        """
+        Initialize the Agent with a ToolBelt and a logger.
+        
+        Args:
+            tool_belt: An instance of the ToolBelt.
+            logger: A pre-configured logging.Logger instance.
+        """
+        self.tool_belt = tool_belt
+        self.logger = logger
+        # Pass the logger to the toolbelt for unified logging
+        self.tool_belt.set_logger(logger)
+        
+    def solve(self, problem: str, attachments: List[Attachment] | None = None) -> tuple[str, str]:
+        """
+        Solves a complex problem using tools and a step-by-step reasoning process.
+        
+        Logs its operations to the logger and builds a human-readable monologue.
+        
+        Args:
+            problem: The natural language problem description.
+            attachments: An optional list of file attachments (images, PDFs, etc.).
+            
+        Returns:
+            A tuple containing:
+            (final_answer: str, reasoning_monologue: str)
+        """
+        self.logger.info(f"--- New Problem Received ---")
+        self.logger.info(f"Problem: {problem}")
+        if attachments:
+            self.logger.info(f"Attachments: {[a.filename for a in attachments]}")
+        
+        # The agent's reasoning loop will be implemented here.
+        # It will build the `reasoning_monologue` string step-by-step.
+        # e.g., monologue_steps.append("## Initiating Breakdown\n...")
+        # e.g., self.logger.info("Phase changed to: Initiating Breakdown")
+        
+        monologue = "## Initiating Breakdown\nI am analyzing the request... (monologue)"
+        final_answer = "[Stub] Final Answer"
+        
+        self.logger.info(f"Problem solved. Returning answer.")
+        return (final_answer, monologue)
+```
+
+#### 3\. Data Models
+
+```python
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+
+@dataclass
+class Attachment:
+    """Represents a file attachment provided by the user."""
+    filename: str  # e.g., "document.pdf", "image.png"
+    data: bytes    # Raw file content
+    metadata: dict = field(default_factory=dict)  # Optional metadata
+
+@dataclass
+class SearchResult:
+    """Represents a single web search result."""
+    snippet: str   # Text snippet from the result
+    url: str       # The source URL
+    title: str     # The page title
+    relevance_score: float = 0.0  # Optional relevance score
+
+@dataclass
+class RevisionData:
+    """Represents metadata for a single Wikipedia revision."""
+    timestamp: datetime
+    editor: str
+    tags: list[str]
+    comment: str
+    revision_id: str = ""  # Optional revision ID
+```
+
+-----
+
+### 🔧 ToolBelt Specifications
+
+Please create a `ToolBelt` class with the following **placeholder/stub methods**. Each method must include `self.logger` calls for `INFO`, `DEBUG`, and `ERROR` states.
+
+```python
+import logging
+
+class ToolBelt:
+    def __init__(self):
+        """Initializes the ToolBelt. A logger will be set via set_logger()."""
+        # Default to a null logger to prevent errors if not set
+        self.logger = logging.getLogger('null')
+
+    def set_logger(self, logger: logging.Logger):
+        """Receives and sets the logger from the Agent."""
+        self.logger = logger
+        self.logger.info("ToolBelt logger initialized.")
+
+    def code_interpreter(self, python_code: str, context: dict = None) -> str:
+        """
+        Executes Python code in a sandboxed environment.
+        This is the primary tool for all math, logic, and complex data processing.
+        """
+        self.logger.info("Tool 'code_interpreter' called.")
+        self.logger.debug(f"Executing code snippet: {python_code[:150]}...")
+        
+        try:
+            # STUB: Mock execution
+            if "Reward = New_FD_in_Pile_A * 2" in python_code:
+                result = "28"
+            elif "datetime.datetime(2020, 1, 1)" in python_code:
+                result = "42"
+            elif "pdfplumber" in python_code:
+                result = "Figure 54-A: Anatomy of the common frog..."
+            else:
+                result = "[STUB] Code executed successfully."
+            
+            self.logger.info(f"Code executed successfully. Output: {result[:100]}...")
+            return result
+        except Exception as e:
+            self.logger.error(f"Code execution FAILED: {e}", exc_info=True)
+            return f"Error: {e}"
+
+    def search(self, query: str, num_results: int = 5, search_type: str = "web") -> List[SearchResult]:
+        """
+        Performs a web or specialized search.
+        """
+        self.logger.info(f"Tool 'search' called (type: {search_type}).")
+        self.logger.debug(f"Search query: {query}")
+        
+        try:
+            # STUB: Return mock search results
+            results = []
+            if "Ruth Lawson" in query:
+                results = [SearchResult(
+                    snippet="...Anatomy and Physiology of Animals by Ruth Lawson...",
+                    url="https://example.com/lawson_animal_book.pdf",
+                    title="Anatomy and Physiology of Animals - PDF"
+                )]
+            elif "Red-Eyed Tree Frog" in query:
+                results = [SearchResult(
+                    snippet="The red-eyed tree frog (Agalychnis callidryas) is a species of... ",
+                    url="https://en.wikipedia.org/wiki/Red-eyed_tree_frog",
+                    title="Red-eyed tree frog - Wikipedia"
+                )]
+            
+            self.logger.info(f"Search returned {len(results)} result(s).")
+            return results
+        except Exception as e:
+            self.logger.error(f"Search FAILED: {e}", exc_info=True)
+            return []
+
+    def read_attachment(self, attachment: Attachment, options: dict = None) -> str:
+        """
+        Smart file reader that extracts text from various common formats.
+        """
+        self.logger.info(f"Tool 'read_attachment' called for: {attachment.filename}")
+        self.logger.debug(f"Read options: {options}")
+        
+        try:
+            # STUB: Mock text extraction
+            if ".pdf" in attachment.filename and options and options.get("page_range") == [54, 54]:
+                result = "Figure 54-A: Anatomy of the common frog. Text about frog dissection..."
+            elif ".txt" in attachment.filename:
+                result = attachment.data.decode('utf-8')
+            else:
+                result = f"[STUB] Full text content of {attachment.filename}"
+                
+            self.logger.info(f"Successfully read {attachment.filename}. Content length: {len(result)}")
+            return result
+        except Exception as e:
+            self.logger.error(f"Failed to read attachment {attachment.filename}: {e}", exc_info=True)
+            return f"Error: Failed to read {attachment.filename}"
+
+    def analyze_media(self, attachment: Attachment, analysis_type: str = "auto") -> str:
+        """
+        Analyzes non-text media files (images, audio, video) using ML models.
+        """
+        self.logger.info(f"Tool 'analyze_media' called for: {attachment.filename} (type: {analysis_type})")
+        
+        try:
+            # STUB: Return a mock description
+            if "e14448e9" in attachment.filename:
+                result = "A high-resolution photo of a Red-Eyed Tree Frog (Agalychnis callidryas) clinging to a green leaf."
+            else:
+                result = f"[STUB] Detailed description of {attachment.filename}"
+                
+            self.logger.info(f"Media analysis complete. Result: {result[:70]}...")
+            return result
+        except Exception as e:
+            self.logger.error(f"Media analysis FAILED for {attachment.filename}: {e}", exc_info=True)
+            return f"Error: Failed to analyze {attachment.filename}"
+
+    def get_structured_data(self, api_name: str, **kwargs) -> Any:
+        """
+        Accesses specialized external APIs for structured data.
+        """
+        self.logger.info(f"Tool 'get_structured_data' called for API: {api_name}")
+        self.logger.debug(f"API parameters: {kwargs}")
+        
+        try:
+            # STUB: Return mock API data
+            if api_name == 'wikipedia_revisions' and kwargs.get('page_title') == 'Red-eyed tree frog':
+                result = [
+                    RevisionData(timestamp=datetime(2019, 5, 10), editor="UserA", tags=["visual edit"], comment="added img"),
+                    RevisionData(timestamp=datetime(2020, 2, 15), editor="UserB", tags=["visual edit"], comment="reverted"),
+                    RevisionData(timestamp=datetime(2018, 11, 1), editor="UserC", tags=[], comment="typo"),
+                    RevisionData(timestamp=datetime(2019, 12, 30), editor="UserD", tags=["visual edit", "mobile edit"], comment="..."),
+                ]
+                self.logger.info(f"API '{api_name}' returned {len(result)} records.")
+                return result
+            
+            self.logger.warning(f"No mock data found for API '{api_name}'.")
+            return None
+        except Exception as e:
+            self.logger.error(f"API call '{api_name}' FAILED: {e}", exc_info=True)
+            return None
+
+```
+
+-----
+
+### 📝 Logging vs. Monologue
+
+It is critical to distinguish between the two outputs:
+
+1.  **Reasoning Monologue (USER-FACING):** This is the second item in the `(final_answer, reasoning_monologue)` tuple returned by `solve()`. It's a high-level, human-readable *narrative* of the agent's plan and conclusions (e.g., `## Initiating Breakdown\nI need to find the animal in the image...`).
+2.  **Extensive Logging (DEVELOPER-FACING):** This is written to `stdout` or a file via the injected `logging.Logger` instance. It's a low-level, verbose, technical trace of *every single operation*, tool call, parameter, and error for debugging and auditing (e.g., `[INFO] Tool 'analyze_media' called for 'e14448e9.jpg'`, `[DEBUG] API response: [...]`).
+
+The monologue examples below **only** show the user-facing output.
+
+-----
+
+### 📜 Target Reasoning Monologue (Examples)
+
+The agent's monologue output **must** precisely mimic the following style.
+
+#### Example 1: Pure Logic/Math (using `code_interpreter`)
+
+**(Problem:** The adventurer riddle with 200 coins, 30 face-down, etc.)
+
+```markdown
+## Initiating Breakdown
+The user has provided a logic riddle. This problem doesn't require external search; it's a self-contained logic and math problem. I need to model the variables and the adventurer's actions.
+
+Let's define the state:
+* `Total_Coins = 200`
+* `Total_FD = 30` (Face-Down)
+* `Total_FU = 170` (Face-Up)
+
+The adventurer creates two piles:
+* `Pile_A` (Adventurer's): 30 coins.
+* `Pile_B` (Voice's): 170 coins.
+
+I need to find the number of FD coins in each pile *before* the flip. Let's say `Pile_A` (30 coins) has `x` FD coins.
+This means `Pile_B` (170 coins) must have the rest of the FD coins, which is `30 - x`.
+
+Now, the adventurer's action:
+* He flips all 30 coins in his `Pile_A`.
+* The `x` FD coins become FU.
+* The `30 - x` FU coins become FD.
+
+So, *after* the flip:
+* New FD in `Pile_A` = `30 - x`
+* FD in `Pile_B` = `30 - x`
+
+The number of face-down coins is identical! The adventurer's logic was correct, regardless of how many FD coins `x` he happened to take.
+
+The riddle gives a final clue: "Looking at the two piles, he noticed that the larger pile contained 14 face-down coins."
+* The larger pile is `Pile_B` (170 coins).
+* FD in `Pile_B` = 14.
+* This means our variable `30 - x = 14`.
+* Therefore, `x = 16`.
+
+This means originally:
+* `Pile_A` had `x = 16` FD coins.
+* `Pile_B` had `30 - 16 = 14` FD coins.
+
+After the flip:
+* New FD in `Pile_A` = `30 - x` = `30 - 16` = 14.
+* FD in `Pile_B` = 14.
+* The condition is met. Both piles have 14 FD coins.
+
+The reward is "two gold coins for every face-down coin in *your* pile."
+* Face-down coins in his pile (`Pile_A`) = 14.
+* Reward = 14 * 2 = 28.
+
+I will use the `code_interpreter` to validate this entire chain of logic and compute the final answer.
+
+## Step 1: Formulating Logic Code
+I am writing a Python script to model the riddle's logic and constraints to derive the final answer.
+
+## Step 2: Executing Logic
+I am calling `self.tool_belt.code_interpreter(...)` with the validation code.
+
+## Step 3: Processing Code Output
+The `code_interpreter` returned: `28`
+
+## Step 4: Final Validation
+The logic holds and the calculation is confirmed. The adventurer succeeded and won 28 coins.
+```
+
+#### Example 2: PDF Parsing (using `read_attachment` with options)
+
+**(Problem:** "What animal is shown on page 54 of Anatomy and Physiology of Animals by Ruth Lawson in Dirk Hünniger's 2015 pdf conversion? Just give the common name, without any article.")
+
+```markdown
+## Initiating Breakdown
+This is a multi-hop problem:
+1.  Find the specific PDF document.
+2.  Download the PDF.
+3.  Parse *only page 54* of the PDF to find the animal.
+4.  Extract and format the animal's common name.
+
+## Step 1: Find PDF
+I'll use the `search` tool with a query for the specific document.
+(Calling `self.tool_belt.search(query="Anatomy and Physiology of Animals by Ruth Lawson in Dirk Hünniger's 2015 pdf conversion")`)
+
+## Step 2: Analyze Search Results
+The search returned a promising result:
+* Title: "Anatomy and Physiology of Animals - PDF"
+* URL: "https://example.com/lawson_animal_book.pdf"
+This appears to be the correct file. I will proceed with this URL.
+
+## Step 3: Parse Specific Page
+My next step is to retrieve and parse the content of page 54. I will (conceptually) download the file from the URL and then use my `read_attachment` tool. I'll pass the `Attachment` object to the tool with an `options` dictionary to specify the exact page.
+
+(Simulating download and then calling `self.tool_belt.read_attachment(attachment, options={'page_range': [54, 54]})`)
+
+## Step 4: Analyze Page Content
+The `read_attachment` tool returned the text content for page 54:
+`Figure 54-A: Anatomy of the common frog. Text about frog dissection... [Image: A diagram of a frog's internal organs]`
+
+The text clearly identifies the animal as "frog".
+
+## Step 5: Format Answer
+The user requested the common name, without any article.
+The final answer is "Frog".
+```
+
+#### Example 3: Multi-Modal + API + Data Filtering (using all tools)
+
+**(Problem:** "On the Wikipedia page for the animal in the provided image [e14448e9...jpg], how many revisions from before 2020 had 'visual edit' tags?")
+
+```markdown
+## Initiating Breakdown
+This is a complex, multi-modal, multi-hop problem.
+1.  Identify the animal from the attached image.
+2.  Find the English Wikipedia page for this animal.
+3.  Get the *entire* revision history for that page.
+4.  Filter this history based on two criteria: (a) date is before 2020-01-01 AND (b) 'visual edit' is in the revision's tags.
+5.  Count the number of revisions that match.
+6.  Return only the final count.
+
+## Step 1: Analyze Image
+I have one attachment. I will use the `analyze_media` tool to identify the animal.
+(Calling `self.tool_belt.analyze_media(attachment)`)
+
+## Step 2: Image Analysis Results
+The `analyze_media` tool returned the description: "A high-resolution photo of a Red-Eyed Tree Frog (Agalychnis callidryas) clinging to a green leaf."
+This is my key entity.
+
+## Step 3: Find Wikipedia Page
+Now I need the Wikipedia page. I'll use the `search` tool.
+(Calling `self.tool_belt.search(query="Red-Eyed Tree Frog English Wikipedia", search_type="web")`)
+
+## Step 4: Search Results & Tool Selection
+The `search` tool returned a top hit: "Red-eyed tree frog - Wikipedia" at "https://en.wikipedia.org/wiki/Red-eyed_tree_frog". This is the correct page. Now I must get the revision history. I will use the `get_structured_data` tool.
+
+## Step 5: Get Revision Data
+(Calling `self.tool_belt.get_structured_data('wikipedia_revisions', page_title='Red-eyed tree frog')`)
+
+## Step 6: Process Revision Data
+I've received a large list of `RevisionData` objects. I must now process this data. This filtering is complex and involves date logic, making it a perfect job for the `code_interpreter`.
+
+## Step 7: Formulating Filter Code
+I will write Python code that:
+1.  Defines the list of `RevisionData` objects (I'll pass the data as context).
+2.  Imports `datetime`.
+3.  Sets a `cutoff_date = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)`.
+4.  Initializes a `count = 0`.
+5.  Loops through the list, checking `if rev.timestamp < cutoff_date and 'visual edit' in rev.tags`.
+6.  Prints the final `count`.
+
+## Step 8: Executing Filter Code
+(Calling `self.tool_belt.code_interpreter(...)` with the data and logic)
+
+## Step 9: Finalizing Count
+The `code_interpreter` returned a single number: `42`. This is the final answer.
+```
+
+Please generate the complete Python code for this agent system, including all specified classes, methods, and stubs."

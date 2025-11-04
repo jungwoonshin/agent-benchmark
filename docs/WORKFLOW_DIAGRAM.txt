@@ -1,0 +1,188 @@
+=================================================================================================
+SYSTEMATIC SEARCH RESULT PROCESSING WORKFLOW
+=================================================================================================
+
+┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                      SUBTASK EXECUTION                                        │
+│                                  (Executor.execute_subtask)                                   │
+└────────────────────────────────────────┬─────────────────────────────────────────────────────┘
+                                         │
+                                         │ tool_name == 'search'
+                                         ▼
+                         ┌───────────────────────────────┐
+                         │    Execute Search Tool        │
+                         │  (ToolBelt.search)            │
+                         └───────────┬───────────────────┘
+                                     │
+                                     │ Returns: search_results[]
+                                     ▼
+                   ┌─────────────────────────────────────────────┐
+                   │   SearchResultProcessor                     │
+                   │   .process_search_results()                 │
+                   └───────────┬─────────────────────────────────┘
+                               │
+                               │ For each result:
+                               │
+        ┌──────────────────────┼──────────────────────┐
+        │                      │                      │
+        ▼                      ▼                      ▼
+   ┌─────────┐          ┌─────────┐            ┌─────────┐
+   │Result 1 │          │Result 2 │            │Result 3 │
+   └────┬────┘          └────┬────┘            └────┬────┘
+        │                    │                      │
+        │                    │                      │
+        ▼                    ▼                      ▼
+   ┌──────────────────────────────────────────────────────┐
+   │        STEP 1: Check Relevance (LLM)                 │
+   │                                                       │
+   │  Prompt: "Is this result relevant to the subtask?"  │
+   │  Context:                                            │
+   │    - Subtask description                             │
+   │    - Problem requirements                            │
+   │    - Query analysis constraints                      │
+   │                                                       │
+   │  LLM Response:                                       │
+   │    {                                                 │
+   │      "relevant": true/false,                        │
+   │      "reasoning": "...",                            │
+   │      "confidence": 0.0-1.0                          │
+   │    }                                                 │
+   └──────────────┬───────────────────────────────────────┘
+                  │
+                  │ If NOT relevant → Skip
+                  │ If relevant → Continue
+                  ▼
+   ┌──────────────────────────────────────────────────────┐
+   │        STEP 2: Classify Type                         │
+   │                                                       │
+   │  Check URL/Title for:                                │
+   │    • File extensions (.pdf, .docx, .csv, etc.)      │
+   │    • Download indicators (/pdf/, /download/, etc.)  │
+   │                                                       │
+   │  Classification:                                     │
+   │    • is_file: true/false                            │
+   │    • file_type: 'pdf'|'doc'|'webpage'|etc.         │
+   └──────────────┬───────────────────────────────────────┘
+                  │
+                  │
+     ┌────────────┴─────────────┐
+     │                          │
+     ▼                          ▼
+┌─────────────┐          ┌─────────────┐
+│   IS FILE   │          │ IS WEB PAGE │
+└──────┬──────┘          └──────┬──────┘
+       │                        │
+       │                        │
+       ▼                        ▼
+┌──────────────────────────────────────────────────────────┐  ┌──────────────────────────────────────────────────────────┐
+│        STEP 3a: Handle File                              │  │        STEP 3b: Handle Web Page                         │
+│                                                           │  │                                                          │
+│  1. Download file using:                                 │  │  1. Determine extraction action:                        │
+│     tool_belt.download_file_from_url(url)               │  │     • "count" keywords → extract_count                  │
+│                                                           │  │     • "table" keywords → find_table                     │
+│  2. Add to attachments list                              │  │     • "search" keywords → search_text                   │
+│                                                           │  │     • Default → extract_text                            │
+│  3. Extract content using:                               │  │                                                          │
+│     tool_belt.read_attachment(attachment)               │  │  2. Navigate using Selenium:                            │
+│                                                           │  │     tool_belt.browser_navigate(                         │
+│  Result:                                                 │  │       url=url,                                          │
+│    {                                                     │  │       action=action,                                    │
+│      'url': '...',                                      │  │       extraction_query=subtask.description              │
+│      'type': 'pdf',                                     │  │     )                                                   │
+│      'content': '...[extracted text]...'               │  │                                                          │
+│    }                                                     │  │  3. Extract structured content:                         │
+│                                                           │  │     • Text content                                      │
+│                                                           │  │     • Tables                                            │
+│                                                           │  │     • Numeric data/counts                               │
+│                                                           │  │     • LLM extractions                                   │
+│                                                           │  │                                                          │
+│                                                           │  │  Result:                                                │
+│                                                           │  │    {                                                    │
+│                                                           │  │      'url': '...',                                     │
+│                                                           │  │      'title': '...',                                   │
+│                                                           │  │      'content': '...[extracted content]...'           │
+│                                                           │  │    }                                                    │
+└──────────────┬────────────────────────────────────────────┘  └──────────────┬───────────────────────────────────────────┘
+               │                                                               │
+               └───────────────────────────┬───────────────────────────────────┘
+                                           │
+                                           ▼
+                         ┌─────────────────────────────────────────┐
+                         │   STEP 4: Aggregate Results             │
+                         │                                          │
+                         │  Combine all processed results into:     │
+                         │                                          │
+                         │  {                                       │
+                         │    'processed_count': 3,                │
+                         │    'relevant_count': 2,                 │
+                         │    'web_pages': [...],                  │
+                         │    'downloaded_files': [...],           │
+                         │    'content_summary': '...'            │
+                         │  }                                       │
+                         └─────────────┬───────────────────────────┘
+                                       │
+                                       ▼
+                   ┌───────────────────────────────────────────────┐
+                   │   Return to Executor                           │
+                   │                                                 │
+                   │   Result available for:                        │
+                   │     • Downstream subtasks                      │
+                   │     • Answer synthesis                         │
+                   │     • State manager updates                    │
+                   └─────────────────────────────────────────────────┘
+
+=================================================================================================
+KEY FEATURES
+=================================================================================================
+
+1. LLM-BASED RELEVANCE CHECKING
+   • Each result evaluated with full context
+   • Returns reasoning for transparency
+   • Filters out non-relevant results early
+
+2. INTELLIGENT TYPE CLASSIFICATION
+   • Automatic detection of files vs web pages
+   • Supports many file types (PDF, DOC, CSV, images, etc.)
+   • Handles edge cases (download URLs, etc.)
+
+3. APPROPRIATE HANDLER DISPATCH
+   • Files → Download + Extract
+   • Web pages → Navigate + Extract
+   • No manual intervention needed
+
+4. UNIFIED CONTENT STRUCTURE
+   • All content in consistent format
+   • Easy to consume by downstream tasks
+   • Aggregated summary for synthesis
+
+=================================================================================================
+EXAMPLE OUTPUT
+=================================================================================================
+
+Input: 
+  - Search query: "climate change papers 2020"
+  - 5 search results (mix of web pages and PDFs)
+
+Processing:
+  ✓ Result 1 (webpage): RELEVANT → Navigate → Extract text
+  ✓ Result 2 (PDF): RELEVANT → Download → Extract content
+  ✗ Result 3 (blog): NOT RELEVANT → Skip
+  ✓ Result 4 (webpage): RELEVANT → Navigate → Extract table
+  ✗ Result 5 (unrelated): NOT RELEVANT → Skip
+
+Output:
+  {
+    'processed_count': 5,
+    'relevant_count': 3,
+    'web_pages': [
+      {url: '...', title: '...', content: '...'},
+      {url: '...', title: '...', content: '...'}
+    ],
+    'downloaded_files': [
+      {url: '...', type: 'pdf', content: '...'}
+    ],
+    'content_summary': '[Web Page: ...]...\n\n[File: ...]...\n\n[Web Page: ...]...'
+  }
+
+=================================================================================================
+

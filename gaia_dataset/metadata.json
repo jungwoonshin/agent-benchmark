@@ -1,0 +1,9 @@
+{
+  "dataset_name": "GAIA Benchmark",
+  "description": "General AI Assistant benchmark for evaluating LLMs with augmented capabilities",
+  "version": "2023",
+  "source": "gaia-benchmark/GAIA",
+  "note": "Full GAIA dataset downloaded from Hugging Face",
+  "test_cases": 301,
+  "validation_cases": 165
+}

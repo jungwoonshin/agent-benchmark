@@ -1,0 +1,102 @@
+# Cursor Rules for Agent System
+
+## Core Principles
+
+### 1. General Agent Problem Solving Capability
+- **Maintain GAIA Dataset Compatibility**: All code modifications must preserve the system's ability to solve general agent-related problems, particularly those found in the GAIA dataset benchmark
+- **Task Decomposition**: Ensure the hierarchical task decomposition system remains functional for complex multi-step problems
+- **Tool Integration**: Maintain the flexible tool integration patterns (chaining, fallback, parallel execution) that enable solving diverse problem types
+- **When modifying existing code**: Verify that changes don't break compatibility with GAIA-style problems requiring web browsing, file processing, calculations, and multi-tool orchestration
+
+### 2. Dependency Management with UV
+- **Use `uv` for all dependency operations**: Install, update, and manage dependencies using `uv` instead of `pip`
+- **Commands to use**:
+  - `uv pip install <package>` instead of `pip install <package>`
+  - `uv pip install -r requirements.txt` for installing from requirements
+  - `uv run <command>` to run Python scripts with managed environment
+  - `uv pip compile requirements.txt` to generate lock files
+- **When adding dependencies**: Add them to `requirements.txt` and use `uv` to install
+- **Environment management**: Prefer `uv`'s virtual environment management over manual venv creation
+
+### 3. Modular Design Principles
+- **Multiple Classes**: Use multiple classes to organize functionality rather than monolithic classes
+  - Each class should have a single, well-defined responsibility
+  - Prefer composition over inheritance when appropriate
+  - Use abstract base classes for shared interfaces (like `Tool` base class)
+  
+- **Multiple Files Organization**: Organize code across multiple files based on functionality
+  - **Core functionality**: Place in `src/core/` directory (e.g., `task.py`, `decomposer.py`, `executor.py`, `dag.py`)
+  - **Tool implementations**: Organize by tier in `src/tools/tier1/`, `src/tools/tier2/`, etc.
+  - **One class per file** (or small related classes) rather than large multi-class files
+  - **Shared utilities**: Create separate utility modules rather than cramming everything into one file
+  
+- **File Structure Guidelines**:
+  ```
+src/
+├── core/
+│   ├── decomposers/
+│   │   ├── __init__.py
+│   │   └── web_decomposer.py       # Web task decomposition
+│   ├── executors/
+│   │   ├── __init__.py
+│   │   └── browser_executor.py     # Browser execution helpers
+│   ├── decomposer.py               # General decomposition (refactored)
+│   └── executor.py                 # General execution (refactored)
+├── processors/
+│   ├── __init__.py
+│   └── browser_processor.py        # Browser result processing
+└── solver.py                       # Main solver (refactored)
+  ```
+
+### 4. Code Organization Best Practices
+- **Separation of Concerns**: Keep concerns separated (e.g., tool execution logic separate from tool selection logic)
+- **Interface Definitions**: Define clear interfaces using ABCs (Abstract Base Classes) for extensibility
+- **Configuration**: Keep configuration separate from implementation (use `config.py` and YAML files)
+- **Error Handling**: Implement consistent error handling patterns across modules
+- **Testing**: Structure tests to mirror source structure (`tests/test_*.py` matching `src/*.py`)
+
+### 5. When Making Changes
+- **Before modifying**: Check if the change maintains GAIA problem-solving capabilities
+- **When adding features**: Consider if they fit the modular structure or require new modules/files
+- **When refactoring**: Ensure the modular design is preserved or improved, not degraded
+- **Dependency changes**: Always use `uv` commands and update `requirements.txt`
+
+## Examples
+
+### ✅ Good: Modular Tool Implementation
+```python
+# src/tools/tier1/calculator.py
+from src.tools.base import Tool, ToolResult
+
+class CalculatorTool(Tool):
+    def execute(self, params):
+        # Implementation
+        pass
+```
+
+### ❌ Bad: Monolithic File
+```python
+# src/tools.py - DON'T DO THIS
+class CalculatorTool:
+    pass
+
+class FileHandlerTool:
+    pass
+
+class WebBrowserTool:
+    pass
+# ... all tools in one file
+```
+
+### ✅ Good: Using UV
+```bash
+uv pip install requests
+uv run python src/solver.py
+```
+
+### ❌ Bad: Using pip directly
+```bash
+pip install requests  # DON'T USE
+python src/solver.py
+```
+

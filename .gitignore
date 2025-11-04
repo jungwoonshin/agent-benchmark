@@ -1,0 +1,16 @@
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+*.pyzw
+*.pyzwz
+*.pyzwzw
+*.pyzwzwzw
+*.backup
+__pycache__/
+*.log
+.env
+logs/
+.claude/
