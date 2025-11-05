@@ -4,9 +4,9 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
-from .json_utils import extract_json_from_text
+from ..state import InformationStateManager
+from ..utils import extract_json_from_text
 from .llm_service import LLMService
-from .state_manager import InformationStateManager
 
 
 class ReasoningEngine:
@@ -56,7 +56,9 @@ Return a JSON object with:
 - patterns: list of identified patterns
 - entity_mappings: dictionary mapping equivalent entities
 - inconsistencies: list of detected contradictions
-- relationships: list of discovered relationships"""
+- relationships: list of discovered relationships
+
+IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
 
         user_prompt = f"""Data to analyze:
 {json.dumps(data, indent=2, default=str)}
@@ -69,7 +71,7 @@ Identify patterns and relationships."""
             response = self.llm_service.call_with_system_prompt(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                temperature=1.0,
+                temperature=0.3,  # Consistent logical reasoning
                 response_format={'type': 'json_object'},
             )
             json_text = extract_json_from_text(response)
@@ -109,7 +111,9 @@ Return a JSON object with:
 - narrowed_space: description of narrowed solution space
 - contradictions: list of detected contradictions
 - inferred_constraints: list of newly inferred constraints
-- eliminated_possibilities: list of eliminated options"""
+- eliminated_possibilities: list of eliminated options
+
+IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
 
         user_prompt = f"""Constraints:
 {json.dumps(constraints, indent=2, default=str)}
@@ -123,7 +127,7 @@ Propagate constraints and check for contradictions."""
             response = self.llm_service.call_with_system_prompt(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                temperature=1.0,
+                temperature=0.3,  # Consistent space narrowing
                 response_format={'type': 'json_object'},
             )
             json_text = extract_json_from_text(response)
@@ -166,7 +170,9 @@ Return a JSON object with:
   - solution: description of the candidate solution
   - likelihood: float between 0 and 1
   - reasoning: explanation of why this is plausible
-  - evidence_support: which evidence supports this hypothesis"""
+  - evidence_support: which evidence supports this hypothesis
+
+IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
 
         user_prompt = f"""Problem: {problem}
 
@@ -179,7 +185,7 @@ Generate ranked candidate solutions."""
             response = self.llm_service.call_with_system_prompt(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                temperature=1.0,
+                temperature=0.3,  # Consistent hypothesis generation
                 response_format={'type': 'json_object'},
             )
             json_text = extract_json_from_text(response)

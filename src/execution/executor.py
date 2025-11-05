@@ -5,12 +5,29 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
-from .json_utils import extract_json_from_text
-from .llm_service import LLMService
-from .models import Attachment
-from .search_result_processor import SearchResultProcessor
-from .state_manager import InformationStateManager, Subtask
-from .tool_belt import ToolBelt
+from ..browser.search_result_processor import SearchResultProcessor
+
+# from ..code_interpreter.error_analysis import ExecutionResultAnalyzer  # Disabled - using LLM reasoning instead
+from ..llm import LLMService
+from ..models import Attachment
+from ..state import InformationStateManager, Subtask
+from ..tools import ToolBelt
+from ..utils import extract_json_from_text
+
+
+# Stub for backward compatibility (legacy code execution methods not used anymore)
+class ExecutionResultAnalyzer:
+    """Stub class - code execution is replaced with LLM reasoning."""
+
+    @staticmethod
+    def is_error_result(result: Any) -> bool:
+        """Check if result is an error (legacy method - not used with LLM reasoning)."""
+        return False
+
+    @staticmethod
+    def extract_error_message(result: Any) -> Optional[str]:
+        """Extract error message (legacy method - not used with LLM reasoning)."""
+        return None
 
 
 class Executor:
@@ -36,9 +53,14 @@ class Executor:
         self.llm_service = llm_service
         self.state_manager = state_manager
         self.logger = logger
+        # Initialize browser for search result processor
+        from ..browser import Browser
+
+        browser = Browser(logger=logger, headless=True)
         # Initialize search result processor for systematic search result handling
         self.search_processor = SearchResultProcessor(
             llm_service=llm_service,
+            browser=browser,
             tool_belt=tool_belt,
             logger=logger,
         )
@@ -101,121 +123,267 @@ class Executor:
 
         try:
             # IMPORTANT: For most subtasks, always search first, then process results
-            # Only skip search for: code_interpreter, read_attachment, analyze_media
+            # Only skip search for: llm_reasoning, read_attachment, analyze_media
             should_search_first = tool_name not in [
-                'code_interpreter',
+                'llm_reasoning',
+                'code_interpreter',  # Backward compatibility
                 'read_attachment',
                 'analyze_media',
             ]
 
             # If tool is browser_navigate or unknown, convert to search
             if should_search_first and tool_name != 'search':
-                # Get LLM-generated search_query from metadata
-                search_query = subtask.metadata.get('search_query', '')
-                if not search_query:
-                    # Fallback to description if search_query not provided
-                    self.logger.warning(
-                        f'Subtask {subtask.id} missing search_query in metadata. '
-                        f'Using description as fallback.'
-                    )
-                    search_query = subtask.description
+                # Get LLM-generated search_queries from metadata (prefer new format, fallback to old)
+                search_queries = subtask.metadata.get('search_queries', [])
+                if not search_queries:
+                    # Handle backward compatibility: if search_query (singular) exists, convert to array
+                    old_search_query = subtask.metadata.get('search_query', '')
+                    if old_search_query:
+                        search_queries = [old_search_query]
+                    else:
+                        # Fallback to description if no search queries provided
+                        self.logger.warning(
+                            f'Subtask {subtask.id} missing search_queries in metadata. '
+                            f'Using description as fallback.'
+                        )
+                        search_queries = [subtask.description]
 
+                # Use first query for backward compatibility with parameters
+                search_query = (
+                    search_queries[0] if search_queries else subtask.description
+                )
                 self.logger.info(
                     f'Converting tool "{tool_name}" to search-first workflow. '
-                    f'Will search with LLM-generated query: "{search_query}"'
+                    f'Will search with {len(search_queries)} queries, first query: "{search_query}"'
                 )
                 tool_name = 'search'
-                # Use LLM-generated search_query from metadata
+                # Use LLM-generated search_queries from metadata
                 if 'query' not in parameters:
-                    parameters['query'] = search_query
+                    parameters['query'] = (
+                        search_query  # Store first query for backward compatibility
+                    )
 
             # Execute based on tool type
-            if tool_name == 'code_interpreter':
+            if tool_name == 'code_interpreter' or tool_name == 'llm_reasoning':
+                # Support both old 'code_interpreter' and new 'llm_reasoning' tool names
                 code = parameters.get('code', '')
+                task_description = parameters.get('task_description', '')
                 context = parameters.get('context', {})
-                self.logger.debug(
-                    f'Executing code_interpreter with code length: {len(code)} chars'
-                )
-                result = self.tool_belt.code_interpreter(code, context)
 
-                # Check if result indicates PDF import error - convert to search if needed
-                if isinstance(result, str) and (
-                    'PyPDF2' in result
-                    or 'pdfplumber' in result.lower()
-                    or 'pdf processing' in result.lower()
-                ):
-                    self.logger.warning(
-                        'Code execution attempted PDF parsing, but PDF libraries are not available. '
-                        'Converting subtask to use search instead.'
+                # Convert code to task description if needed
+                if code and not task_description:
+                    task_description = (
+                        f'Execute the following Python code logic: {code}'
                     )
-                    # Get LLM-generated search_query from metadata, fallback to description
-                    search_query = subtask.metadata.get(
-                        'search_query', subtask.description
-                    )
-                    # Try to make it more specific for PDFs if not already
-                    if 'pdf' not in search_query.lower():
-                        search_query = f'{search_query} PDF'
-                    self.logger.info(
-                        f'Executing search instead using LLM-generated query: "{search_query}"'
-                    )
-                    search_results = self.tool_belt.search(
-                        search_query, num_results=5, search_type='web'
-                    )
+                elif not task_description:
+                    # Fallback to subtask description
+                    task_description = subtask.description
 
-                    if search_results:
-                        processing_result = (
-                            self.search_processor.process_search_results(
-                                search_results=search_results,
-                                subtask_description=subtask.description,
-                                problem=problem,
-                                query_analysis=query_analysis,
-                                attachments=attachments,
-                                max_results_to_process=5,
+                # Collect results from dependency subtasks and add to context
+                if subtask.dependencies:
+                    dependency_results = {}
+                    missing_dependencies = []
+                    for dep_id in subtask.dependencies:
+                        if dep_id in self.state_manager.subtasks:
+                            dep_subtask = self.state_manager.subtasks[dep_id]
+                            if (
+                                dep_subtask.status == 'completed'
+                                and dep_subtask.result is not None
+                            ):
+                                # Serialize result for LLM reasoning
+                                # Convert SearchResult objects to dictionaries to avoid iteration errors
+                                result = dep_subtask.result
+                                serialized_result = self._serialize_result_for_code(
+                                    result
+                                )
+
+                                dependency_results[dep_id] = serialized_result
+                                self.logger.debug(
+                                    f'Added dependency result from {dep_id} to context (serialized)'
+                                )
+                            elif dep_subtask.status == 'failed':
+                                self.logger.warning(
+                                    f'Dependency {dep_id} failed - not adding to context'
+                                )
+                                missing_dependencies.append(dep_id)
+                            else:
+                                # Dependency not completed yet
+                                self.logger.warning(
+                                    f'Dependency {dep_id} has status "{dep_subtask.status}" - not adding to context'
+                                )
+                                missing_dependencies.append(dep_id)
+                        else:
+                            self.logger.warning(
+                                f'Dependency {dep_id} not found in state manager'
                             )
+                            missing_dependencies.append(dep_id)
+
+                    # Check if we have missing dependencies
+                    if missing_dependencies:
+                        error_msg = (
+                            f'Cannot execute LLM reasoning - missing or incomplete dependencies: '
+                            f'{", ".join(missing_dependencies)}. '
+                            f'Available dependencies: {", ".join(dependency_results.keys()) if dependency_results else "none"}'
                         )
-                        result = {
-                            'search_results': search_results,
-                            'processing_summary': processing_result,
-                            'content': processing_result.get('content_summary', ''),
-                            'relevant_count': processing_result.get(
-                                'relevant_count', 0
-                            ),
-                            'web_pages': processing_result.get('web_pages', []),
-                            'downloaded_files': processing_result.get(
-                                'downloaded_files', []
-                            ),
-                            'note': 'Converted from code_interpreter to search due to PDF processing requirement',
+                        self.logger.error(error_msg)
+                        # Mark subtask as failed
+                        self.state_manager.fail_subtask(subtask.id, error_msg)
+                        subtask.metadata['error'] = error_msg
+                        subtask.metadata['error_type'] = 'missing_dependencies'
+                        # Return structured error dict instead of error string
+                        return {
+                            'error': error_msg,
+                            'error_type': 'missing_dependencies',
+                            'status': 'failed',
+                            'subtask_id': subtask.id,
                         }
-                    else:
-                        result = {
-                            'error': 'PDF processing not available via code. Converted to search but no results found.',
-                            'original_error': result,
-                            'suggestion': 'Use search queries to find PDFs, then read_attachment to extract content.',
-                        }
-            elif tool_name == 'search':
-                # Prioritize LLM-generated search_query from metadata
-                search_query = subtask.metadata.get('search_query', '')
-                if search_query:
-                    # Use LLM-generated search query if available
-                    query = parameters.get('query', search_query)
+
+                    # Merge dependency results into context
+                    # Use a structured format to avoid conflicts
+                    context['dependency_results'] = dependency_results
+                    # Also add individual results under BOTH original key AND simplified key for compatibility
+                    for dep_id, result in dependency_results.items():
+                        # Add with original key (e.g., step_1, step_2)
+                        context[dep_id] = result
+                        # Also add with simplified key (e.g., step1, step2) for backward compatibility
+                        simplified_key = dep_id.replace(
+                            'step_', 'step'
+                        )  # step_1 -> step1
+                        if simplified_key != dep_id:  # Only add if different
+                            context[simplified_key] = result
+
                     self.logger.info(
-                        f'Using LLM-generated search_query from planner: "{search_query}"'
+                        f'Added {len(dependency_results)} dependency result(s) to LLM reasoning context'
+                    )
+                    self.logger.debug(
+                        f'Context keys available: {", ".join(sorted(context.keys()))}'
+                    )
+
+                self.logger.debug(
+                    f'Executing LLM reasoning with task: {task_description[:100]}..., '
+                    f'context keys: {list(context.keys())}'
+                )
+                # Check if images are present and use visual LLM if needed
+                images = self._extract_images_from_context(context, attachments)
+                if images:
+                    self.logger.info(
+                        f'Images detected in subtask {subtask.id}, using visual LLM for processing'
+                    )
+                    result = self.tool_belt.llm_reasoning_with_images(
+                        task_description, context, images
                     )
                 else:
-                    # Fallback to parameters or description
-                    query = parameters.get('query', subtask.description)
-                    if query == subtask.description:
-                        self.logger.warning(
-                            f'Subtask {subtask.id} missing search_query in metadata. '
-                            f'Using description as fallback query: "{query}"'
+                    # Execute LLM reasoning (simplified - no code error fixing needed)
+                    result = self.tool_belt.llm_reasoning(task_description, context)
+
+            elif tool_name == 'search':
+                # Get search_queries array from metadata (prefer new format, fallback to old)
+                search_queries = subtask.metadata.get('search_queries', [])
+
+                # Handle backward compatibility: if search_query (singular) exists, convert to array
+                if not search_queries:
+                    old_search_query = subtask.metadata.get('search_query', '')
+                    if old_search_query:
+                        search_queries = [old_search_query]
+                        self.logger.debug(
+                            f'Subtask {subtask.id} uses old search_query format. '
+                            f'Converted to search_queries array with 1 query.'
                         )
 
-                num_results = parameters.get('num_results', 5)
+                # Fallback to parameters or description if no queries found
+                if not search_queries:
+                    fallback_query = parameters.get('query', subtask.description)
+                    search_queries = [fallback_query]
+                    if fallback_query == subtask.description:
+                        self.logger.warning(
+                            f'Subtask {subtask.id} missing search_queries in metadata. '
+                            f'Using description as fallback query: "{fallback_query}"'
+                        )
+
+                # Ensure we have exactly 3 queries (pad if needed)
+                if len(search_queries) < 3:
+                    while len(search_queries) < 3:
+                        search_queries.append(
+                            search_queries[-1]
+                            if search_queries
+                            else subtask.description
+                        )
+                    self.logger.warning(
+                        f'Subtask {subtask.id} has only {len([q for q in search_queries if q])} unique search queries. '
+                        f'Padded to 3 queries.'
+                    )
+                elif len(search_queries) > 3:
+                    search_queries = search_queries[:3]
+                    self.logger.debug(
+                        f'Subtask {subtask.id} has {len(search_queries)} search queries. Using first 3.'
+                    )
+
+                num_results = parameters.get(
+                    'num_results', 5
+                )  # Default: 5 results per query
                 search_type = parameters.get('search_type', 'web')
-                self.logger.debug(
-                    f'Executing search: query="{query}", type={search_type}, num_results={num_results}'
+
+                # Try all 3 search queries and combine results
+                all_search_results = []
+                seen_urls = set()  # Track URLs to avoid duplicates
+
+                self.logger.info(
+                    f'Executing {len(search_queries)} different search queries for subtask {subtask.id}'
                 )
-                search_results = self.tool_belt.search(query, num_results, search_type)
+
+                for idx, query in enumerate(search_queries, 1):
+                    self.logger.info(
+                        f'Search query {idx}/{len(search_queries)}: "{query}" '
+                        f'(type={search_type}, num_results={num_results})'
+                    )
+                    query_results = self.tool_belt.search(
+                        query, num_results, search_type
+                    )
+
+                    # Add results to combined list, avoiding duplicates by URL
+                    for result in query_results:
+                        if hasattr(result, 'url'):
+                            url = result.url
+                        elif isinstance(result, dict):
+                            url = result.get('url', '')
+                        else:
+                            url = str(result)
+
+                        if url and url not in seen_urls:
+                            seen_urls.add(url)
+                            all_search_results.append(result)
+
+                    self.logger.debug(
+                        f'Query {idx} returned {len(query_results)} results, '
+                        f'{len(all_search_results)} total unique results so far'
+                    )
+
+                search_results = all_search_results
+                self.logger.info(
+                    f'Combined search results: {len(search_results)} unique results from {len(search_queries)} queries'
+                )
+
+                # Use LLM to determine top 5 most relevant results from combined set
+                if len(search_results) > 5:
+                    self.logger.info(
+                        f'Filtering {len(search_results)} combined results to top 5 most relevant using LLM'
+                    )
+                    # Use subtask description as the query context for filtering
+                    filtered_results = self._filter_search_results_by_relevance(
+                        search_results=search_results,
+                        query=subtask.description,  # Use subtask description as context
+                        problem=problem,
+                        query_analysis=query_analysis,
+                    )
+                    # Limit to top 5
+                    search_results = filtered_results[:5]
+                    self.logger.info(
+                        f'Selected top {len(search_results)} most relevant results from combined search queries'
+                    )
+                elif search_results:
+                    self.logger.info(
+                        f'Using all {len(search_results)} combined results (already <= 5)'
+                    )
 
                 # If search returned 0 results, try to identify downloadable resources
                 if not search_results:
@@ -241,7 +409,7 @@ class Executor:
                                                 f'Downloaded resource: {title} from {url}'
                                             )
                                             # Add to search results as a SearchResult for consistency
-                                            from .models import SearchResult
+                                            from ..models import SearchResult
 
                                             search_results.append(
                                                 SearchResult(
@@ -278,7 +446,7 @@ class Executor:
                         problem=problem,
                         query_analysis=query_analysis,
                         attachments=attachments,
-                        max_results_to_process=5,
+                        max_results_to_process=5,  # Process up to 5 results per query
                     )
 
                     # Return structured processing result along with original search results
@@ -336,7 +504,9 @@ class Executor:
                     attachment = attachments[parameters.get('attachment_index', 0)]
                     options = parameters.get('options', {})
                     self.logger.debug(f'Reading attachment: {attachment.filename}')
-                    result = self.tool_belt.read_attachment(attachment, options)
+                    result = self.tool_belt.read_attachment(
+                        attachment, options, problem, query_analysis
+                    )
                 else:
                     result = 'Error: No attachments available'
             elif tool_name == 'analyze_media':
@@ -362,7 +532,19 @@ class Executor:
             )
             result_type = type(result).__name__
 
-            self.state_manager.complete_subtask(subtask.id, result)
+            # Check if subtask was already marked as failed (e.g., from LLM reasoning error)
+            if subtask.id in self.state_manager.subtasks:
+                current_subtask = self.state_manager.subtasks[subtask.id]
+                if current_subtask.status == 'failed':
+                    # Don't mark as completed if it's already failed
+                    self.logger.warning(
+                        f'Subtask {subtask.id} already marked as failed, not completing'
+                    )
+                else:
+                    self.state_manager.complete_subtask(subtask.id, result)
+            else:
+                # If not in state_manager, add it as completed
+                self.state_manager.complete_subtask(subtask.id, result)
 
             self.logger.info('-' * 80)
             self.logger.info(f'AFTER executing subtask: {subtask.id}')
@@ -406,6 +588,364 @@ class Executor:
             self.logger.error(f'Subtask execution failed: {e}', exc_info=True)
             raise
 
+    def _serialize_result_for_code(self, result: Any) -> Any:
+        """
+        Serialize result objects for use in LLM reasoning.
+
+        Converts SearchResult dataclass objects to dictionaries to avoid
+        iteration errors in RestrictedPython execution environment.
+
+        Args:
+            result: The result to serialize (can be dict, list, SearchResult, or other types)
+
+        Returns:
+            Serialized result with SearchResult objects converted to dictionaries
+        """
+        from ..models import SearchResult
+
+        # If result is a SearchResult object, convert to dict
+        if isinstance(result, SearchResult):
+            return {
+                'snippet': result.snippet,
+                'url': result.url,
+                'title': result.title,
+                'relevance_score': result.relevance_score,
+            }
+
+        # If result is a dictionary, recursively serialize values
+        if isinstance(result, dict):
+            serialized = {}
+            for key, value in result.items():
+                if isinstance(value, SearchResult):
+                    serialized[key] = {
+                        'snippet': value.snippet,
+                        'url': value.url,
+                        'title': value.title,
+                        'relevance_score': value.relevance_score,
+                    }
+                elif isinstance(value, list):
+                    # Recursively serialize list items
+                    serialized[key] = [
+                        self._serialize_result_for_code(item) for item in value
+                    ]
+                elif isinstance(value, dict):
+                    # Recursively serialize nested dictionaries
+                    serialized[key] = self._serialize_result_for_code(value)
+                else:
+                    serialized[key] = value
+            return serialized
+
+        # If result is a list, recursively serialize items
+        if isinstance(result, list):
+            return [self._serialize_result_for_code(item) for item in result]
+
+        # For other types (str, int, etc.), return as-is
+        return result
+
+    def _execute_code_with_retry(
+        self,
+        code: str,
+        context: Dict[str, Any],
+        problem: str,
+        subtask: Subtask,
+        max_retries: int = 10,
+    ) -> Any:
+        """
+        Execute code with automatic retry and error fixing.
+
+        Args:
+            code: Python code to execute
+            context: Context dictionary with variables
+            problem: Original problem description
+            subtask: Subtask being executed
+            max_retries: Maximum number of retry attempts
+
+        Returns:
+            Execution result (successful result or error dict)
+        """
+        retry_count = subtask.metadata.get('code_fix_retry_count', 0)
+        current_code = code
+        last_error = None
+
+        # Execute initial code
+        result = self.tool_belt.code_interpreter(current_code, context)
+
+        # Keep retrying until success or max retries reached
+        while retry_count < max_retries:
+            # Check if result is an error
+            is_error = ExecutionResultAnalyzer.is_error_result(result)
+
+            if not is_error:
+                # Success! Handle success and return
+                return self._handle_code_execution_success(result, retry_count, subtask)
+
+            # Error detected - extract error message and try to fix
+            error_reason = ExecutionResultAnalyzer.extract_error_message(result)
+            if error_reason is None:
+                error_reason = str(result)[:500]
+            last_error = error_reason[:500]
+
+            self.logger.warning(
+                f'Code execution failed (attempt {retry_count + 1}/{max_retries}): {error_reason}'
+            )
+
+            # Attempt to fix the code
+            fixed_code = self._fix_code_error(
+                current_code, error_reason, context, problem, subtask
+            )
+
+            if not fixed_code or fixed_code == current_code:
+                # Could not fix the code or fix didn't change anything
+                self.logger.warning(
+                    'Could not fix code error or fix produced identical code. Stopping retries.'
+                )
+                break
+
+            # Update retry count and metadata
+            retry_count += 1
+            self._update_code_retry_metadata(
+                subtask, code, retry_count, error_reason, fixed_code
+            )
+
+            self.logger.info(
+                f'Retrying code execution with fixed code (attempt {retry_count}/{max_retries})'
+            )
+
+            # Update current_code for next iteration
+            current_code = fixed_code
+
+            # Retry with fixed code
+            result = self.tool_belt.code_interpreter(fixed_code, context)
+
+        # Check if we still have an error after all retries
+        return self._handle_code_execution_failure(
+            result, last_error, retry_count, subtask
+        )
+
+    def _handle_code_execution_success(
+        self, result: Any, retry_count: int, subtask: Subtask
+    ) -> Any:
+        """
+        Handle successful code execution.
+
+        Args:
+            result: Successful execution result
+            retry_count: Number of retries that were made
+            subtask: Subtask that was executed
+
+        Returns:
+            The successful result
+        """
+        if retry_count > 0:
+            self.logger.info(
+                f'Code execution succeeded after {retry_count} retry attempt(s)!'
+            )
+            # Clear error metadata since we succeeded
+            self._clear_code_error_metadata(subtask)
+
+        return result
+
+    def _handle_code_execution_failure(
+        self,
+        result: Any,
+        last_error: Optional[str],
+        retry_count: int,
+        subtask: Subtask,
+    ) -> Dict[str, Any]:
+        """
+        Handle code execution failure after all retries exhausted.
+
+        Args:
+            result: The final execution result (should indicate an error)
+            last_error: The last error message encountered
+            retry_count: Number of retry attempts made
+            subtask: Subtask that failed
+
+        Returns:
+            Structured error dictionary
+        """
+        # Check if result is still an error
+        is_final_error = ExecutionResultAnalyzer.is_error_result(result)
+
+        if not is_final_error:
+            # Unexpected: result is not an error, treat as success
+            self.logger.warning(
+                'Code execution result is not an error after retries. Treating as success.'
+            )
+            return result
+
+        # Extract error message and normalize result
+        _, normalized_result, error_message = (
+            ExecutionResultAnalyzer.normalize_error_result(result)
+        )
+
+        # Use normalized error message or fallback to last_error
+        error_reason = (
+            error_message or last_error or normalized_result or 'Unknown error'
+        )
+        error_reason = str(error_reason)[:500]
+
+        self.logger.error(
+            f'Code execution failed after {retry_count} retry attempt(s). Giving up.'
+        )
+
+        # Mark subtask as failed
+        self.state_manager.fail_subtask(subtask.id, error_reason)
+
+        # Store error in metadata and classify error type
+        error_type = ExecutionResultAnalyzer.classify_error_type(error_reason)
+        subtask.metadata['error'] = error_reason
+        subtask.metadata['error_type'] = error_type
+
+        # Return structured error dict
+        return ExecutionResultAnalyzer.create_error_dict(
+            error_reason,
+            error_type=error_type,
+            subtask_id=subtask.id,
+            retry_attempts=retry_count,
+        )
+
+    def _update_code_retry_metadata(
+        self,
+        subtask: Subtask,
+        original_code: str,
+        retry_count: int,
+        error_reason: str,
+        fixed_code: str,
+    ) -> None:
+        """
+        Update subtask metadata with retry information.
+
+        Args:
+            subtask: Subtask being retried
+            original_code: Original code that failed
+            retry_count: Current retry count
+            error_reason: Error message from last attempt
+            fixed_code: Fixed code to retry with
+        """
+        subtask.metadata['code_fix_retry_count'] = retry_count
+        if 'original_code' not in subtask.metadata:
+            subtask.metadata['original_code'] = original_code
+        subtask.metadata['last_error'] = error_reason
+        subtask.metadata['last_fixed_code'] = fixed_code
+
+    def _clear_code_error_metadata(self, subtask: Subtask) -> None:
+        """
+        Clear error-related metadata from subtask after successful execution.
+
+        Args:
+            subtask: Subtask that succeeded
+        """
+        metadata_keys_to_remove = ['error', 'error_type', 'code_fix_retry_count']
+        for key in metadata_keys_to_remove:
+            if key in subtask.metadata:
+                del subtask.metadata[key]
+
+    def _fix_code_error(
+        self,
+        code: str,
+        error_message: str,
+        context: Dict[str, Any],
+        problem: str,
+        subtask: Subtask,
+    ) -> Optional[str]:
+        """
+        Use LLM to fix code errors by analyzing the error and modifying the code.
+
+        Args:
+            code: The original code that failed.
+            error_message: The error message from code execution.
+            context: The context dictionary available to the code.
+            problem: The original problem description.
+            subtask: The subtask being executed.
+
+        Returns:
+            Fixed code string, or None if fixing failed.
+        """
+        self.logger.debug(f'Attempting to fix code error: {error_message[:200]}...')
+
+        system_prompt = """You are an expert Python code debugger and fixer.
+Given Python code that failed to execute with an error message, analyze the error and fix the code.
+
+CRITICAL CONSTRAINTS:
+- **llm_reasoning**: Use for calculations, data processing, and analysis. Provide clear task descriptions.
+- **Context access**: Variables from context are available. Use dictionary access: context['key'] NOT context.key
+- **For NameError**:
+  - FIRST: Check if the NameError is for a module name (e.g., re, math, datetime, json, os, sys, pandas, numpy, etc.). If so, add `import <module_name>` at the top of the code.
+  - SECOND: Check if the variable exists in context. If accessing context variables, use dictionary syntax: context['step_1'] not step_1
+- **For ImportError**:
+  - If the module cannot be imported (doesn't exist or not installed), suggest using an alternative approach or note that the module needs to be installed
+- **For SyntaxError**: Fix the syntax error
+- **For ExecutionError**: Fix the logic error
+
+Return ONLY the fixed Python code as a JSON object with this exact structure:
+{
+  "fixed_code": "the fixed Python code here"
+}
+
+IMPORTANT:
+- Always include necessary import statements at the top of the code
+- If code uses `re.search()`, `datetime.now()`, `math.sqrt()`, `pandas.read_csv()`, `numpy.array()`, etc., ensure the corresponding import statements are present (e.g., `import re`, `import datetime`, `import math`, `import pandas`, `import numpy`)
+- Return your response as valid JSON only, without any markdown formatting or additional text."""
+
+        # Build context info for the prompt
+        context_info = ''
+        if context:
+            context_keys = list(context.keys())
+            context_info = f'\nAvailable context keys: {", ".join(context_keys[:20])}'
+            if len(context_keys) > 20:
+                context_info += f' (and {len(context_keys) - 20} more)'
+
+        user_prompt = f"""Problem: {problem}
+
+Subtask Description: {subtask.description}
+
+Original Code (that failed):
+```python
+{code}
+```
+
+Error Message:
+{error_message}
+{context_info}
+
+Analyze the error and fix the code. Return the fixed code in JSON format:
+{{
+  "fixed_code": "fixed Python code here"
+}}
+
+IMPORTANT:
+- Fix the specific error mentioned in the error message
+- If error mentions a missing variable, check if it's in context and use context['key'] syntax
+- If error mentions an import, remove it or use whitelisted alternatives
+- Keep the same logic and intent, just fix the error
+- Return ONLY the fixed code, no explanations
+- Return your response as valid JSON only, without any markdown formatting or additional text"""
+
+        try:
+            response = self.llm_service.call_with_system_prompt(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=0.3,  # Lower temperature for more consistent fixes
+                response_format={'type': 'json_object'},
+            )
+
+            json_text = extract_json_from_text(response)
+            fixed_data = json.loads(json_text)
+            fixed_code = fixed_data.get('fixed_code', '')
+
+            if fixed_code and fixed_code.strip():
+                self.logger.info(
+                    f'Code fix generated successfully (length: {len(fixed_code)} chars)'
+                )
+                return fixed_code.strip()
+            else:
+                self.logger.warning('Code fix returned empty or invalid code')
+                return None
+        except Exception as e:
+            self.logger.error(f'Failed to generate code fix: {e}', exc_info=True)
+            return None
+
     def _determine_tool_parameters(
         self,
         subtask: Subtask,
@@ -429,19 +969,25 @@ class Executor:
 Given a subtask description, determine the appropriate parameters for the tool.
 
 CRITICAL CONSTRAINTS:
-- **code_interpreter limitations**: Can only use built-in Python functions and whitelisted modules (math, json, datetime, re, etc.).
-  - CANNOT import: PyPDF2, pdfplumber, os, sys, subprocess, or any file parsing libraries
-  - For PDF processing: DO NOT generate code that imports PDF libraries. Instead, suggest using search + read_attachment tools
-  - For file operations: Use search to find files, then read_attachment to extract content
-- **Use search for information gathering**: When you need to find PDFs, documents, or information, generate a specific search query instead of code
-- **PDF processing**: Use search to locate PDFs, then read_attachment to extract text. Never try to parse PDFs with code.
-- **Search query priority**: If a search_query is provided in the subtask information, you MUST use that exact query. Do not modify or replace it.
+- **llm_reasoning**: Use for calculations, data processing, and analysis. Provide task_description instead of code.
+- **Use search for information gathering**: When you need to find PDFs, documents, or information, generate a specific search query instead of reasoning
+- **PDF processing**: Use search to locate PDFs, then read_attachment to extract text. Never try to parse PDFs with reasoning.
+- **Search query priority**: If search_queries are provided in the subtask information, you MUST use all of them. The system will try all queries and combine results. Do not modify or replace them.
 
 Return a JSON object with parameters specific to the tool type.
-For code_interpreter: {"code": "python code", "context": {...}}
-  - IMPORTANT: Only generate code that uses built-in Python functions (math, json, datetime, re, etc.)
-  - DO NOT include imports for PyPDF2, pdfplumber, or any file parsing libraries
-  - If the task requires PDF processing, return an error message suggesting use of search + read_attachment instead
+For llm_reasoning: {"task_description": "description of what needs to be calculated/analyzed", "context": {...}}
+
+CRITICAL TASK DESCRIPTION RULES FOR LLM_REASONING:
+- **Clear task description**: Provide a clear, detailed description of what needs to be calculated or analyzed
+  - Example: "Calculate the average of the numbers in the context" instead of "average()"
+  - Example: "Extract all dates from the text and convert them to YYYY-MM-DD format" instead of "datetime conversion"
+- **Reference context data**: Explicitly mention which context variables contain the data you need
+  - Example: "Using the data from step_1, calculate the total and divide by the count"
+- **Be specific**: Include details about data formats, units, and expected output format
+
+IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text.
+  - **DEPENDENCY RESULTS**: If this subtask has dependencies, the results from dependency subtasks will be automatically added to the context. For llm_reasoning, describe in the task_description which dependency results to use (e.g., "Use data from step_1 and step_2 to calculate...").
+  - **SEARCH RESULTS**: When task_description references search results from dependencies, describe what information to extract from them clearly.
 For search: {"query": "search query", "num_results": 5, "search_type": "web"}
   - Generate specific, detailed search queries that include key terms, dates, and requirements
   - Example: Instead of "AI papers", use "arXiv AI regulation papers submitted June 2022"
@@ -473,27 +1019,61 @@ For analyze_media: {"attachment_index": 0, "analysis_type": "auto"}"""
                 f'\nAvailable attachments: {[a.filename for a in attachments]}'
             )
 
-        # Get LLM-generated search_query from metadata if available
-        search_query = subtask.metadata.get('search_query', '')
+        # Get LLM-generated search_queries from metadata if available (prefer new format, fallback to old)
+        search_queries = subtask.metadata.get('search_queries', [])
+        if not search_queries:
+            # Handle backward compatibility: if search_query (singular) exists, convert to array
+            old_search_query = subtask.metadata.get('search_query', '')
+            if old_search_query:
+                search_queries = [old_search_query]
+
         search_query_info = ''
-        if search_query and subtask.metadata.get('tool') == 'search':
-            search_query_info = (
-                f'\nLLM-generated search_query (MUST USE): {search_query}'
-            )
+        if search_queries and subtask.metadata.get('tool') == 'search':
+            if len(search_queries) == 1:
+                search_query_info = (
+                    f'\nLLM-generated search_query (MUST USE): {search_queries[0]}'
+                )
+            else:
+                queries_list = ', '.join([f'"{q}"' for q in search_queries[:3]])
+                search_query_info = f'\nLLM-generated search_queries (MUST USE ALL {len(search_queries)}): [{queries_list}]'
+
+        # Collect dependency results information for the prompt
+        dependency_info = ''
+        if subtask.dependencies:
+            dependency_results_summary = []
+            for dep_id in subtask.dependencies:
+                if dep_id in self.state_manager.subtasks:
+                    dep_subtask = self.state_manager.subtasks[dep_id]
+                    if dep_subtask.status == 'completed':
+                        result_preview = (
+                            str(dep_subtask.result)[:200]
+                            if dep_subtask.result
+                            else 'None'
+                        )
+                        dependency_results_summary.append(
+                            f'  - {dep_id}: {result_preview}...'
+                        )
+            if dependency_results_summary:
+                dependency_info = (
+                    f'\n\nDependency Results (available in context):\n'
+                    f'{"".join(dependency_results_summary)}\n'
+                    f'Note: These results will be automatically added to the context parameter for llm_reasoning.'
+                )
 
         user_prompt = f"""Problem: {problem}
 
 Subtask: {subtask.description}
-Tool: {subtask.metadata.get('tool', 'unknown')}{search_query_info}{attachment_info}
+Tool: {subtask.metadata.get('tool', 'unknown')}{search_query_info}{attachment_info}{dependency_info}
 
 Determine the appropriate tool parameters.
-IMPORTANT: If the tool is 'search' and a search_query is provided above, you MUST use that exact search_query in the parameters."""
+IMPORTANT: If the tool is 'search' and search_queries are provided above, the system will automatically try all of them. You do not need to specify them in parameters.
+If the tool is 'llm_reasoning' and dependencies are listed above, describe in the task_description which dependency results to use."""
 
         try:
             response = self.llm_service.call_with_system_prompt(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                temperature=1.0,
+                temperature=0.7,  # Creative but focused for parameter generation
                 response_format={'type': 'json_object'},
             )
             json_text = extract_json_from_text(response)
@@ -541,6 +1121,8 @@ Return a JSON object with key "resources" containing an array of resource object
 If you cannot construct a direct URL but can identify a resource, include it with url as null and provide as much info as possible.
 If no resources are found, return {{"resources": []}}.
 
+IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text.
+
 Examples:
 - "Preprint paper 2207.01510" -> {{"url": "https://repository.org/pdf/2207.01510.pdf", "title": "Preprint paper 2207.01510", "description": "Preprint paper with ID 2207.01510", "relevance": 1.0}}
 - "Paper submitted to preprint repository in June 2022" -> {{"url": null, "title": "June 2022 preprint submission", "description": "Paper submitted to preprint repository in June 2022", "relevance": 0.8}}
@@ -559,7 +1141,7 @@ Return as JSON with "resources" key containing an array of resource objects."""
             response = self.llm_service.call_with_system_prompt(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                temperature=1.0,
+                temperature=0.7,  # Creative but focused for resource identification
                 response_format={'type': 'json_object'},
             )
             json_text = extract_json_from_text(response)
@@ -602,7 +1184,7 @@ Return as JSON with "resources" key containing an array of resource objects."""
         Returns:
             Filtered list of most relevant SearchResult objects.
         """
-        from .models import SearchResult
+        from ..models import SearchResult
 
         if not search_results:
             return search_results
@@ -621,6 +1203,16 @@ Return as JSON with "resources" key containing an array of resource objects."""
                         'title': result.title,
                         'snippet': result.snippet,
                         'url': result.url,
+                    }
+                )
+            elif isinstance(result, dict):
+                # Handle already-serialized SearchResult dictionaries
+                results_list.append(
+                    {
+                        'index': i,
+                        'title': result.get('title', ''),
+                        'snippet': result.get('snippet', ''),
+                        'url': result.get('url', ''),
                     }
                 )
 
@@ -663,36 +1255,40 @@ Return as JSON with "resources" key containing an array of resource objects."""
                 requirements_context += f'- Expected Answer Format: {answer_format}\n'
 
         system_prompt = """You are an expert at evaluating search result relevance.
-Given a search query, query requirements analysis, and a list of search results, identify which results are most relevant to answering the query.
+Given a search query/subtask description, query requirements analysis, and a list of search results, identify which results are most relevant to answering the query.
 
 Consider the explicit and implicit requirements from the query analysis when determining relevance.
 A result is relevant if it helps satisfy any of the stated requirements or constraints.
 
 Return a JSON object with:
-- selected_indices: list of integers representing the indices (0-based) of the most relevant results
+- selected_indices: list of integers representing the indices (0-based) of the most relevant results, ordered by relevance (most relevant first)
 - reasoning: brief explanation of why these results were selected, specifically referencing which requirements they address
-- max_results: limit to at most 3-5 most relevant results, prioritizing quality over quantity
+- max_results: limit to exactly 5 most relevant results (or fewer if less than 5 results provided), prioritizing quality over quantity
+
+IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text.
 
 Focus on:
-- Direct relevance to the query terms and intent
+- Direct relevance to the query/subtask terms and intent
 - Alignment with explicit and implicit requirements from query analysis
 - How well each result addresses the specific requirements and constraints
-- Information quality and usefulness for satisfying the problem requirements"""
+- Information quality and usefulness for satisfying the problem requirements
+- For aggregate/statistical queries (e.g., "how many articles"), prioritize archive/browse pages over individual articles"""
 
         user_prompt = f"""Original Problem: {problem}
 
-Search Query: {query}
+Subtask/Query: {query}
 {requirements_context}
-Search Results:
+
+Search Results (combined from multiple search queries):
 {json.dumps(results_list, indent=2)}
 
-Identify the most relevant search results for answering the query. Pay special attention to which results best satisfy the requirements identified in the query analysis."""
+Identify the top 5 most relevant search results for answering the query/subtask. Pay special attention to which results best satisfy the requirements identified in the query analysis. Return the indices of the most relevant results, ordered by relevance (most relevant first)."""
 
         try:
             response = self.llm_service.call_with_system_prompt(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                temperature=1.0,  # Lower temperature for more consistent relevance scoring
+                temperature=0.7,  # Creative but focused for search result filtering
                 response_format={'type': 'json_object'},
             )
             json_text = extract_json_from_text(response)
@@ -705,25 +1301,30 @@ Identify the most relevant search results for answering the query. Pay special a
                 f'LLM selected {len(selected_indices)} most relevant result(s) out of {len(search_results)}. Reasoning: {reasoning}'
             )
 
-            # Filter results to only include selected indices
+            # Filter results to only include selected indices, preserving order
             filtered_results = []
+            seen_indices = set()  # Avoid duplicates
             for idx in selected_indices:
-                if 0 <= idx < len(search_results):
+                if 0 <= idx < len(search_results) and idx not in seen_indices:
                     filtered_results.append(search_results[idx])
-                else:
+                    seen_indices.add(idx)
+                elif idx not in seen_indices:
                     self.logger.warning(
                         f'Invalid index {idx} in selected_indices (valid range: 0-{len(search_results) - 1})'
                     )
 
-            # If no valid results were selected, return original results as fallback
+            # Limit to top 5
+            filtered_results = filtered_results[:5]
+
+            # If no valid results were selected, return top 5 original results as fallback
             if not filtered_results:
                 self.logger.warning(
-                    'No valid results selected by LLM, using all original results'
+                    'No valid results selected by LLM, using top 5 original results as fallback'
                 )
-                return search_results
+                return search_results[:5]
 
             self.logger.info(
-                f'Filtered search results: {len(filtered_results)} relevant result(s) selected from {len(search_results)} total'
+                f'LLM filtered {len(search_results)} results down to {len(filtered_results)} most relevant'
             )
             return filtered_results
 
@@ -792,6 +1393,14 @@ Identify the most relevant search results for answering the query. Pay special a
                         progress_made = True
                     except Exception as e:
                         self.logger.error(f'Failed to execute {subtask.id}: {e}')
+                        # Include failed subtask in results with structured error format
+                        # Note: fail_subtask() already called in execute_subtask(), so state is consistent
+                        results[subtask.id] = {
+                            'error': str(e),
+                            'error_type': type(e).__name__,
+                            'status': 'failed',
+                            'subtask_id': subtask.id,
+                        }
                         # Try to continue with other tasks
                         continue
 
@@ -855,6 +1464,77 @@ Identify the most relevant search results for answering the query. Pay special a
                 continue
 
         return results
+
+    def _extract_images_from_context(
+        self,
+        context: Dict[str, Any],
+        attachments: Optional[List[Attachment]] = None,
+    ) -> List[bytes]:
+        """
+        Extract image data from context and attachments for visual LLM processing.
+
+        Args:
+            context: Context dictionary that may contain image data.
+            attachments: Optional list of attachments that may contain images.
+
+        Returns:
+            List of image data as bytes.
+        """
+        images = []
+
+        # Check attachments for image files
+        if attachments:
+            image_extensions = {
+                '.png',
+                '.jpg',
+                '.jpeg',
+                '.gif',
+                '.bmp',
+                '.webp',
+                '.svg',
+            }
+            for attachment in attachments:
+                filename_lower = attachment.filename.lower()
+                if any(filename_lower.endswith(ext) for ext in image_extensions):
+                    images.append(attachment.data)
+                    self.logger.debug(
+                        f'Found image in attachment: {attachment.filename}'
+                    )
+
+        # Check context for image data (from browser screenshots, etc.)
+        if isinstance(context, dict):
+            # Check for screenshot data in context
+            if 'screenshot' in context:
+                screenshot_data = context.get('screenshot')
+                if isinstance(screenshot_data, bytes):
+                    images.append(screenshot_data)
+                    self.logger.debug('Found screenshot in context')
+                elif isinstance(screenshot_data, str):
+                    # Try to decode base64 string
+                    try:
+                        import base64
+
+                        decoded = base64.b64decode(screenshot_data)
+                        images.append(decoded)
+                        self.logger.debug('Found base64-encoded screenshot in context')
+                    except Exception:
+                        pass
+
+            # Check for image data in nested structures
+            for key, value in context.items():
+                if key == 'screenshot' or 'image' in key.lower():
+                    if isinstance(value, bytes):
+                        images.append(value)
+                    elif isinstance(value, str):
+                        try:
+                            import base64
+
+                            decoded = base64.b64decode(value)
+                            images.append(decoded)
+                        except Exception:
+                            pass
+
+        return images
 
     def _is_file_url(self, url: str) -> bool:
         """
@@ -955,7 +1635,9 @@ Given a problem description and a search result (title, snippet, URL), determine
 
 Return a JSON object with:
 - relevant: boolean indicating if the result is relevant
-- reasoning: brief explanation of why it is or isn't relevant"""
+- reasoning: brief explanation of why it is or isn't relevant
+
+IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
 
             user_prompt = f"""Problem: {problem}
 {requirements_context}
@@ -1010,7 +1692,7 @@ Is this search result relevant to solving the problem?"""
             problem: Original problem description.
             query_analysis: Optional query analysis results.
         """
-        from .models import SearchResult
+        from ..models import SearchResult
 
         if not search_results:
             return

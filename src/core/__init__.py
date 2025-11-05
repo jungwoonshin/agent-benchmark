@@ -1,16 +1,15 @@
-"""Core agent system components."""
+"""Core agent system components - main Agent orchestrator."""
 
 from .agent import Agent
-from .answer_synthesizer import AnswerSynthesizer
-from .executor import Executor
-from .llm_service import LLMService
-from .models import Attachment, RevisionData, SearchResult
-from .planner import Planner
-from .problem_classifier import ProblemClassifier
-from .query_understanding import QueryUnderstanding
-from .reasoning_engine import ReasoningEngine
-from .state_manager import InformationStateManager
-from .tool_belt import ToolBelt
+
+# Re-export from new module locations for backward compatibility
+from ..execution import Executor
+from ..llm import LLMService, ReasoningEngine
+from ..models import Attachment, RevisionData, SearchResult
+from ..planning import Planner, ProblemClassifier, QueryUnderstanding
+from ..state import InformationStateManager
+from ..synthesis import AnswerSynthesizer
+from ..tools import ToolBelt
 
 __all__ = [
     'Agent',

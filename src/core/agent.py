@@ -3,20 +3,17 @@
 import json
 import logging
 import os
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
-from .answer_synthesizer import AnswerSynthesizer
-from .executor import Executor
-from .llm_service import LLMService
-from .models import Attachment
-from .planner import Planner
-from .problem_classifier import ProblemClassifier
-from .query_understanding import QueryUnderstanding
-from .reasoning_engine import ReasoningEngine
-from .state_manager import InformationStateManager
-from .tool_belt import ToolBelt
+from ..execution import Executor
+from ..llm import LLMService, ReasoningEngine
+from ..models import Attachment
+from ..planning import Planner, ProblemClassifier, QueryUnderstanding
+from ..state import InformationStateManager
+from ..synthesis import AnswerSynthesizer, AnswerValidator
+from ..tools import ToolBelt
 
 # Load environment variables
 load_dotenv()
@@ -67,6 +64,9 @@ class Agent:
         self.answer_synthesizer = AnswerSynthesizer(
             self.llm_service, self.state_manager, logger
         )
+        self.answer_validator = AnswerValidator(
+            self.llm_service, self.state_manager, logger
+        )
 
     def solve(
         self, problem: str, attachments: Optional[List[Attachment]] = None
@@ -81,7 +81,7 @@ class Agent:
         4. EXECUTE: Run tool operations
         5. REASON: Analyze results and propagate constraints
         6. SYNTHESIZE: Construct answer from components
-        7. VALIDATE: Verify all requirements satisfied
+        7. VALIDATE: Check if answer is correct and retry incorrect execution steps if needed
 
         Logs its operations to the logger and builds a human-readable monologue.
 
@@ -137,6 +137,23 @@ class Agent:
             execution_results = self.executor.execute_plan(
                 plan, problem, attachments, query_analysis
             )
+            
+            # Include failed subtasks from state_manager that might not be in execution_results
+            for subtask_id, subtask in self.state_manager.subtasks.items():
+                if subtask.status == 'failed' and subtask_id not in execution_results:
+                    # Include failed subtask in execution_results for completeness
+                    error_msg = subtask.metadata.get('error', 'Unknown error')
+                    error_type = subtask.metadata.get('error_type', 'unknown')
+                    execution_results[subtask_id] = {
+                        'error': error_msg,
+                        'error_type': error_type,
+                        'status': 'failed',
+                        'subtask_id': subtask_id,
+                    }
+                    self.logger.info(
+                        f'Included failed subtask {subtask_id} in execution_results'
+                    )
+            
             self.logger.info(
                 f'Execution complete: {len(execution_results)} results obtained'
             )
@@ -229,7 +246,9 @@ class Agent:
                         )
 
                         # Retry only the failed subtasks
-                        self.logger.info('=== Phase 4 (RETRY): EXECUTE FAILED SUBTASKS ===')
+                        self.logger.info(
+                            '=== Phase 4 (RETRY): EXECUTE FAILED SUBTASKS ==='
+                        )
                         retry_results = self.executor.retry_failed_subtasks(
                             problem, attachments, query_analysis
                         )
@@ -243,9 +262,7 @@ class Agent:
                         # Re-run reasoning if constraints exist
                         if constraints:
                             self.logger.info('=== Phase 5 (RETRY): REASON ===')
-                            knowledge_from_execution = list(
-                                execution_results.values()
-                            )
+                            knowledge_from_execution = list(execution_results.values())
                             reasoning_results = (
                                 self.reasoning_engine.propagate_constraints(
                                     constraints, knowledge_from_execution
@@ -288,7 +305,9 @@ class Agent:
                                 )
 
                                 # Execute the new plan
-                                self.logger.info('=== Phase 4 (RETRY): EXECUTE NEW PLAN ===')
+                                self.logger.info(
+                                    '=== Phase 4 (RETRY): EXECUTE NEW PLAN ==='
+                                )
                                 new_execution_results = self.executor.execute_plan(
                                     improved_plan, problem, attachments, query_analysis
                                 )
@@ -340,18 +359,97 @@ class Agent:
                 synthesis,
             )
 
-            # Step 7: VALIDATE - Verify requirements satisfied
+            # Step 7: VALIDATE - Check if answer is correct
             self.logger.info('=== Phase 7: VALIDATE ===')
-            # Validate that final_answer exists and is not empty
-            if not final_answer or final_answer == 'Unable to determine answer':
-                self.logger.warning('Final answer may be incomplete or missing')
+            validation_result = self.answer_validator.validate_answer(
+                problem,
+                final_answer,
+                query_analysis,
+                execution_results,
+                combined_results,
+                plan,
+            )
 
-            validation_info = synthesis.get('validation_info', {})
-            if validation_info:
-                self.logger.info(
-                    f'Final validation: is_complete={validation_info.get("is_complete")}, '
-                    f'data_quality={validation_info.get("data_quality")}'
+            if validation_result['is_correct']:
+                self.logger.info('Answer validation passed. Answer is correct.')
+                self.logger.info('Problem solved. Returning answer.')
+                return (final_answer, monologue)
+            else:
+                # Answer is incorrect, identify and retry only incorrect execution steps
+                self.logger.warning(
+                    f'Answer validation failed: {validation_result.get("reason", "Unknown reason")}'
                 )
+                incorrect_subtask_ids = validation_result.get(
+                    'incorrect_subtask_ids', []
+                )
+
+                if incorrect_subtask_ids:
+                    self.logger.info(
+                        f'Identified {len(incorrect_subtask_ids)} incorrect execution step(s): '
+                        f'{incorrect_subtask_ids}'
+                    )
+
+                    # Retry only the incorrect execution steps
+                    self.logger.info(
+                        '=== Phase 4 (VALIDATION RETRY): EXECUTE INCORRECT SUBTASKS ==='
+                    )
+                    retry_results = self._retry_incorrect_subtasks(
+                        incorrect_subtask_ids,
+                        problem,
+                        attachments,
+                        query_analysis,
+                    )
+                    self.logger.info(
+                        f'Retry execution complete: {len(retry_results)} subtask(s) retried'
+                    )
+
+                    # Merge retry results with existing execution results
+                    execution_results.update(retry_results)
+
+                    # Re-run reasoning if constraints exist
+                    if constraints:
+                        self.logger.info('=== Phase 5 (VALIDATION RETRY): REASON ===')
+                        knowledge_from_execution = list(execution_results.values())
+                        reasoning_results = self.reasoning_engine.propagate_constraints(
+                            constraints, knowledge_from_execution
+                        )
+                        combined_results = {
+                            'execution_summary': execution_results,
+                            'reasoning_summary': reasoning_results,
+                        }
+                    else:
+                        combined_results = {
+                            'execution_summary': execution_results,
+                            'reasoning_summary': {},
+                        }
+
+                    # Re-synthesize answer with corrected results
+                    self.logger.info('=== Phase 6 (VALIDATION RETRY): SYNTHESIZE ===')
+                    synthesis = self.answer_synthesizer.synthesize(
+                        problem, combined_results, query_analysis, attachments
+                    )
+                    final_answer = synthesis.get(
+                        'final_answer', 'Unable to determine answer'
+                    )
+
+                    # Rebuild monologue with updated information
+                    monologue = self.answer_synthesizer.build_monologue(
+                        problem,
+                        query_analysis,
+                        problem_classification,
+                        plan,
+                        combined_results,
+                        synthesis,
+                    )
+
+                    self.logger.info(
+                        f'FINAL ANSWER (after validation retry): {final_answer}'
+                    )
+                else:
+                    self.logger.warning(
+                        'Could not identify specific incorrect subtasks. '
+                        'Proceeding with current answer.'
+                    )
 
             self.logger.info('Problem solved. Returning answer.')
             return (final_answer, monologue)
@@ -362,3 +460,65 @@ class Agent:
 
             self.logger.error(traceback.format_exc())
             return 'I encountered an error and could not solve the problem.', str(e)
+
+    def _retry_incorrect_subtasks(
+        self,
+        incorrect_subtask_ids: List[str],
+        problem: str,
+        attachments: Optional[List[Attachment]],
+        query_analysis: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Retry only the identified incorrect subtasks.
+
+        Args:
+            incorrect_subtask_ids: List of subtask IDs to retry.
+            problem: Original problem description.
+            attachments: Optional attachments.
+            query_analysis: Optional query analysis results.
+
+        Returns:
+            Dictionary with retry execution results.
+        """
+        if not incorrect_subtask_ids:
+            return {}
+
+        # Get the subtasks to retry
+        subtasks_to_retry = []
+        for subtask_id in incorrect_subtask_ids:
+            if subtask_id in self.state_manager.subtasks:
+                subtask = self.state_manager.subtasks[subtask_id]
+                # Reset subtask for retry
+                self.state_manager.retry_subtask(subtask_id)
+                subtasks_to_retry.append(subtask)
+            else:
+                self.logger.warning(f'Subtask ID not found: {subtask_id}')
+
+        if not subtasks_to_retry:
+            self.logger.warning('No valid subtasks to retry.')
+            return {}
+
+        self.logger.info(
+            f'Retrying {len(subtasks_to_retry)} incorrect subtask(s): '
+            f'{[st.id for st in subtasks_to_retry]}'
+        )
+
+        # Re-execute only the incorrect subtasks
+        results = {}
+        for subtask in subtasks_to_retry:
+            subtask.status = 'in_progress'
+            try:
+                self.logger.info(
+                    f'Retrying incorrect subtask: {subtask.id} - {subtask.description}'
+                )
+                result = self.executor.execute_subtask(
+                    subtask, problem, attachments, query_analysis
+                )
+                results[subtask.id] = result
+                self.logger.info(f'Successfully retried subtask: {subtask.id}')
+            except Exception as e:
+                self.logger.error(f'Failed to retry {subtask.id}: {e}', exc_info=True)
+                # Task will remain in failed state
+                continue
+
+        return results

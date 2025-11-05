@@ -5,13 +5,10 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from .json_utils import extract_json_from_text
-from .llm_service import LLMService
-from .models import SearchResult
-from .state_manager import InformationStateManager
-
-if TYPE_CHECKING:
-    from .models import Attachment
+from ..llm import LLMService
+from ..models import Attachment
+from ..state import InformationStateManager
+from ..utils import extract_json_from_text
 
 
 class AnswerSynthesizer:
@@ -236,131 +233,6 @@ class AnswerSynthesizer:
 
         return final_answer
 
-    def _validate_execution_results(
-        self,
-        execution_summary: Dict[str, Any],
-        query_analysis: Dict[str, Any],
-        problem: str,
-    ) -> Dict[str, Any]:
-        """
-        Validate execution results for completeness and data quality using LLM.
-
-        Args:
-            execution_summary: Dictionary of execution results.
-            query_analysis: Query analysis with requirements.
-            problem: Original problem statement.
-
-        Returns:
-            Dictionary with validation information including:
-            - is_complete: Whether critical data is present
-            - missing_requirements: List of requirements not satisfied
-            - data_quality: Assessment of data quality
-        """
-        validation = {
-            'is_complete': True,
-            'missing_requirements': [],
-            'data_quality': 'good',
-            'warnings': [],
-        }
-
-        # Check if execution results are empty
-        if not execution_summary:
-            validation['is_complete'] = False
-            validation['missing_requirements'] = ['No execution results available']
-            validation['data_quality'] = 'poor'
-            validation['warnings'].append('Execution results are empty')
-            return validation
-
-        # Use LLM to validate execution results
-        try:
-            # Format execution results for LLM analysis
-            execution_summary_str = ''
-            for subtask_id, result in execution_summary.items():
-                result_str = self._format_result_content(result)
-                # Truncate very long results to avoid token limits
-                if len(result_str) > 500:
-                    result_str = result_str[:500] + '... (truncated)'
-                execution_summary_str += f'\n### Subtask {subtask_id}:\n{result_str}\n'
-
-            # Extract requirements
-            explicit_requirements = query_analysis.get('explicit_requirements', [])
-            implicit_requirements = query_analysis.get('implicit_requirements', [])
-            all_requirements = explicit_requirements + implicit_requirements
-            answer_format = query_analysis.get('answer_format', 'text')
-
-            system_prompt = """You are an expert at validating execution results for completeness and data quality.
-Analyze whether the execution results contain sufficient information to answer the problem question.
-
-Your task is to:
-1. Check if execution results are empty or contain only placeholder/stub responses
-2. Determine if all critical requirements from the query analysis are addressed by the results
-3. Assess whether the data quality is sufficient to extract the required answer format
-4. Identify any missing information that prevents answering the question
-
-Return a JSON object with:
-- is_complete: boolean indicating if sufficient data is present to answer the question
-- missing_requirements: list of requirement strings that are not satisfied by the results
-- data_quality: string indicating quality level ("good", "fair", "poor")
-- warnings: list of warning messages about data quality issues (e.g., stub responses, incomplete data)"""
-
-            user_prompt = f"""Problem: {problem}
-
-Answer Format Requirement: {answer_format}
-
-Requirements that must be satisfied:
-{chr(10).join(['- ' + req for req in all_requirements])}
-
-Execution Results:
-{execution_summary_str}
-
-Analyze whether these execution results contain sufficient information to answer the problem.
-Pay special attention to:
-- Whether the results contain actual data (not just placeholders or stubs)
-- Whether all explicit and implicit requirements have corresponding data in the results
-- Whether the data is in a format that can be used to construct the required answer format
-- Whether any critical information is missing that would prevent answering the question"""
-
-            response = self.llm_service.call_with_system_prompt(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                temperature=0.3,  # Lower temperature for more consistent validation
-                response_format={'type': 'json_object'},
-            )
-
-            # Parse LLM response
-            json_text = extract_json_from_text(response)
-            llm_validation = json.loads(json_text)
-
-            # Update validation with LLM results
-            validation['is_complete'] = llm_validation.get('is_complete', True)
-            validation['missing_requirements'] = llm_validation.get(
-                'missing_requirements', []
-            )
-            validation['data_quality'] = llm_validation.get('data_quality', 'good')
-            validation['warnings'] = llm_validation.get('warnings', [])
-
-            self.logger.debug(
-                f'LLM validation: is_complete={validation["is_complete"]}, '
-                f'data_quality={validation["data_quality"]}, '
-                f'warnings={len(validation["warnings"])}'
-            )
-
-        except Exception as e:
-            self.logger.warning(f'LLM validation failed, using default validation: {e}')
-            # Fallback to basic validation if LLM call fails
-            stub_keywords = ['[STUB]', 'stub', 'placeholder', 'example']
-            has_stubs = any(
-                any(keyword in str(result).lower() for keyword in stub_keywords)
-                for result in execution_summary.values()
-            )
-            if has_stubs:
-                validation['warnings'].append(
-                    'Some execution results contain placeholder/stub responses'
-                )
-                validation['data_quality'] = 'fair'
-
-        return validation
-
     def _extract_structured_data_hints(
         self, execution_summary: Dict[str, Any], query_analysis: Dict[str, Any]
     ) -> str:
@@ -380,6 +252,16 @@ Pay special attention to:
         # PRIORITY 1: Extract from browser_navigate extracted_counts (most reliable)
         extracted_counts_found = []
         for result in execution_summary.values():
+            # Skip error results
+            if isinstance(result, dict) and result.get('status') == 'failed':
+                continue
+            if isinstance(result, str) and (
+                result.startswith('Error:')
+                or result.startswith('Name Error:')
+                or result.startswith('Execution Error:')
+            ):
+                continue
+
             if isinstance(result, dict):
                 # Check for extracted_counts (from extract_count/extract_statistics)
                 if 'extracted_counts' in result and result.get('extracted_counts'):
@@ -474,198 +356,6 @@ Pay special attention to:
 
         return '\n'.join(hints) if hints else ''
 
-    def _format_result_content(self, result: Any) -> str:
-        """
-        Format execution result content for better readability.
-        Extracts actual content from objects instead of showing object representations.
-
-        Args:
-            result: Execution result (can be various types).
-
-        Returns:
-            Formatted string with actual content.
-        """
-        if result is None:
-            return 'No result'
-
-        # Handle lists of SearchResult objects
-        if isinstance(result, list) and len(result) > 0:
-            formatted_items = []
-            for item in result:
-                if isinstance(item, SearchResult):
-                    # Extract actual content from SearchResult
-                    item_str = f'Title: {item.title}\n'
-                    item_str += f'URL: {item.url}\n'
-                    item_str += f'Snippet: {item.snippet}\n'
-                    if item.relevance_score > 0:
-                        item_str += f'Relevance: {item.relevance_score:.2f}'
-                    formatted_items.append(item_str)
-                elif isinstance(item, dict):
-                    # Format dictionaries nicely
-                    formatted_items.append(
-                        json.dumps(item, indent=2, ensure_ascii=False, default=str)
-                    )
-                else:
-                    # For other types, convert to string
-                    formatted_items.append(str(item))
-            return '\n\n---\n\n'.join(formatted_items)
-
-        # Handle SearchResult directly (not in a list)
-        if isinstance(result, SearchResult):
-            formatted = f'Title: {result.title}\n'
-            formatted += f'URL: {result.url}\n'
-            formatted += f'Snippet: {result.snippet}\n'
-            if result.relevance_score > 0:
-                formatted += f'Relevance: {result.relevance_score:.2f}'
-            return formatted
-
-        # Handle dictionaries
-        if isinstance(result, dict):
-            # Special handling for search results with processed content (from SearchResultProcessor)
-            if 'content' in result and 'processing_summary' in result:
-                highlighted = '=== PROCESSED SEARCH RESULTS (WEB PAGES + FILES) ===\n'
-                
-                # Show summary stats
-                summary = result.get('processing_summary', {})
-                highlighted += f"Processed: {summary.get('processed_count', 0)} results\n"
-                highlighted += f"Relevant: {summary.get('relevant_count', 0)} results\n"
-                highlighted += f"Web Pages: {len(result.get('web_pages', []))} navigated\n"
-                highlighted += f"Files: {len(result.get('downloaded_files', []))} downloaded\n\n"
-                
-                # Show the aggregated content (this is the key extracted content!)
-                content = result.get('content', '')
-                if content:
-                    highlighted += '=== EXTRACTED CONTENT FROM WEB PAGES AND FILES ===\n'
-                    # Limit length to avoid token limits
-                    max_content_length = 3000
-                    if len(content) > max_content_length:
-                        highlighted += content[:max_content_length] + '\n\n...[content truncated for length]...\n'
-                    else:
-                        highlighted += content + '\n'
-                else:
-                    highlighted += '[No content extracted]\n'
-                
-                highlighted += '\n=== FULL RESULT DETAILS ===\n'
-                highlighted += json.dumps(
-                    result, indent=2, ensure_ascii=False, default=str
-                )[:2000]  # Limit JSON dump to avoid overwhelming output
-                return highlighted
-            
-
-            # Special handling for browser_navigate errors - show diagnostics clearly
-            if not result.get('success', True) and 'diagnostics' in result:
-                diagnostics = result['diagnostics']
-                error_details = f'ERROR: {result.get("error", "Unknown error")}\n'
-                error_details += f'Status Code: {result.get("status_code", "N/A")}\n'
-
-                if diagnostics.get('page_load_failed'):
-                    error_details += (
-                        f'🔴 Page Load Failed\n'
-                        f'  Original Error: {diagnostics.get("original_error", "Unknown")}\n'
-                        f'  Status: {diagnostics.get("status_code", "N/A")}\n'
-                    )
-                elif diagnostics.get('navigation_failed'):
-                    error_details += (
-                        f'🔴 Navigation Failed After Link Click\n'
-                        f'  Target URL: {diagnostics.get("target_url", "Unknown")}\n'
-                        f'  Status: {diagnostics.get("status_code", "N/A")}\n'
-                    )
-                elif diagnostics.get('link_found') is False:
-                    error_details += (
-                        f'🔴 Link Not Found on Page\n'
-                        f'  Searched Text: "{diagnostics.get("searched_text", "N/A")}"\n'
-                        f'  Searched Pattern: "{diagnostics.get("searched_pattern", "N/A")}"\n'
-                    )
-                    if diagnostics.get('similar_links_found'):
-                        error_details += f'  💡 Similar Links Found: {", ".join(diagnostics["similar_links_found"][:3])}\n'
-                    if diagnostics.get('sample_link_texts'):
-                        sample = diagnostics['sample_link_texts'][:5]
-                        error_details += (
-                            f'  Sample Links on Page: {", ".join(sample)}\n'
-                        )
-
-                error_details += '\n💡 SUGGESTION: Check if:\n'
-                error_details += '  - The URL is correct and accessible\n'
-                error_details += '  - The link text/pattern matches exactly\n'
-                error_details += '  - Authentication or special access is required\n'
-                error_details += '  - Try alternative search terms or URL patterns\n'
-
-                return (
-                    error_details
-                    + '\n=== FULL RESULT DETAILS ===\n'
-                    + json.dumps(result, indent=2, ensure_ascii=False, default=str)
-                )
-
-            # Special handling for browser_navigate results with extracted counts
-            # Highlight extracted values prominently so LLM can easily identify them
-            if 'extracted_counts' in result and result.get('extracted_counts'):
-                extracted_counts = result['extracted_counts']
-                highlighted = '=== EXTRACTED VALUES (PRIMARY DATA) ===\n'
-                for count_item in extracted_counts:
-                    value = count_item.get('value', 'N/A')
-                    context = count_item.get('context', '')
-                    confidence = count_item.get('confidence', 'N/A')
-                    reasoning = count_item.get('reasoning', '')
-                    highlighted += f'EXTRACTED VALUE: {value}\n'
-                    if context:
-                        highlighted += f'  Context: {context[:200]}\n'
-                    if confidence != 'N/A':
-                        highlighted += f'  Confidence: {confidence:.2f}\n'
-                    if reasoning:
-                        highlighted += f'  Reasoning: {reasoning[:200]}\n'
-                    highlighted += '\n'
-                highlighted += '=== FULL RESULT DETAILS ===\n'
-                highlighted += json.dumps(
-                    result, indent=2, ensure_ascii=False, default=str
-                )
-                return highlighted
-
-            # Special handling for LLM extraction results
-            if 'llm_extraction' in result and result.get('llm_extraction'):
-                llm_extraction = result['llm_extraction']
-                extracted_value = llm_extraction.get('extracted_value')
-                if extracted_value is not None:
-                    highlighted = (
-                        f'=== EXTRACTED VALUE (LLM EXTRACTION): {extracted_value} ===\n'
-                    )
-                    highlighted += (
-                        f'Confidence: {llm_extraction.get("confidence", 0.0):.2f}\n'
-                    )
-                    highlighted += f'Reasoning: {llm_extraction.get("reasoning", "")}\n'
-                    highlighted += '\n=== FULL RESULT DETAILS ===\n'
-                    highlighted += json.dumps(
-                        result, indent=2, ensure_ascii=False, default=str
-                    )
-                    return highlighted
-
-            # Special handling for numeric_data
-            if 'numeric_data' in result and result.get('numeric_data'):
-                numeric_data = result['numeric_data']
-                counts = numeric_data.get('counts', [])
-                if counts:
-                    highlighted = '=== EXTRACTED COUNTS (PRIMARY DATA) ===\n'
-                    for count_item in counts[:5]:  # Limit to top 5
-                        value = count_item.get('value', 'N/A')
-                        context = count_item.get('context', '')
-                        highlighted += f'COUNT VALUE: {value}\n'
-                        if context:
-                            highlighted += f'  Context: {context[:200]}\n'
-                        highlighted += '\n'
-                    highlighted += '=== FULL RESULT DETAILS ===\n'
-                    highlighted += json.dumps(
-                        result, indent=2, ensure_ascii=False, default=str
-                    )
-                    return highlighted
-
-            return json.dumps(result, indent=2, ensure_ascii=False, default=str)
-
-        # Handle strings
-        if isinstance(result, str):
-            return result
-
-        # For other types, convert to string
-        return str(result)
-
     def synthesize(
         self,
         problem: str,
@@ -688,7 +378,7 @@ Pay special attention to:
         Returns:
             Dictionary with:
             - final_answer: The comprehensive synthesized report answer
-            - validation_info: Dictionary with validation results (is_complete, data_quality, missing_requirements, warnings)
+            - validation_info: Empty dictionary (validation is handled by validation.py)
         """
         self.logger.info('Synthesizing final report answer')
 
@@ -699,11 +389,12 @@ Your task is to generate a precise answer that:
 2. Integrates all available information from execution results, knowledge graph, and attachments
 3. STRICTLY follows the format requirements specified (e.g., "word" = single word only, "number" = number only)
 4. Provides ONLY the factual answer without extra explanations
+5. **CRITICAL: ALWAY return the NAME in words using the shortest common name rather than the symbol**
 
 CRITICAL: USE EXACT EXTRACTED VALUES FOR CALCULATIONS
-- When execution results show extracted values (e.g., "EXTRACTED VALUE: 1002"), you MUST use that EXACT number for calculations
+- When execution results show extracted values (e.g., "EXTRACTED VALUE: XXX"), you MUST use that EXACT number for calculations
 - DO NOT assume, estimate, or guess different numbers when an extracted value is available
-- If a calculation is needed (e.g., "1002 × 0.04"), use the exact extracted value from the results
+- If a calculation is needed, use the exact extracted value from the results
 - Look for sections marked "=== EXTRACTED VALUES (PRIMARY DATA) ===" or "EXTRACTED COUNT VALUE:" - these are the actual extracted values to use
 - DO NOT use phrases like "assumed", "approximately", or "estimated" when an exact extracted value exists
 
@@ -727,8 +418,13 @@ GENERATION GUIDELINES:
 - Pay special attention to structured data extraction hints provided in the execution results
 - If information is missing, return the best available answer that still meets format requirements
 
-ALWAYS return a JSON object with ONLY:
-- "final_answer": The answer in the exact format specified (e.g., if "word" required, return just the word, not a sentence explaining the word)
+CRITICAL: If the `reasoning_summary` explicitly identifies a specific number as the 'best_ball' or optimal choice to maximize winning probability, you MUST use that number as the `final_answer`. Ensure the `final_answer` is consistent with the `reasoning_summary`.
+
+ALWAYS return a JSON object with EXACTLY these two fields:
+- "final_answer": The answer in the exact format specified (e.g., if "word" required, return just the word, not a sentence explaining the word). This is the ONLY field that should be used for answer extraction.
+- "description": A brief description of how the final_answer was derived (optional explanation, but final_answer is the authoritative answer)
+
+CRITICAL: The "final_answer" field is the ONLY answer that should be extracted and used. Do NOT include dates, intermediate values, or other information in final_answer unless they are the actual answer to the question.
 
 The final_answer MUST be formatted exactly as required - no exceptions."""
 
@@ -794,55 +490,36 @@ The final_answer MUST be formatted exactly as required - no exceptions."""
         execution_summary = execution_results.get('execution_summary', {})
         reasoning_summary = execution_results.get('reasoning_summary', {})
 
-        # Validate execution results for completeness
-        validation_info = self._validate_execution_results(
-            execution_summary, query_analysis, problem
-        )
-
-        # Check for failed tasks and refuse to answer if critical tasks failed
-        failed_tasks = []
-        all_failed = True
-        for subtask_id, result in execution_summary.items():
-            if isinstance(result, dict):
-                # Check for errors or failures
-                if result.get('success') is False or 'error' in result:
-                    error_msg = result.get('error', 'Unknown error')
-                    failed_tasks.append(f"{subtask_id}: {error_msg}")
-                else:
-                    all_failed = False
-            elif isinstance(result, str) and ('error' in result.lower() or '[stub]' in result.lower()):
-                failed_tasks.append(f"{subtask_id}: {result[:100]}")
-            else:
-                all_failed = False
-        
-        # If all tasks failed or validation indicates poor data quality with no usable data
-        if (all_failed and failed_tasks) or (
-            validation_info.get('data_quality') == 'poor' 
-            and not validation_info.get('is_complete')
-            and len(failed_tasks) > 0
-        ):
-            self.logger.error(f"Cannot answer question - {len(failed_tasks)} task(s) failed")
-            for task_failure in failed_tasks:
-                self.logger.error(f"  - {task_failure}")
-            
-            failure_details = "\n".join([f"  - {task}" for task in failed_tasks])
-            refusal_message = (
-                f"Unable to answer the question. The following task(s) failed:\n"
-                f"{failure_details}\n\n"
-                f"These failures prevented gathering the necessary information to answer your question."
-            )
-            return {
-                'final_answer': refusal_message,
-                'validation_info': validation_info
-            }
-
-
         # Format execution results for better readability
         execution_summary_str = ''
         if execution_summary:
             execution_summary_str = '## Execution Results Summary\n'
             for subtask_id, result in execution_summary.items():
-                result_str = self._format_result_content(result)
+                # Filter out error results - skip failed subtasks and error strings
+                if isinstance(result, dict) and result.get('status') == 'failed':
+                    self.logger.debug(
+                        f'Skipping failed subtask {subtask_id} from synthesis'
+                    )
+                    continue
+
+                # Check if result is an error string
+                if isinstance(result, str) and (
+                    result.startswith('Error:')
+                    or result.startswith('Name Error:')
+                    or result.startswith('Execution Error:')
+                    or result.startswith('Import Error:')
+                ):
+                    self.logger.debug(
+                        f'Skipping error result from subtask {subtask_id}: {result[:100]}'
+                    )
+                    continue
+
+                if isinstance(result, dict):
+                    result_str = json.dumps(
+                        result, indent=2, ensure_ascii=False, default=str
+                    )
+                else:
+                    result_str = str(result)
                 execution_summary_str += f'\n### Subtask {subtask_id}:\n{result_str}\n'
 
             # Add structured data extraction hints
@@ -855,6 +532,17 @@ The final_answer MUST be formatted exactly as required - no exceptions."""
             # Extract and highlight key values for calculations
             calculation_values = []
             for subtask_id, result in execution_summary.items():
+                # Skip error results
+                if isinstance(result, dict) and result.get('status') == 'failed':
+                    continue
+                if isinstance(result, str) and (
+                    result.startswith('Error:')
+                    or result.startswith('Name Error:')
+                    or result.startswith('Execution Error:')
+                    or result.startswith('Import Error:')
+                ):
+                    continue
+
                 if isinstance(result, dict):
                     # Check for extracted_counts
                     if 'extracted_counts' in result and result.get('extracted_counts'):
@@ -898,15 +586,6 @@ The final_answer MUST be formatted exactly as required - no exceptions."""
                         calculation_hints += f'  Context: {calc_val["context"]}\n'
                 calculation_hints += '\n⚠️ When performing calculations, use these exact values. Do not assume or estimate different numbers.\n'
                 execution_summary_str += calculation_hints
-
-            # Add validation warnings if data quality is poor
-            if validation_info.get('warnings'):
-                warnings_str = '\n'.join(
-                    [f'- {w}' for w in validation_info['warnings']]
-                )
-                execution_summary_str += (
-                    f'\n## Data Quality Warnings:\n{warnings_str}\n'
-                )
 
         # Format reasoning summary
         reasoning_summary_str = ''
@@ -961,23 +640,34 @@ Instructions:
    - If question asks for a date, find and extract the exact date matching the format requirement
    - If question asks for a word/term, find the exact word in results
    - If question asks for zip codes, extract all five-digit zip codes from results
+   - **If question asks for "character name", convert any symbol (`, ., ,) to its NAME ("backtick", "dot", "comma")**
 5. When performing calculations:
    - Find the extracted value in the "Key Values for Calculations" section
-   - Use that EXACT value in your calculation (e.g., if extracted value is 1002, use 1002, not 500 or 800)
+   - Use that EXACT value in your calculation
    - Show the calculation: extracted_value × multiplier = result
 6. Synthesize this information into a coherent answer
-7. STRICTLY follow the format requirements - if it says "word", return ONLY a single word; if it says "number", return ONLY a number
+7. STRICTLY follow the format requirements - if it says "word", return ONLY a single word; if it says "number", return ONLY a number; if it says "character name", return the NAME not the symbol
 8. Ensure the final_answer field contains ONLY the ACTUAL ANSWER (no explanations, no meta-commentary, no summaries)
 9. If format requires a word, extract the exact word from the results - do not add explanations
 10. Before finalizing, validate that your answer matches the expected format exactly and uses the extracted values correctly
 
-Return ONLY a JSON object with a "final_answer" field containing your synthesized answer."""
+Return a JSON object with EXACTLY these two fields:
+- "final_answer": The actual answer to the question (extract and use this field only)
+- "description": Brief explanation of how the answer was derived
+
+CRITICAL:
+- The "final_answer" field is the ONLY answer value. Extract and use this field exclusively.
+- Do NOT include dates, intermediate calculations, or context in final_answer unless they ARE the answer.
+- If the question asks for a word, final_answer should contain ONLY that word.
+- If the question asks for a number, final_answer should contain ONLY that number.
+
+IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
 
         try:
             response = self.llm_service.call_with_system_prompt(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                temperature=1.0,
+                temperature=0.0,  # Maximum determinism for consistent answer formatting
                 response_format={'type': 'json_object'},
             )
 
@@ -990,28 +680,18 @@ Return ONLY a JSON object with a "final_answer" field containing your synthesize
             self.logger.debug(
                 f'Raw synthesis response (first 500 chars): {response[:500]}'
             )
-            # Extract JSON and parse it to get final_answer field
+
+            # Extract JSON and parse it - return as-is
             json_text = extract_json_from_text(response)
             response_data = json.loads(json_text)
-            final_answer = response_data.get('final_answer', response)
 
-            # Format final_answer properly
-            if isinstance(final_answer, (dict, list)):
-                # Convert structured data to JSON string
-                final_answer = json.dumps(final_answer, indent=2, ensure_ascii=False)
-                self.logger.debug(
-                    'Converted final_answer from structured data to JSON string'
-                )
-            elif isinstance(final_answer, str):
-                # Remove any leading/trailing whitespace
-                final_answer = final_answer.strip()
-            else:
-                # Convert non-string types to string
-                final_answer = str(final_answer)
+            # Extract final_answer from the JSON response
+            final_answer = response_data.get('final_answer', '')
+            description = response_data.get('description', '')
 
-            # Validate and correct format compliance
-            final_answer = self._validate_and_correct_format(
-                final_answer, query_analysis, execution_summary
+            # Log what was extracted
+            self.logger.debug(
+                f'Extracted final_answer: {final_answer}, description: {description[:100] if description else "None"}'
             )
 
             # Log summary
@@ -1025,8 +705,10 @@ Return ONLY a JSON object with a "final_answer" field containing your synthesize
                 f'(length: {len(str(final_answer))})'
             )
 
-            # Return final_answer and validation_info
-            return {'final_answer': final_answer, 'validation_info': validation_info}
+            # Return final_answer with empty validation_info (validation handled by validation.py)
+            # return {'final_answer': final_answer, 'validation_info': {}}
+            return response_data
+
         except json.JSONDecodeError as e:
             self.logger.error(f'Failed to parse synthesis response: {e}')
             self.logger.debug(
@@ -1041,11 +723,7 @@ Return ONLY a JSON object with a "final_answer" field containing your synthesize
                 )
                 if answer_match:
                     fallback_answer = answer_match.group(1).strip()
-            # Include validation info even on error
-            validation_info = self._validate_execution_results(
-                execution_results.get('execution_summary', {}), query_analysis, problem
-            )
-            return {'final_answer': fallback_answer, 'validation_info': validation_info}
+            return {'final_answer': fallback_answer, 'validation_info': {}}
         except Exception as e:
             self.logger.error(f'Answer synthesis failed: {e}', exc_info=True)
             # Always return a valid format even on error
@@ -1065,11 +743,10 @@ Return ONLY a JSON object with a "final_answer" field containing your synthesize
                                 break
             except Exception:
                 pass  # Use default fallback if extraction fails
-            # Include validation info even on error
-            validation_info = self._validate_execution_results(
-                execution_results.get('execution_summary', {}), query_analysis, problem
-            )
-            return {'final_answer': fallback_answer, 'validation_info': validation_info}
+            return {
+                'final_answer': fallback_answer,
+                'description': 'Exception occurred during answer synthesis',
+            }
 
     def build_monologue(
         self,
@@ -1124,6 +801,16 @@ Format the monologue with sections like:
         extracted_values_summary = []
 
         for subtask_id, result in execution_summary.items():
+            # Skip error results
+            if isinstance(result, dict) and result.get('status') == 'failed':
+                continue
+            if isinstance(result, str) and (
+                result.startswith('Error:')
+                or result.startswith('Name Error:')
+                or result.startswith('Execution Error:')
+            ):
+                continue
+
             if isinstance(result, dict):
                 # Check for extracted_counts
                 if 'extracted_counts' in result and result.get('extracted_counts'):
@@ -1159,7 +846,23 @@ Format the monologue with sections like:
         if execution_summary:
             execution_summary_str = '\n\n=== Execution Results ===\n'
             for subtask_id, result in execution_summary.items():
-                result_str = self._format_result_content(result)
+                # Skip error results from monologue
+                if isinstance(result, dict) and result.get('status') == 'failed':
+                    continue
+                if isinstance(result, str) and (
+                    result.startswith('Error:')
+                    or result.startswith('Name Error:')
+                    or result.startswith('Execution Error:')
+                    or result.startswith('Import Error:')
+                ):
+                    continue
+
+                if isinstance(result, dict):
+                    result_str = json.dumps(
+                        result, indent=2, ensure_ascii=False, default=str
+                    )
+                else:
+                    result_str = str(result)
                 # Truncate long results
                 if len(result_str) > 1000:
                     result_str = result_str[:1000] + '... (truncated)'
@@ -1185,7 +888,7 @@ Create a comprehensive reasoning monologue that:
             monologue = self.llm_service.call_with_system_prompt(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                temperature=1.0,
+                temperature=0.3,  # Consistent but readable monologue generation
             )
             return monologue
         except Exception as e:

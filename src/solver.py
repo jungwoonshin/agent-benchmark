@@ -7,7 +7,9 @@ from typing import List, Optional
 
 from dotenv import load_dotenv
 
-from .core import Agent, Attachment, ToolBelt
+from .core import Agent
+from .models import Attachment
+from .tools import ToolBelt
 
 # Load environment variables
 load_dotenv()

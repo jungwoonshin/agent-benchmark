@@ -62,7 +62,9 @@ def test_case(
 
         # Check if answer is correct (simple string matching)
         # Only check match if we have a non-empty answer
-        got_answer = answer.answer.strip() if answer.answer else ''
+        # Convert to string first to handle cases where answer might be an integer
+        answer_str = str(answer.answer) if answer.answer is not None else ''
+        got_answer = answer_str.strip() if answer_str else ''
         expected = expected_answer.strip()
 
         # Task is successful only if LLM generated a proper answer (not a refusal message)
@@ -79,13 +81,10 @@ def test_case(
         # Success requires: non-empty answer, confidence > 0, and NOT a refusal message
         is_successful = got_answer and answer.confidence > 0.0 and not is_refusal
 
-        # Match requires both: substring match AND successful answer
+        # Match requires both: exact match AND successful answer
         answer_match = False
         if is_successful:
-            answer_match = (
-                expected.lower() in got_answer.lower()
-                or got_answer.lower() in expected.lower()
-            )
+            answer_match = expected.lower().strip() == got_answer.lower().strip()
 
         result = {
             'task_id': task_id,
@@ -157,7 +156,7 @@ def main():
     # Load validation cases
     validation_file = 'gaia_dataset/validation.json'
     print(f'\nLoading validation cases from {validation_file}...')
-    cases = load_validation_cases(validation_file, num_cases=10)[:1]
+    cases = [load_validation_cases(validation_file, num_cases=10)[2]]
     print(f'Loaded {len(cases)} cases')
 
     # Test each case
@@ -210,7 +209,7 @@ def main():
             print(f'  Error: {result["error"]}')
 
         logging.info(
-            f'Case {i}: Task ID={result["task_id"]}, Match={result["match"]}, Success={result["success"]}'
+            f'Case {i}: Task ID={result["task_id"]}, Match={result["match"]} (Expected: {result["expected"]} / Got: {result["got"]}), Success={result["success"]}'
         )
         if 'error' in result:
             logging.error(f'Case {i} Error: {result["error"]}')

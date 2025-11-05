@@ -4,8 +4,8 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
-from .json_utils import extract_json_from_text
-from .llm_service import LLMService
+from ..llm import LLMService
+from ..utils import extract_json_from_text
 
 
 class QueryUnderstanding:
@@ -64,7 +64,9 @@ Return your analysis as a JSON object with these keys:
 - answer_format: string describing expected format
 - cross_references: list of strings describing cross-references
 
-Be thorough and precise."""
+Be thorough and precise.
+
+IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
 
         user_prompt = f"""Problem: {problem}{attachment_info}
 
