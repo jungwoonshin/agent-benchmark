@@ -57,7 +57,39 @@ Each plan should be as detailed as possible.
 Given a problem analysis and classification, create a concise execution plan with only the ESSENTIAL steps needed.
 
 CRITICAL: Create the MINIMUM number of subtasks necessary to solve the problem. Aim for 3-7 essential subtasks maximum.
-- Group related operations into single subtasks when possible
+
+**AVOIDING REDUNDANCY - UNIVERSAL PRINCIPLES**:
+
+Before creating your plan, analyze the problem to identify:
+- What are the UNIQUE data sources needed? (each source = potentially ONE subtask)
+- What are the UNIQUE processing operations? (group operations on same data)
+- What is the FINAL output? (work backwards - what's the last meaningful step that produces it?)
+
+Then apply these rules:
+
+1. **Combine operations with the same tool and target**:
+   - If multiple steps use the SAME tool (search, read_attachment, etc.) on the SAME source/target, combine them into ONE subtask
+   - Examples: Multiple searches of same website/database/archive → ONE search subtask
+   - Examples: Multiple reads from same document → ONE read_attachment subtask
+   - Examples: Multiple calculations using same data → ONE llm_reasoning subtask
+   - **Test**: Can I describe both operations in a single comprehensive instruction? If yes, combine them.
+
+2. **Eliminate redundant processing steps**:
+   - If step N already performs comparison/filtering/selection on data from step M, DO NOT add step N+1 to "compare step M with step N"
+   - The step that performs the analysis IS the final result - don't add another step to restate it
+   - Only create synthesis steps when truly combining INDEPENDENT results from parallel branches
+   - **Test**: Does this step just reword or restate the output of a previous step? If yes, remove it.
+
+3. **Group sequential operations on the same data**:
+   - If you need to: fetch data → extract field A → extract field B, combine into ONE step "fetch data and extract fields A and B"
+   - Avoid: step_1 "download PDF", step_2 "extract text from PDF" → Instead: step_1 "download PDF and extract text"
+   - **Test**: Does step N+1 operate on ONLY the output of step N, using the same tool? If yes, merge them.
+
+4. **Parallel vs Sequential - choose wisely**:
+   - Create parallel subtasks ONLY when they are truly independent (no shared data dependencies)
+   - If two subtasks process the SAME source/document, combine them rather than making them parallel
+   - **Test**: Can these steps share a tool invocation? If yes, combine them instead of parallelizing.
+
 - DO NOT create separate subtasks for each requirement or dependency
 - DO NOT create fallback strategy subtasks upfront - handle failures during execution if needed
 - Focus on the core workflow: what information to gather → how to process it → how to synthesize the answer
@@ -135,12 +167,7 @@ Return a JSON object with:
     * llm_reasoning: Use for computation, data processing, analysis, and reasoning tasks. This replaces code_interpreter with LLM-based problem solving.
     * read_attachment: Use to read files that were already provided or downloaded. This automatically extracts text from PDFs - no code needed.
     * analyze_media: Use to analyze images, audio, or video files
-  - search_queries: REQUIRED ARRAY OF 3 STRINGS (only for subtasks using 'search' tool) - Generate exactly 3 different search queries to try for this subtask. Each query should approach the information need from a different angle to maximize coverage.
-    * REQUIRED ONLY when tool is 'search' - for llm_reasoning or LLM-only tasks, use empty array [] or omit
-    * CRITICAL: Generate exactly 3 different search queries that:
-      - Use different keyword combinations or phrasings
-      - Approach the information need from different angles (e.g., one focusing on domain, one on topic, one on specific details)
-      - Each query should be concise and keyword-optimized
+  - search_queries: (ONLY for 'search' tool) - Array of exactly 3 different search queries. OMIT this field entirely for non-search tools.
     * FORMAT RULES (apply to each of the 3 queries):
       - Use ONLY keywords and essential terms - NO verbs, NO descriptive phrases, NO unnecessary words
       - Keep it SHORT: 3-8 keywords maximum (typically 5-6 words)
@@ -149,18 +176,41 @@ Return a JSON object with:
       - Separate keywords with spaces, NOT commas or special formatting
     * KEYWORD SELECTION:
       - Include: Domain/source (arXiv, Nature, etc.), topic keywords, dates, location (if relevant)
+      - Use different keyword combinations or phrasings for each query
       - DO NOT BE TOO SPECIFIC - THE SEARCH TOOL WILL NAVIGATE TO THE SOURCE AND EXTRACT THE INFORMATION AUTOMATICALLY
-  - dependencies: list of subtask IDs that must complete first (empty if none)
+  - dependencies: list of subtask IDs that must complete first (empty array [] if none)
   - parallelizable: boolean indicating if this can run in parallel with others
 
-CRITICAL: The search_queries field is REQUIRED ONLY for subtasks using the 'search' tool:
-- For subtasks with tool='search': MUST include a search_queries array with exactly 3 different search queries in concise keyword-only format (3-8 keywords each, no verbs or descriptive phrases). Example: ['arXiv Physics Society August 11 2016', 'arXiv Physics Society 2016', 'Physics Society arXiv August'] NOT ['arXiv Physics and Society article submitted August 11 2016 society descriptors']. Remove words like 'article', 'submitted', 'descriptors', 'about'. The search tool will automatically navigate and extract from archives.
-- For subtasks with tool='llm_reasoning' or other non-search tools: Use empty array [] for search_queries or omit it
-- Each search query in the array MUST be:
-  - NO verbs, NO descriptive phrases, NO filler words
-  - Optimized for search engines (like Google search bar queries)
-  - Different from the other queries (different angles/approaches)
-- The executor will try all 3 search queries and combine results - it will NOT use the description field
+CRITICAL RULES TO AVOID REDUNDANCY:
+1. **search_queries field** (JSON structure requirement):
+   - For tool='search': MUST include search_queries array with exactly 3 different queries
+   - For tool='llm_reasoning', 'read_attachment', or 'analyze_media': OMIT search_queries entirely (do not include empty array)
+   
+2. **Identify and eliminate duplicate patterns** (applies to ALL tools):
+   Before creating multiple subtasks, ask: "Do these steps use the same tool on the same target?"
+   
+   Pattern A - Same tool, same source:
+   - BAD: step_1 "Search [source] for X" + step_N "Search [source] for Y"
+   - GOOD: step_1 "Search [source] for X and Y" (list all requirements in one description)
+   
+   Pattern B - Same document, multiple extractions:
+   - BAD: step_1 "Read doc and extract A" + step_N "Read doc and extract B"
+   - GOOD: step_1 "Read doc and extract A and B"
+   
+   Pattern C - Same data, multiple calculations:
+   - BAD: step_1 "Calculate X from data" + step_N "Calculate Y from data"
+   - GOOD: step_1 "Calculate X and Y from data"
+   
+3. **Eliminate redundant comparison/output steps**:
+   Before creating a "compare" or "output" step, ask: "Does the previous step already produce this result?"
+   
+   - BAD: step_N "find item from list A that matches criteria in B" + step_N+1 "compare list A with result from step_N"
+   - GOOD: step_N "find item from list A that matches criteria in B" (this IS the final answer)
+   
+   - BAD: step_N "analyze and select the answer" + step_N+1 "output the result from step_N"
+   - GOOD: step_N "analyze and select the answer" (already outputs it)
+   
+   Only create synthesis steps when combining results from TRULY INDEPENDENT parallel branches, not when restating a previous result.
 
 Order subtasks logically based on dependencies. Keep it minimal and essential.
 

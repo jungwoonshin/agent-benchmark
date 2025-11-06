@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from urllib.parse import urljoin
 
+import html2text
 import requests
 from bs4 import BeautifulSoup
 from selenium import webdriver
@@ -177,13 +178,38 @@ class Browser:
                 'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             )
             chrome_options.add_argument('--log-level=3')
+            # Anti-detection options to avoid being blocked
+            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
             chrome_options.add_experimental_option(
-                'excludeSwitches', ['enable-logging']
+                'excludeSwitches', ['enable-automation', 'enable-logging']
             )
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+            # Set page load strategy to 'eager' to avoid waiting for all resources
+            # This helps avoid timeouts on slow-loading pages
+            try:
+                from selenium.webdriver.common.page_load_strategy import (
+                    PageLoadStrategy,
+                )
+
+                chrome_options.page_load_strategy = PageLoadStrategy.EAGER
+            except ImportError:
+                # Fallback for older Selenium versions
+                chrome_options.page_load_strategy = 'eager'
             chromedriver_path = self._resolve_chromedriver_path()
             self.logger.debug(f'Using chromedriver at: {chromedriver_path}')
             service = Service(chromedriver_path)
             self.driver = webdriver.Chrome(service=service, options=chrome_options)
+            # Execute script to remove webdriver property
+            self.driver.execute_cdp_cmd(
+                'Page.addScriptToEvaluateOnNewDocument',
+                {
+                    'source': """
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    })
+                """
+                },
+            )
             self.driver.set_page_load_timeout(self.timeout)
             self.logger.info(
                 f'Selenium WebDriver initialized (headless={self.headless})'
@@ -195,7 +221,11 @@ class Browser:
             raise
 
     def navigate(
-        self, url: str, use_selenium: bool = False, wait_for_js: float = 2.0
+        self,
+        url: str,
+        use_selenium: bool = False,
+        wait_for_js: float = 2.0,
+        fallback_to_requests: bool = True,
     ) -> Dict[str, Any]:
         """
         Navigate to a URL and return page content.
@@ -204,12 +234,29 @@ class Browser:
             url: URL to navigate to.
             use_selenium: If True, use Selenium for navigation. Otherwise, use requests.
             wait_for_js: Seconds to wait for JavaScript execution (Selenium only).
+            fallback_to_requests: If True, fallback to requests if Selenium fails.
 
         Returns:
             Dictionary with page data.
         """
         if use_selenium:
-            return self._navigate_selenium(url, wait_for_js)
+            result = self._navigate_selenium(url, wait_for_js)
+            # If Selenium fails and fallback is enabled, try with requests
+            if not result.get('success') and fallback_to_requests:
+                error = result.get('error', '')
+                # Check if it's an empty response or connection error
+                if (
+                    'ERR_EMPTY_RESPONSE' in error
+                    or 'empty' in error.lower()
+                    or result.get('content', '') == ''
+                ):
+                    self.logger.info(
+                        f'Selenium failed with empty response, falling back to requests for {url}'
+                    )
+                    requests_result = self._navigate_requests(url)
+                    if requests_result.get('success'):
+                        return requests_result
+            return result
         else:
             return self._navigate_requests(url)
 
@@ -255,15 +302,70 @@ class Browser:
         try:
             self._initialize_driver()
             self.logger.info(f'Navigating to: {url} using Selenium')
-            self.driver.get(url)
 
-            # Replace time.sleep with WebDriverWait
-            WebDriverWait(self.driver, wait_for_js).until(
-                lambda d: d.execute_script('return document.readyState') == 'complete'
-            )
+            try:
+                self.driver.get(url)
+            except TimeoutException:
+                # Even if page load times out, try to get what we have
+                self.logger.warning(
+                    f'Page load timeout for {url}, attempting to extract partial content'
+                )
+            except WebDriverException as e:
+                error_str = str(e)
+                # Check for empty response errors
+                if 'ERR_EMPTY_RESPONSE' in error_str or 'empty' in error_str.lower():
+                    error_msg = f'Empty response from server: {error_str}'
+                    self.logger.warning(
+                        f'Failed to load page with Selenium: {error_msg}'
+                    )
+                    return {
+                        'url': url,
+                        'status_code': 502,
+                        'content': '',
+                        'success': False,
+                        'error': error_msg,
+                        'soup': None,
+                    }
+                raise
+
+            # Wait for page to be interactive (DOM ready, not necessarily all resources)
+            try:
+                WebDriverWait(self.driver, min(wait_for_js, 5)).until(
+                    lambda d: d.execute_script('return document.readyState')
+                    in ['interactive', 'complete']
+                )
+            except TimeoutException:
+                # If readyState doesn't become interactive, continue anyway
+                self.logger.debug(
+                    'Page readyState check timed out, continuing with current state'
+                )
 
             content = self.driver.page_source
             final_url = self.driver.current_url
+
+            # Check for empty or error responses
+            if not content or len(content.strip()) < 100:
+                # Check if page contains error messages
+                page_text = content.lower() if content else ''
+                error_indicators = [
+                    'err_empty_response',
+                    '페이지가 작동하지 않습니다',
+                    'page not working',
+                    'no data was sent',
+                    '전송한 데이터가 없습니다',
+                ]
+                if any(indicator in page_text for indicator in error_indicators):
+                    error_msg = 'Page returned empty response or error message'
+                    self.logger.warning(f'Empty or error response detected for {url}')
+                    return {
+                        'url': final_url,
+                        'status_code': 502,
+                        'content': content,
+                        'success': False,
+                        'error': error_msg,
+                        'soup': None,
+                    }
+
             result = {
                 'url': final_url,
                 'status_code': 200,  # Selenium doesn't provide status codes directly
@@ -279,8 +381,8 @@ class Browser:
                 self.logger.warning(f'Failed to parse HTML with Selenium: {e}')
                 result['soup'] = None
             return result
-        except TimeoutException:
-            error_msg = f'Page load timeout after {self.timeout}s'
+        except TimeoutException as e:
+            error_msg = f'Page load timeout after {self.timeout}s: {str(e)}'
             self.logger.warning(f'Failed to load page with Selenium: {error_msg}')
             return {
                 'url': url,
@@ -291,8 +393,19 @@ class Browser:
                 'soup': None,
             }
         except WebDriverException as e:
-            error_msg = f'WebDriver error: {str(e)}'
+            error_str = str(e)
+            error_msg = f'WebDriver error: {error_str}'
             self.logger.warning(f'Failed to load page with Selenium: {error_msg}')
+            # Check for empty response in the error
+            if 'ERR_EMPTY_RESPONSE' in error_str or 'empty' in error_str.lower():
+                return {
+                    'url': url,
+                    'status_code': 502,
+                    'content': '',
+                    'success': False,
+                    'error': error_msg,
+                    'soup': None,
+                }
             return {
                 'url': url,
                 'status_code': 500,
@@ -415,6 +528,51 @@ class Browser:
             script.decompose()
         return soup.get_text(separator='\n', strip=True)
 
+    def extract_markdown(
+        self, page_data: Dict[str, Any], selector: Optional[str] = None
+    ) -> str:
+        """
+        Extract content from HTML and convert to markdown format.
+        This preserves structure (headings, links, lists) better than plain text.
+
+        Args:
+            page_data: Dictionary containing 'soup' (BeautifulSoup) or 'content' (HTML string).
+            selector: Optional CSS selector to extract specific elements.
+
+        Returns:
+            Markdown-formatted string.
+        """
+        if not page_data.get('soup'):
+            html_content = page_data.get('content', '')
+            if not html_content:
+                return ''
+        else:
+            soup = page_data['soup']
+            if selector:
+                elements = soup.select(selector)
+                if not elements:
+                    return ''
+                html_content = '\n'.join(str(elem) for elem in elements)
+            else:
+                # Remove script and style tags before conversion
+                soup_copy = BeautifulSoup(str(soup), 'html.parser')
+                for script in soup_copy(['script', 'style', 'noscript']):
+                    script.decompose()
+                html_content = str(soup_copy)
+
+        # Configure html2text converter
+        h = html2text.HTML2Text()
+        h.ignore_links = False
+        h.ignore_images = False
+        h.body_width = 0  # Don't wrap lines
+        h.unicode_snob = True  # Use unicode characters
+        h.skip_internal_links = False
+        h.inline_links = True  # Put links inline
+
+        # Convert HTML to markdown
+        markdown = h.handle(html_content)
+        return markdown.strip()
+
     def extract_html(
         self,
         page_data: Dict[str, Any],
@@ -518,7 +676,7 @@ class Browser:
         llm_service: 'LLMService',
         context_keywords: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        page_text = self.extract_text(page_data)
+        page_text = self.extract_markdown(page_data)
         max_text_length = 45000
         if len(page_text) > max_text_length:
             page_text = page_text[:max_text_length] + '\n[Text content truncated...]'

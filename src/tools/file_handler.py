@@ -329,4 +329,3 @@ class FileHandler:
             error_type, error_category, user_message = classify_error(last_exception)
             raise Exception(user_message) from last_exception
         raise Exception('All download strategies exhausted')
-

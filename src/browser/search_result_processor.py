@@ -568,8 +568,8 @@ Is this search result relevant to completing the subtask?"""
             elif action == 'find_table':
                 table_data = self.browser.find_table(nav_result)
                 return json.dumps(table_data) if table_data else 'No table found.'
-            else:  # default to text extraction
-                return self.browser.extract_text(nav_result)
+            else:  # default to markdown extraction for better structure preservation
+                return self.browser.extract_markdown(nav_result)
 
         except Exception as e:
             self.logger.warning(
@@ -617,8 +617,8 @@ Is this search result relevant to completing the subtask?"""
         if nav_result.get('url'):
             content_parts.append(f'URL: {nav_result["url"]}')
 
-        # Extract main text content
-        text_content = self.browser.extract_text(nav_result)
+        # Extract main content as markdown for better structure preservation
+        text_content = self.browser.extract_markdown(nav_result)
         if text_content:
             max_text_length = 5000
             if len(text_content) > max_text_length:

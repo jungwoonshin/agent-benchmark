@@ -6,28 +6,14 @@ import re
 from typing import Any, Dict, List, Optional
 
 from ..browser.search_result_processor import SearchResultProcessor
-
-# from ..code_interpreter.error_analysis import ExecutionResultAnalyzer  # Disabled - using LLM reasoning instead
 from ..llm import LLMService
 from ..models import Attachment
 from ..state import InformationStateManager, Subtask
 from ..tools import ToolBelt
-from ..utils import extract_json_from_text
-
-
-# Stub for backward compatibility (legacy code execution methods not used anymore)
-class ExecutionResultAnalyzer:
-    """Stub class - code execution is replaced with LLM reasoning."""
-
-    @staticmethod
-    def is_error_result(result: Any) -> bool:
-        """Check if result is an error (legacy method - not used with LLM reasoning)."""
-        return False
-
-    @staticmethod
-    def extract_error_message(result: Any) -> Optional[str]:
-        """Extract error message (legacy method - not used with LLM reasoning)."""
-        return None
+from ..utils.json_utils import extract_json_from_text
+from .code_executor import CodeExecutor
+from .result_analyzer import ExecutionResultAnalyzer
+from .search_handler import SearchHandler
 
 
 class Executor:
@@ -53,6 +39,7 @@ class Executor:
         self.llm_service = llm_service
         self.state_manager = state_manager
         self.logger = logger
+
         # Initialize browser for search result processor
         from ..browser import Browser
 
@@ -62,6 +49,19 @@ class Executor:
             llm_service=llm_service,
             browser=browser,
             tool_belt=tool_belt,
+            logger=logger,
+        )
+
+        # Initialize helper classes
+        self.code_executor = CodeExecutor(
+            tool_belt=tool_belt,
+            llm_service=llm_service,
+            state_manager=state_manager,
+            logger=logger,
+        )
+        self.search_handler = SearchHandler(
+            tool_belt=tool_belt,
+            llm_service=llm_service,
             logger=logger,
         )
 
@@ -319,11 +319,15 @@ class Executor:
                                     )
 
                     # Build structured context entry for this step
+                    # Include full result text (no truncation) for complete context
+                    if isinstance(step_result, dict):
+                        summary = step_result.get('content', '') or str(step_result)
+                    else:
+                        summary = str(step_result)
+
                     context[step_id] = {
                         'materials': materials,
-                        'summary': step_result.get('content', '')
-                        if isinstance(step_result, dict)
-                        else str(step_result)[:500],
+                        'summary': summary,  # Full summary without truncation
                         'full_result': step_result,  # Include full result for backward compatibility
                     }
 
@@ -448,21 +452,103 @@ class Executor:
                 )
 
                 # Use LLM to determine all relevant results from combined set
+                was_selected_indices_empty = False
                 if search_results:
                     self.logger.info(
                         f'Filtering {len(search_results)} combined results to select all relevant results using LLM'
                     )
                     # Use subtask description as the query context for filtering
-                    filtered_results = self._filter_search_results_by_relevance(
-                        search_results=search_results,
-                        query=subtask.description,  # Use subtask description as context
-                        problem=problem,
-                        query_analysis=query_analysis,
+                    filtered_results, was_selected_indices_empty = (
+                        self._filter_search_results_by_relevance(
+                            search_results=search_results,
+                            query=subtask.description,  # Use subtask description as context
+                            problem=problem,
+                            query_analysis=query_analysis,
+                        )
                     )
                     search_results = filtered_results
                     self.logger.info(
                         f'Selected {len(search_results)} relevant results from combined search queries'
                     )
+
+                # If selected_indices was empty (0), generate new queries and retry
+                # Note: We retry if selected_indices was 0, even if fallback returned all results
+                if was_selected_indices_empty:
+                    self.logger.info(
+                        'LLM selected 0 indices from search results. Generating new search queries and retrying...'
+                    )
+                    # Generate new search queries
+                    new_search_queries = self._generate_new_search_queries(
+                        subtask_description=subtask.description,
+                        problem=problem,
+                        previous_queries=search_queries,
+                        query_analysis=query_analysis,
+                    )
+
+                    # Perform search again with new queries
+                    retry_search_results = []
+                    seen_urls_retry = set(
+                        seen_urls
+                    )  # Keep track of URLs from first attempt
+
+                    self.logger.info(
+                        f'Retrying search with {len(new_search_queries)} new queries for subtask {subtask.id}'
+                    )
+
+                    for idx, query in enumerate(new_search_queries, 1):
+                        self.logger.info(
+                            f'Retry search query {idx}/{len(new_search_queries)}: "{query}" '
+                            f'(type={search_type}, num_results={num_results})'
+                        )
+                        query_results = self.tool_belt.search(
+                            query, num_results, search_type
+                        )
+
+                        # Add results to combined list, avoiding duplicates by URL
+                        for result in query_results:
+                            if hasattr(result, 'url'):
+                                url = result.url
+                            elif isinstance(result, dict):
+                                url = result.get('url', '')
+                            else:
+                                url = str(result)
+
+                            if url and url not in seen_urls_retry:
+                                seen_urls_retry.add(url)
+                                retry_search_results.append(result)
+
+                        self.logger.debug(
+                            f'Retry query {idx} returned {len(query_results)} results, '
+                            f'{len(retry_search_results)} total unique results so far'
+                        )
+
+                    # Filter retry results by relevance
+                    if retry_search_results:
+                        self.logger.info(
+                            f'Filtering {len(retry_search_results)} retry search results to select all relevant results using LLM'
+                        )
+                        retry_filtered_results, retry_was_empty = (
+                            self._filter_search_results_by_relevance(
+                                search_results=retry_search_results,
+                                query=subtask.description,
+                                problem=problem,
+                                query_analysis=query_analysis,
+                            )
+                        )
+                        # Use retry results if they have selected indices, otherwise keep original
+                        if not retry_was_empty and retry_filtered_results:
+                            search_results = retry_filtered_results
+                            self.logger.info(
+                                f'Retry search successful: Selected {len(search_results)} relevant results from retry queries'
+                            )
+                        else:
+                            self.logger.warning(
+                                'Retry search also returned 0 selected indices. Using original results as fallback.'
+                            )
+                    else:
+                        self.logger.warning(
+                            'Retry search returned 0 results. Using original results as fallback.'
+                        )
 
                 # If search returned 0 results, try to identify downloadable resources
                 if not search_results:
@@ -665,6 +751,26 @@ class Executor:
                     result = self.tool_belt.read_attachment(
                         attachment, options, problem, query_analysis
                     )
+
+                    # Handle structured PDF results with sections
+                    # If result is a dict with sections, store them in subtask metadata
+                    if (
+                        isinstance(result, dict)
+                        and result.get('type') == 'pdf'
+                        and 'sections' in result
+                    ):
+                        # Store structured PDF data in subtask metadata for later use
+                        if not hasattr(subtask, 'metadata'):
+                            subtask.metadata = {}
+                        subtask.metadata['pdf_data'] = {
+                            'filename': result.get('filename', attachment.filename),
+                            'sections': result.get('sections', []),
+                            'image_analysis': result.get('image_analysis', ''),
+                            'full_text': result.get('full_text', ''),
+                        }
+                        self.logger.info(
+                            f'Extracted {len(result.get("sections", []))} sections from PDF {attachment.filename}'
+                        )
                 else:
                     result = 'Error: No attachments available'
             elif tool_name == 'analyze_media':
@@ -683,9 +789,37 @@ class Executor:
             # === AFTER SUBTASK EXECUTION (SUCCESS) ===
             state_after = self.state_manager.get_state_summary()
 
-            # Summarize result for logging
-            result_str = str(result)
-            result_type = type(result).__name__
+            # Handle structured PDF results - convert to string format with sections
+            if (
+                isinstance(result, dict)
+                and result.get('type') == 'pdf'
+                and 'sections' in result
+            ):
+                # Format sections into readable text for the result
+                sections_text = []
+                for section in result.get('sections', []):
+                    section_title = section.get('title', 'Untitled')
+                    section_content = section.get('content', '')
+                    section_page = section.get('page', '?')
+                    sections_text.append(
+                        f'[Section: {section_title} (Page {section_page})]\n{section_content}'
+                    )
+
+                # Combine sections with image analysis
+                formatted_result = '\n\n'.join(sections_text)
+                if result.get('image_analysis'):
+                    formatted_result += '\n\nIMAGE ANALYSIS (from visual LLM):\n'
+                    formatted_result += result.get('image_analysis', '')
+
+                # Use formatted result for storage and logging
+                result_str = formatted_result
+                result_type = 'pdf_with_sections'
+                result_to_store = formatted_result  # Store formatted string
+            else:
+                # Regular result (string or other)
+                result_str = str(result)
+                result_type = type(result).__name__
+                result_to_store = result  # Store original result
 
             # Check if result contains image analysis - if so, extract and log it separately
             image_analysis_marker = 'IMAGE ANALYSIS (from visual LLM):'
@@ -739,10 +873,10 @@ class Executor:
                         f'Subtask {subtask.id} already marked as failed, not completing'
                     )
                 else:
-                    self.state_manager.complete_subtask(subtask.id, result)
+                    self.state_manager.complete_subtask(subtask.id, result_to_store)
             else:
                 # If not in state_manager, add it as completed
-                self.state_manager.complete_subtask(subtask.id, result)
+                self.state_manager.complete_subtask(subtask.id, result_to_store)
 
             self.logger.info('-' * 80)
             self.logger.info(f'AFTER executing subtask: {subtask.id}')
@@ -776,7 +910,7 @@ class Executor:
             self.logger.info(f'  State changes: {state_changes}')
             self.logger.info('=' * 80)
 
-            return result
+            return result_to_store
         except Exception as e:
             # === AFTER SUBTASK EXECUTION (FAILURE) ===
             state_after = self.state_manager.get_state_summary()
@@ -1252,13 +1386,12 @@ For analyze_media: {"attachment_index": 0, "analysis_type": "auto"}"""
                 if dep_id in self.state_manager.subtasks:
                     dep_subtask = self.state_manager.subtasks[dep_id]
                     if dep_subtask.status == 'completed':
-                        result_preview = (
-                            str(dep_subtask.result)[:200]
-                            if dep_subtask.result
-                            else 'None'
+                        # Include full result (no truncation) for complete context
+                        result_text = (
+                            str(dep_subtask.result) if dep_subtask.result else 'None'
                         )
                         dependency_results_summary.append(
-                            f'  - {dep_id}: {result_preview}...'
+                            f'  - {dep_id}: {result_text}'
                         )
             if dependency_results_summary:
                 dependency_info = (
@@ -1378,7 +1511,7 @@ Return as JSON with "resources" key containing an array of resource objects."""
         query: str,
         problem: str,
         query_analysis: Optional[Dict[str, Any]] = None,
-    ) -> List[Any]:
+    ) -> tuple[List[Any], bool]:
         """
         Use LLM to filter and rank search results by relevance to the query.
 
@@ -1389,12 +1522,13 @@ Return as JSON with "resources" key containing an array of resource objects."""
             query_analysis: Optional query analysis results containing requirements and constraints.
 
         Returns:
-            Filtered list of most relevant SearchResult objects.
+            Tuple of (filtered list of most relevant SearchResult objects, was_selected_indices_empty).
+            was_selected_indices_empty is True if the LLM returned 0 selected indices.
         """
         from ..models import SearchResult
 
         if not search_results:
-            return search_results
+            return search_results, False
 
         self.logger.info(
             f'Filtering {len(search_results)} search results by relevance using LLM'
@@ -1506,6 +1640,7 @@ Identify ALL relevant search results for answering the query/subtask. Pay specia
 
             selected_indices = result_data.get('selected_indices', [])
             reasoning = result_data.get('reasoning', 'No reasoning provided')
+            was_selected_indices_empty = len(selected_indices) == 0
 
             self.logger.info(
                 f'LLM selected {len(selected_indices)} most relevant result(s) out of {len(search_results)}. Reasoning: {reasoning}'
@@ -1528,12 +1663,12 @@ Identify ALL relevant search results for answering the query/subtask. Pay specia
                 self.logger.warning(
                     'No valid results selected by LLM, using all original results as fallback'
                 )
-                return search_results
+                return search_results, was_selected_indices_empty
 
             self.logger.info(
                 f'LLM filtered {len(search_results)} results down to {len(filtered_results)} most relevant'
             )
-            return filtered_results
+            return filtered_results, was_selected_indices_empty
 
         except Exception as e:
             self.logger.error(
@@ -1541,7 +1676,143 @@ Identify ALL relevant search results for answering the query/subtask. Pay specia
             )
             # Fallback to original results if filtering fails
             self.logger.warning('Using all original search results as fallback')
-            return search_results
+            return search_results, False
+
+    def _generate_new_search_queries(
+        self,
+        subtask_description: str,
+        problem: str,
+        previous_queries: List[str],
+        query_analysis: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
+        """
+        Generate new search queries when initial search returned 0 selected indices.
+
+        Args:
+            subtask_description: Description of the subtask.
+            problem: Original problem being solved.
+            previous_queries: List of previous search queries that didn't yield results.
+            query_analysis: Optional query analysis results.
+
+        Returns:
+            List of 3 new search queries.
+        """
+        self.logger.info(
+            f'Generating new search queries for subtask. Previous queries: {previous_queries}'
+        )
+
+        system_prompt = """You are an expert at creating effective search queries.
+Given a subtask description, problem context, and previous search queries that didn't yield relevant results, create 3 NEW and DIFFERENT search queries.
+
+CRITICAL REQUIREMENTS:
+- Create exactly 3 different search queries
+- Use ONLY keywords and essential terms - NO verbs, NO descriptive phrases, NO unnecessary words
+- Keep each query SHORT: 3-8 keywords maximum (typically 5-6 words)
+- Remove filler words like "article", "submitted", "descriptors", "about", "related to"
+- Use dates in format: "August 11 2016" or "2016-08-11" or "August 2016"
+- Separate keywords with spaces, NOT commas or special formatting
+- Make queries DIFFERENT from the previous ones - try alternative keyword combinations, synonyms, or different phrasings
+- Focus on the core information needed to complete the subtask
+
+Return a JSON object with:
+- search_queries: array of exactly 3 different search queries in keyword-only format
+
+IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
+
+        # Build context about previous queries
+        previous_queries_context = ''
+        if previous_queries:
+            previous_queries_context = (
+                '\n\nPrevious search queries that did not yield relevant results:\n'
+            )
+            for i, query in enumerate(previous_queries, 1):
+                previous_queries_context += f'{i}. {query}\n'
+            previous_queries_context += '\nCreate NEW queries with different keyword combinations or phrasings.\n'
+
+        # Extract requirement information from query analysis
+        requirements_context = ''
+        if query_analysis:
+            explicit_reqs = query_analysis.get('explicit_requirements', [])
+            implicit_reqs = query_analysis.get('implicit_requirements', [])
+            constraints = query_analysis.get('constraints', {})
+
+            if explicit_reqs or implicit_reqs or constraints:
+                requirements_context = '\n\nKey Requirements:\n'
+                if explicit_reqs:
+                    requirements_context += (
+                        f'- Explicit Requirements: {", ".join(explicit_reqs)}\n'
+                    )
+                if implicit_reqs:
+                    requirements_context += (
+                        f'- Implicit Requirements: {", ".join(implicit_reqs)}\n'
+                    )
+                if constraints:
+                    constraints_str = []
+                    if constraints.get('temporal'):
+                        constraints_str.append(
+                            f'Temporal: {", ".join(constraints["temporal"])}'
+                        )
+                    if constraints.get('spatial'):
+                        constraints_str.append(
+                            f'Spatial: {", ".join(constraints["spatial"])}'
+                        )
+                    if constraints.get('categorical'):
+                        constraints_str.append(
+                            f'Categorical: {", ".join(constraints["categorical"])}'
+                        )
+                    if constraints_str:
+                        requirements_context += (
+                            f'- Constraints: {"; ".join(constraints_str)}\n'
+                        )
+
+        user_prompt = f"""Problem: {problem}
+
+Subtask: {subtask_description}
+{requirements_context}
+{previous_queries_context}
+
+Create 3 NEW search queries (different from previous ones) that will help find information to complete this subtask. Use keyword-only format (3-8 keywords each)."""
+
+        try:
+            response = self.llm_service.call_with_system_prompt(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=0.7,  # Creative for generating alternative queries
+                response_format={'type': 'json_object'},
+            )
+            json_text = extract_json_from_text(response)
+            result_data = json.loads(json_text)
+
+            new_queries = result_data.get('search_queries', [])
+            if not new_queries or len(new_queries) < 3:
+                self.logger.warning(
+                    f'LLM generated only {len(new_queries)} queries, padding to 3'
+                )
+                # Pad with variations of the subtask description
+                while len(new_queries) < 3:
+                    new_queries.append(subtask_description)
+            elif len(new_queries) > 3:
+                new_queries = new_queries[:3]
+                self.logger.debug(
+                    f'LLM generated {len(new_queries)} queries, using first 3'
+                )
+
+            self.logger.info(
+                'Generated %d new search queries: %s', len(new_queries), new_queries
+            )
+            return new_queries
+
+        except Exception as e:
+            self.logger.error(
+                f'Failed to generate new search queries: {e}', exc_info=True
+            )
+            # Fallback: create variations from subtask description
+            self.logger.warning(
+                'Using fallback: creating query variations from subtask description'
+            )
+            # Simple fallback: use subtask description with slight variations
+            base_query = subtask_description
+            return [base_query, base_query, base_query]
 
     def execute_plan(
         self,
@@ -1805,21 +2076,23 @@ Identify ALL relevant search results for answering the query/subtask. Pay specia
             # Prepare content summary from processed results
             content_summary = processing_result.get('content_summary', '')
 
-            # Build materials summary
+            # Build materials summary with full content (no truncation)
             materials_summary = []
             for material in materials:
                 material_type = material.get('type', 'unknown')
                 title = material.get('title', 'Untitled')
                 url = material.get('url', '')
-                content_preview = (
-                    material.get('content', '')[:500] if material.get('content') else ''
-                )
+                content = material.get('content', '') or ''
 
-                materials_summary.append(
-                    f'[{material_type.upper()}] {title}\nURL: {url}\nContent: {content_preview}...'
-                    if content_preview
-                    else f'[{material_type.upper()}] {title}\nURL: {url}'
-                )
+                # Include full content for complete context
+                if content:
+                    materials_summary.append(
+                        f'[{material_type.upper()}] {title}\nURL: {url}\nContent: {content}'
+                    )
+                else:
+                    materials_summary.append(
+                        f'[{material_type.upper()}] {title}\nURL: {url}'
+                    )
 
             system_prompt = """You are an expert at analyzing search results and extracting information relevant to a specific task.
 
