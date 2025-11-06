@@ -179,10 +179,13 @@ class Executor:
                     # Fallback to subtask description
                     task_description = subtask.description
 
-                # Collect results from dependency subtasks and add to context
+                # Collect results from ALL previous completed subtasks (not just direct dependencies)
+                # This ensures step N has access to materials from steps 1..N-1
+                previous_results = {}
+                missing_dependencies = []
+
+                # First, check direct dependencies (required)
                 if subtask.dependencies:
-                    dependency_results = {}
-                    missing_dependencies = []
                     for dep_id in subtask.dependencies:
                         if dep_id in self.state_manager.subtasks:
                             dep_subtask = self.state_manager.subtasks[dep_id]
@@ -190,24 +193,17 @@ class Executor:
                                 dep_subtask.status == 'completed'
                                 and dep_subtask.result is not None
                             ):
-                                # Serialize result for LLM reasoning
-                                # Convert SearchResult objects to dictionaries to avoid iteration errors
                                 result = dep_subtask.result
                                 serialized_result = self._serialize_result_for_code(
                                     result
                                 )
-
-                                dependency_results[dep_id] = serialized_result
-                                self.logger.debug(
-                                    f'Added dependency result from {dep_id} to context (serialized)'
-                                )
+                                previous_results[dep_id] = serialized_result
                             elif dep_subtask.status == 'failed':
                                 self.logger.warning(
                                     f'Dependency {dep_id} failed - not adding to context'
                                 )
                                 missing_dependencies.append(dep_id)
                             else:
-                                # Dependency not completed yet
                                 self.logger.warning(
                                     f'Dependency {dep_id} has status "{dep_subtask.status}" - not adding to context'
                                 )
@@ -218,12 +214,12 @@ class Executor:
                             )
                             missing_dependencies.append(dep_id)
 
-                    # Check if we have missing dependencies
+                    # Check if we have missing dependencies (fail if required dependencies are missing)
                     if missing_dependencies:
                         error_msg = (
                             f'Cannot execute LLM reasoning - missing or incomplete dependencies: '
                             f'{", ".join(missing_dependencies)}. '
-                            f'Available dependencies: {", ".join(dependency_results.keys()) if dependency_results else "none"}'
+                            f'Available dependencies: {", ".join(previous_results.keys()) if previous_results else "none"}'
                         )
                         self.logger.error(error_msg)
                         # Mark subtask as failed
@@ -238,26 +234,114 @@ class Executor:
                             'subtask_id': subtask.id,
                         }
 
-                    # Merge dependency results into context
-                    # Use a structured format to avoid conflicts
-                    context['dependency_results'] = dependency_results
-                    # Also add individual results under BOTH original key AND simplified key for compatibility
-                    for dep_id, result in dependency_results.items():
-                        # Add with original key (e.g., step_1, step_2)
-                        context[dep_id] = result
-                        # Also add with simplified key (e.g., step1, step2) for backward compatibility
-                        simplified_key = dep_id.replace(
-                            'step_', 'step'
-                        )  # step_1 -> step1
-                        if simplified_key != dep_id:  # Only add if different
-                            context[simplified_key] = result
+                # Add ALL other completed subtasks (for context, not just dependencies)
+                # Extract step number from current subtask ID (e.g., "step_3" -> 3)
+                try:
+                    current_step_num = (
+                        int(subtask.id.split('_')[1]) if '_' in subtask.id else None
+                    )
+                except (ValueError, IndexError):
+                    current_step_num = None
 
-                    self.logger.info(
-                        f'Added {len(dependency_results)} dependency result(s) to LLM reasoning context'
-                    )
-                    self.logger.debug(
-                        f'Context keys available: {", ".join(sorted(context.keys()))}'
-                    )
+                if current_step_num is not None:
+                    # Add all previous steps (step_1, step_2, ..., step_{current_step_num-1})
+                    for step_num in range(1, current_step_num):
+                        prev_step_id = f'step_{step_num}'
+                        if prev_step_id in self.state_manager.subtasks:
+                            prev_subtask = self.state_manager.subtasks[prev_step_id]
+                            if (
+                                prev_subtask.status == 'completed'
+                                and prev_subtask.result is not None
+                                and prev_step_id
+                                not in previous_results  # Don't duplicate
+                            ):
+                                result = prev_subtask.result
+                                serialized_result = self._serialize_result_for_code(
+                                    result
+                                )
+                                previous_results[prev_step_id] = serialized_result
+                                self.logger.debug(
+                                    f'Added previous step {prev_step_id} to context'
+                                )
+
+                # Build structured context with materials from each previous step
+                for step_id, step_result in previous_results.items():
+                    # Extract materials if available
+                    materials = []
+                    if isinstance(step_result, dict):
+                        # Check if result has materials array
+                        if 'materials' in step_result:
+                            materials = step_result['materials']
+                        # Also check for materials in nested structures
+                        elif 'processing_summary' in step_result:
+                            processing = step_result.get('processing_summary', {})
+                            # Build materials from web_pages and downloaded_files
+                            for web_page in processing.get('web_pages', []):
+                                materials.append(
+                                    {
+                                        'type': 'web_page',
+                                        'title': web_page.get('title', ''),
+                                        'url': web_page.get('url', ''),
+                                        'content': web_page.get('content', ''),
+                                    }
+                                )
+                            for file_data in processing.get('downloaded_files', []):
+                                if (
+                                    file_data.get('type') == 'pdf'
+                                    and 'sections' in file_data
+                                ):
+                                    materials.append(
+                                        {
+                                            'type': 'pdf',
+                                            'title': file_data.get('title', '')
+                                            or file_data.get('url', '').split('/')[-1]
+                                            or 'PDF',
+                                            'url': file_data.get('url', ''),
+                                            'sections': file_data.get('sections', []),
+                                            'image_analysis': file_data.get(
+                                                'image_analysis', ''
+                                            ),
+                                            'content': file_data.get('content', ''),
+                                        }
+                                    )
+                                else:
+                                    materials.append(
+                                        {
+                                            'type': 'file'
+                                            if file_data.get('type') != 'pdf'
+                                            else 'pdf',
+                                            'title': file_data.get('title', '')
+                                            or file_data.get('url', '').split('/')[-1]
+                                            or 'File',
+                                            'url': file_data.get('url', ''),
+                                            'content': file_data.get('content', ''),
+                                        }
+                                    )
+
+                    # Build structured context entry for this step
+                    context[step_id] = {
+                        'materials': materials,
+                        'summary': step_result.get('content', '')
+                        if isinstance(step_result, dict)
+                        else str(step_result)[:500],
+                        'full_result': step_result,  # Include full result for backward compatibility
+                    }
+
+                    # Also add with simplified key (e.g., step1, step2) for backward compatibility
+                    simplified_key = step_id.replace('step_', 'step')
+                    if simplified_key != step_id:
+                        context[simplified_key] = context[step_id]
+
+                # Also add dependency_results for backward compatibility
+                context['dependency_results'] = previous_results
+
+                self.logger.info(
+                    f'Added {len(previous_results)} previous step result(s) to LLM reasoning context '
+                    f'({sum(len(ctx.get("materials", [])) for ctx in context.values() if isinstance(ctx, dict) and "materials" in ctx)} materials total)'
+                )
+                self.logger.debug(
+                    f'Context keys available: {", ".join(sorted(context.keys()))}'
+                )
 
                 self.logger.debug(
                     f'Executing LLM reasoning with task: {task_description[:100]}..., '
@@ -363,10 +447,10 @@ class Executor:
                     f'Combined search results: {len(search_results)} unique results from {len(search_queries)} queries'
                 )
 
-                # Use LLM to determine top 5 most relevant results from combined set
-                if len(search_results) > 5:
+                # Use LLM to determine all relevant results from combined set
+                if search_results:
                     self.logger.info(
-                        f'Filtering {len(search_results)} combined results to top 5 most relevant using LLM'
+                        f'Filtering {len(search_results)} combined results to select all relevant results using LLM'
                     )
                     # Use subtask description as the query context for filtering
                     filtered_results = self._filter_search_results_by_relevance(
@@ -375,14 +459,9 @@ class Executor:
                         problem=problem,
                         query_analysis=query_analysis,
                     )
-                    # Limit to top 5
-                    search_results = filtered_results[:5]
+                    search_results = filtered_results
                     self.logger.info(
-                        f'Selected top {len(search_results)} most relevant results from combined search queries'
-                    )
-                elif search_results:
-                    self.logger.info(
-                        f'Using all {len(search_results)} combined results (already <= 5)'
+                        f'Selected {len(search_results)} relevant results from combined search queries'
                     )
 
                 # If search returned 0 results, try to identify downloadable resources
@@ -446,14 +525,84 @@ class Executor:
                         problem=problem,
                         query_analysis=query_analysis,
                         attachments=attachments,
-                        max_results_to_process=5,  # Process up to 5 results per query
+                        max_results_to_process=len(
+                            search_results
+                        ),  # Process all relevant results
                     )
 
-                    # Return structured processing result along with original search results
-                    result = {
-                        'search_results': search_results,
+                    # Build materials array from processed results
+                    # We need to get materials from the processed_result which contains the structured data
+                    # The web_pages and downloaded_files arrays contain the 'data' field from _process_single_result
+                    materials = []
+
+                    # Add web pages as materials
+                    for web_page in processing_result.get('web_pages', []):
+                        materials.append(
+                            {
+                                'type': 'web_page',
+                                'title': web_page.get('title', ''),
+                                'url': web_page.get('url', ''),
+                                'content': web_page.get('content', ''),
+                            }
+                        )
+
+                    # Add downloaded files as materials
+                    for file_data in processing_result.get('downloaded_files', []):
+                        if file_data.get('type') == 'pdf' and 'sections' in file_data:
+                            # Structured PDF with sections
+                            materials.append(
+                                {
+                                    'type': 'pdf',
+                                    'title': file_data.get('title', '')
+                                    or file_data.get('url', '').split('/')[-1]
+                                    or 'PDF',
+                                    'url': file_data.get('url', ''),
+                                    'sections': file_data.get('sections', []),
+                                    'image_analysis': file_data.get(
+                                        'image_analysis', ''
+                                    ),
+                                    'content': file_data.get(
+                                        'content', ''
+                                    ),  # Full text fallback
+                                }
+                            )
+                        else:
+                            # Regular file or PDF without sections
+                            materials.append(
+                                {
+                                    'type': 'file'
+                                    if file_data.get('type') != 'pdf'
+                                    else 'pdf',
+                                    'title': file_data.get('title', '')
+                                    or file_data.get('url', '').split('/')[-1]
+                                    or 'File',
+                                    'url': file_data.get('url', ''),
+                                    'content': file_data.get('content', ''),
+                                }
+                            )
+
+                    # Use LLM to analyze processed search results and determine the answer
+                    # based on the subtask description
+                    llm_analysis = self._analyze_search_results_with_llm(
+                        processing_result=processing_result,
+                        materials=materials,
+                        subtask_description=subtask.description,
+                        problem=problem,
+                        query_analysis=query_analysis,
+                    )
+
+                    # Return LLM analysis answer as the primary result (string)
+                    # This matches the format of llm_reasoning results for consistency
+                    result = llm_analysis.get(
+                        'content', 'No answer determined from search results.'
+                    )
+
+                    # Store full analysis and metadata in subtask metadata for reference
+                    subtask.metadata['search_analysis'] = llm_analysis
+                    subtask.metadata['search_metadata'] = {
+                        'search_results': search_results,  # Original search results (for reference)
+                        'materials': materials,  # Structured materials with title + content
                         'processing_summary': processing_result,
-                        'content': processing_result.get('content_summary', ''),
                         'relevant_count': processing_result.get('relevant_count', 0),
                         'web_pages': processing_result.get('web_pages', []),
                         'downloaded_files': processing_result.get(
@@ -461,11 +610,20 @@ class Executor:
                         ),
                     }
                 else:
-                    result = {
-                        'search_results': [],
-                        'processing_summary': {},
-                        'content': '',
-                    }
+                    # No search results - return empty analysis
+                    llm_analysis = self._analyze_search_results_with_llm(
+                        processing_result={
+                            'content_summary': '',
+                            'web_pages': [],
+                            'downloaded_files': [],
+                        },
+                        materials=[],
+                        subtask_description=subtask.description,
+                        problem=problem,
+                        query_analysis=query_analysis,
+                    )
+                    result = llm_analysis.get('content', 'No search results found.')
+                    subtask.metadata['search_analysis'] = llm_analysis
             elif tool_name == 'browser_navigate':
                 url = parameters.get('url', '')
                 action = parameters.get('action', None)
@@ -527,10 +685,50 @@ class Executor:
 
             # Summarize result for logging
             result_str = str(result)
-            result_summary = (
-                result_str[:200] + '...' if len(result_str) > 200 else result_str
-            )
             result_type = type(result).__name__
+
+            # Check if result contains image analysis - if so, extract and log it separately
+            image_analysis_marker = 'IMAGE ANALYSIS (from visual LLM):'
+            has_image_analysis = image_analysis_marker in result_str
+            image_analysis = None
+
+            if has_image_analysis:
+                # Extract image analysis section
+                # Format: "\n\n" + "="*80 + "\n" + "IMAGE ANALYSIS (from visual LLM):\n" + "="*80 + "\n" + content
+                marker_idx = result_str.find(image_analysis_marker)
+                if marker_idx >= 0:
+                    # Marker ends with '\n', so find the next line (separator line)
+                    after_marker = marker_idx + len(image_analysis_marker)
+                    # Skip the separator line (=====)
+                    separator_end = result_str.find('\n', after_marker)
+                    if separator_end >= 0:
+                        # Content starts after the separator line
+                        content_start = separator_end + 1
+                        image_analysis = result_str[content_start:].strip()
+                    else:
+                        # Fallback: content starts right after marker
+                        image_analysis = result_str[after_marker:].strip()
+
+                    # Create summary without image analysis for brevity
+                    text_before_analysis = result_str[:marker_idx].strip()
+                    result_summary = (
+                        text_before_analysis[:200] + '...'
+                        if len(text_before_analysis) > 200
+                        else text_before_analysis
+                    )
+                    result_summary += (
+                        f'\n[+ Image Analysis: {len(image_analysis)} chars - see below]'
+                    )
+                else:
+                    result_summary = (
+                        result_str[:200] + '...'
+                        if len(result_str) > 200
+                        else result_str
+                    )
+            else:
+                result_summary = (
+                    result_str[:200] + '...' if len(result_str) > 200 else result_str
+                )
 
             # Check if subtask was already marked as failed (e.g., from LLM reasoning error)
             if subtask.id in self.state_manager.subtasks:
@@ -552,6 +750,15 @@ class Executor:
             self.logger.info(f'  Result type: {result_type}')
             self.logger.info(f'  Result summary: {result_summary}')
             self.logger.info(f'  Result length: {len(result_str)} chars')
+
+            # Log full image analysis separately if present
+            if has_image_analysis and image_analysis:
+                self.logger.info('-' * 80)
+                self.logger.info('IMAGE ANALYSIS (from visual LLM):')
+                self.logger.info('=' * 80)
+                self.logger.info(image_analysis)
+                self.logger.info('=' * 80)
+
             self.logger.info(f'  State after: {state_after}')
             self.logger.info(
                 f'  Knowledge facts count: {len(self.state_manager.knowledge_graph)}'
@@ -1255,17 +1462,20 @@ Return as JSON with "resources" key containing an array of resource objects."""
                 requirements_context += f'- Expected Answer Format: {answer_format}\n'
 
         system_prompt = """You are an expert at evaluating search result relevance.
-Given a search query/subtask description, query requirements analysis, and a list of search results, identify which results are most relevant to answering the query.
+Given a search query/subtask description, query requirements analysis, and a list of search results, identify which results are relevant to answering the query.
 
 Consider the explicit and implicit requirements from the query analysis when determining relevance.
 A result is relevant if it helps satisfy any of the stated requirements or constraints.
 
 Return a JSON object with:
-- selected_indices: list of integers representing the indices (0-based) of the most relevant results, ordered by relevance (most relevant first)
+- selected_indices: list of integers representing the indices (0-based) of ALL relevant results, ordered by relevance (most relevant first)
 - reasoning: brief explanation of why these results were selected, specifically referencing which requirements they address
-- max_results: limit to exactly 5 most relevant results (or fewer if less than 5 results provided), prioritizing quality over quantity
 
-IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text.
+IMPORTANT:
+- Select ALL results that are relevant to the query, not just a fixed number
+- Include any result that could help answer the query or satisfy the requirements
+- Order results by relevance (most relevant first)
+- Return your response as valid JSON only, without any markdown formatting or additional text
 
 Focus on:
 - Direct relevance to the query/subtask terms and intent
@@ -1282,7 +1492,7 @@ Subtask/Query: {query}
 Search Results (combined from multiple search queries):
 {json.dumps(results_list, indent=2)}
 
-Identify the top 5 most relevant search results for answering the query/subtask. Pay special attention to which results best satisfy the requirements identified in the query analysis. Return the indices of the most relevant results, ordered by relevance (most relevant first)."""
+Identify ALL relevant search results for answering the query/subtask. Pay special attention to which results satisfy the requirements identified in the query analysis. Return the indices of all relevant results, ordered by relevance (most relevant first). Include any result that could help answer the query or satisfy the requirements."""
 
         try:
             response = self.llm_service.call_with_system_prompt(
@@ -1313,15 +1523,12 @@ Identify the top 5 most relevant search results for answering the query/subtask.
                         f'Invalid index {idx} in selected_indices (valid range: 0-{len(search_results) - 1})'
                     )
 
-            # Limit to top 5
-            filtered_results = filtered_results[:5]
-
-            # If no valid results were selected, return top 5 original results as fallback
+            # If no valid results were selected, return all original results as fallback
             if not filtered_results:
                 self.logger.warning(
-                    'No valid results selected by LLM, using top 5 original results as fallback'
+                    'No valid results selected by LLM, using all original results as fallback'
                 )
-                return search_results[:5]
+                return search_results
 
             self.logger.info(
                 f'LLM filtered {len(search_results)} results down to {len(filtered_results)} most relevant'
@@ -1535,6 +1742,166 @@ Identify the top 5 most relevant search results for answering the query/subtask.
                             pass
 
         return images
+
+    def _analyze_search_results_with_llm(
+        self,
+        processing_result: Dict[str, Any],
+        materials: List[Dict[str, Any]],
+        subtask_description: str,
+        problem: str,
+        query_analysis: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Use LLM to analyze processed search results and determine the answer based on subtask description.
+
+        Args:
+            processing_result: Result from SearchResultProcessor containing content_summary, web_pages, etc.
+            materials: List of materials (web pages, files) extracted from search results.
+            subtask_description: Description of the subtask being executed.
+            problem: Original problem description.
+            query_analysis: Optional query analysis results.
+
+        Returns:
+            Dictionary with LLM analysis result as the primary content.
+        """
+        try:
+            # Build context from query analysis
+            requirements_context = ''
+            if query_analysis:
+                explicit_reqs = query_analysis.get('explicit_requirements', [])
+                implicit_reqs = query_analysis.get('implicit_requirements', [])
+                constraints = query_analysis.get('constraints', {})
+                answer_format = query_analysis.get('answer_format', '')
+
+                if explicit_reqs:
+                    requirements_context += (
+                        f'\nExplicit Requirements: {", ".join(explicit_reqs)}'
+                    )
+                if implicit_reqs:
+                    requirements_context += (
+                        f'\nImplicit Requirements: {", ".join(implicit_reqs)}'
+                    )
+                if constraints:
+                    constraints_str = []
+                    if constraints.get('temporal'):
+                        constraints_str.append(
+                            f'Temporal: {", ".join(constraints["temporal"])}'
+                        )
+                    if constraints.get('spatial'):
+                        constraints_str.append(
+                            f'Spatial: {", ".join(constraints["spatial"])}'
+                        )
+                    if constraints.get('categorical'):
+                        constraints_str.append(
+                            f'Categorical: {", ".join(constraints["categorical"])}'
+                        )
+                    if constraints_str:
+                        requirements_context += (
+                            f'\nConstraints: {"; ".join(constraints_str)}'
+                        )
+                if answer_format:
+                    requirements_context += f'\nAnswer Format: {answer_format}'
+
+            # Prepare content summary from processed results
+            content_summary = processing_result.get('content_summary', '')
+
+            # Build materials summary
+            materials_summary = []
+            for material in materials:
+                material_type = material.get('type', 'unknown')
+                title = material.get('title', 'Untitled')
+                url = material.get('url', '')
+                content_preview = (
+                    material.get('content', '')[:500] if material.get('content') else ''
+                )
+
+                materials_summary.append(
+                    f'[{material_type.upper()}] {title}\nURL: {url}\nContent: {content_preview}...'
+                    if content_preview
+                    else f'[{material_type.upper()}] {title}\nURL: {url}'
+                )
+
+            system_prompt = """You are an expert at analyzing search results and extracting information relevant to a specific task.
+
+Given:
+1. A subtask description that needs to be completed
+2. Processed search results (content from web pages and files)
+3. Problem requirements and constraints
+
+Your task:
+- Analyze the search results with respect to the subtask description
+- Extract and determine the answer or information that addresses the subtask
+- Provide a clear, focused response that directly answers what the subtask is asking for
+- If the search results don't contain the needed information, clearly state that
+- If multiple pieces of information are found, synthesize them appropriately
+
+Return a JSON object with:
+- answer: The answer or information determined from the search results (string)
+- reasoning: Brief explanation of how you arrived at this answer (string)
+- confidence: Confidence level from 0.0 to 1.0 (float)
+- sources_used: List of source titles/URLs that were most relevant (array of strings)
+
+IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
+
+            user_prompt = f"""Problem: {problem}
+
+Subtask Description: {subtask_description}
+{requirements_context}
+
+Processed Search Results:
+{content_summary if content_summary else 'No content extracted from search results.'}
+
+Materials Found ({len(materials)} total):
+{chr(10).join(materials_summary) if materials_summary else 'No materials found.'}
+
+Analyze these search results with respect to the subtask description and determine the answer or information that addresses what the subtask is asking for."""
+
+            self.logger.info(
+                f'Analyzing search results with LLM for subtask: {subtask_description[:100]}...'
+            )
+
+            response = self.llm_service.call_with_system_prompt(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=0.3,  # Lower temperature for consistent analysis
+                response_format={'type': 'json_object'},
+            )
+
+            json_text = extract_json_from_text(response)
+            analysis_data = json.loads(json_text)
+
+            answer = analysis_data.get(
+                'answer', 'No answer determined from search results.'
+            )
+            reasoning = analysis_data.get('reasoning', 'No reasoning provided.')
+            confidence = analysis_data.get('confidence', 0.0)
+            sources_used = analysis_data.get('sources_used', [])
+
+            self.logger.info(
+                f'LLM analysis complete: answer length={len(answer)}, confidence={confidence:.2f}'
+            )
+
+            # Return structured result with LLM analysis as primary content
+            return {
+                'content': answer,  # Primary result - LLM-determined answer
+                'reasoning': reasoning,
+                'confidence': confidence,
+                'sources_used': sources_used,
+                'analysis_type': 'search_results_analysis',
+            }
+
+        except Exception as e:
+            self.logger.error(
+                f'Failed to analyze search results with LLM: {e}', exc_info=True
+            )
+            # Fallback: return content summary as result
+            return {
+                'content': processing_result.get('content_summary', ''),
+                'reasoning': f'LLM analysis failed: {str(e)}',
+                'confidence': 0.0,
+                'sources_used': [],
+                'analysis_type': 'search_results_analysis_fallback',
+            }
 
     def _is_file_url(self, url: str) -> bool:
         """

@@ -3,7 +3,7 @@
 import json
 import logging
 import re
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from ..llm import LLMService
 from ..models import Attachment
@@ -31,6 +31,12 @@ class AnswerSynthesizer:
         self.llm_service = llm_service
         self.state_manager = state_manager
         self.logger = logger
+
+        # Prompt size/length controls
+        self.MAX_CONTEXT_PER_SUBTASK = 800
+        self.MAX_REASONING_SECTION = 1200
+        self.MAX_KNOWLEDGE_FACTS = 20
+        self.MAX_FIELD_SNIPPET = 160
 
     def _extract_numeric_value(self, text: str) -> Optional[float]:
         """
@@ -151,6 +157,284 @@ class AnswerSynthesizer:
 
         return list(set(matches))
 
+    # ===== Prompt Building Utilities (concise, structured, token-efficient) =====
+
+    def _is_error_result(self, result: Any) -> bool:
+        if isinstance(result, dict) and result.get('status') == 'failed':
+            return True
+        if isinstance(result, str) and (
+            result.startswith('Error:')
+            or result.startswith('Name Error:')
+            or result.startswith('Execution Error:')
+            or result.startswith('Import Error:')
+        ):
+            return True
+        return False
+
+    def _truncate(self, text: str, limit: int) -> str:
+        if not isinstance(text, str):
+            text = str(text)
+        return text if len(text) <= limit else text[: limit - 3] + '...'
+
+    def _summarize_result_for_prompt(self, result: Any) -> str:
+        """
+        Produce a compact, high-signal summary of a subtask result prioritizing
+        extracted fields used by synthesis. This greatly reduces token usage.
+        """
+        if isinstance(result, dict):
+            lines: List[str] = []
+
+            # 1) Primary: extracted_counts
+            extracted_counts = result.get('extracted_counts') or []
+            if isinstance(extracted_counts, list) and extracted_counts:
+                for item in extracted_counts[:3]:
+                    value = item.get('value')
+                    ctx = self._truncate(
+                        item.get('context', ''), self.MAX_FIELD_SNIPPET
+                    )
+                    conf = item.get('confidence')
+                    conf_str = (
+                        f' (confidence: {conf:.2f})'
+                        if isinstance(conf, (int, float))
+                        else ''
+                    )
+                    lines.append(f'COUNT: {value}{conf_str} - {ctx}'.strip())
+
+            # 2) Secondary: llm_extraction
+            llm_extraction = result.get('llm_extraction') or {}
+            if (
+                isinstance(llm_extraction, dict)
+                and llm_extraction.get('extracted_value') is not None
+            ):
+                ev = llm_extraction.get('extracted_value')
+                conf = llm_extraction.get('confidence')
+                reas = self._truncate(
+                    llm_extraction.get('reasoning', ''), self.MAX_FIELD_SNIPPET
+                )
+                # Truncate context field to avoid including full page content
+                ctx = self._truncate(
+                    llm_extraction.get('context', ''), self.MAX_FIELD_SNIPPET
+                )
+                conf_str = (
+                    f' (confidence: {conf:.2f})'
+                    if isinstance(conf, (int, float))
+                    else ''
+                )
+                # Only include context if it's different from reasoning and adds value
+                if ctx and ctx != reas and len(ctx) > 10:
+                    lines.append(
+                        f'LLM_EXTRACT: {ev}{conf_str} - {reas} [context: {ctx}]'.strip()
+                    )
+                else:
+                    lines.append(f'LLM_EXTRACT: {ev}{conf_str} - {reas}'.strip())
+
+            # 3) Tertiary: numeric_data.counts
+            numeric_data = result.get('numeric_data') or {}
+            counts = numeric_data.get('counts') or []
+            if isinstance(counts, list) and counts:
+                for item in counts[:2]:
+                    value = item.get('value')
+                    ctx = self._truncate(
+                        item.get('context', ''), self.MAX_FIELD_SNIPPET
+                    )
+                    lines.append(f'REGEX_COUNT: {value} - {ctx}'.strip())
+
+            # 4) Image analysis (high priority for visual answers)
+            image_analysis = result.get('image_analysis')
+            if image_analysis and isinstance(image_analysis, str):
+                # Preserve image analysis prominently
+                image_analysis_summary = self._truncate(
+                    image_analysis, self.MAX_CONTEXT_PER_SUBTASK
+                )
+                lines.append(f'IMAGE_ANALYSIS: {image_analysis_summary}')
+
+            if lines:
+                return '\n'.join(lines[:6])
+
+            # Fallback: compact JSON dump, truncated
+            try:
+                compact = json.dumps(result, ensure_ascii=False, separators=(',', ':'))
+            except Exception:
+                compact = str(result)
+            return self._truncate(compact, self.MAX_CONTEXT_PER_SUBTASK)
+
+        # If it's a plain string, check for image analysis and preserve it
+        result_str = str(result)
+        image_analysis_marker = 'IMAGE ANALYSIS (from visual LLM):'
+
+        if image_analysis_marker in result_str:
+            # Extract image analysis section
+            marker_idx = result_str.find(image_analysis_marker)
+            text_before = result_str[:marker_idx].strip()
+            image_analysis = result_str[marker_idx:].strip()
+
+            # Truncate text before analysis, but preserve full image analysis
+            text_before_summary = self._truncate(
+                text_before, self.MAX_CONTEXT_PER_SUBTASK // 2
+            )
+            # Preserve image analysis (it's usually the key answer)
+            image_analysis_summary = self._truncate(
+                image_analysis, self.MAX_CONTEXT_PER_SUBTASK
+            )
+
+            if text_before_summary:
+                return f'{text_before_summary}\n\n{image_analysis_summary}'
+            else:
+                return image_analysis_summary
+
+        # If no image analysis, just truncate
+        return self._truncate(result_str, self.MAX_CONTEXT_PER_SUBTASK)
+
+    def _build_requirements_str(
+        self, explicit_requirements: List[str], implicit_requirements: List[str]
+    ) -> str:
+        all_requirements = (explicit_requirements or []) + (implicit_requirements or [])
+        if not all_requirements:
+            return ''
+        lines = ['\nCRITICAL ANSWER REQUIREMENTS:']
+        lines.extend([f'- {r}' for r in all_requirements])
+
+        # Add compact format constraint notice if present
+        format_keywords = [
+            'word',
+            'single word',
+            'one word',
+            'number',
+            'phrase',
+            'sentence',
+            'date',
+            'zip code',
+            'zipcode',
+        ]
+        if any(
+            any(kw in (r or '').lower() for kw in format_keywords)
+            for r in all_requirements
+        ):
+            lines.append(
+                '\nFORMAT CONSTRAINT ACTIVE: Answer MUST strictly follow the requirements above.'
+            )
+        return '\n'.join(lines)
+
+    def _build_attachment_info(self, attachments: Optional[List['Attachment']]) -> str:
+        if not attachments:
+            return ''
+        info = [f'\nAvailable Attachments ({len(attachments)}):']
+        for i, att in enumerate(attachments):
+            size_kb = (len(att.data) / 1024) if getattr(att, 'data', None) else 0
+            info.append(f'- [{i}] {att.filename} ({size_kb:.1f} KB)')
+        return '\n'.join(info)
+
+    def _build_execution_summary_str(
+        self, execution_summary: Dict[str, Any], query_analysis: Dict[str, Any]
+    ) -> str:
+        if not execution_summary:
+            return ''
+
+        lines: List[str] = ['## Execution Results (condensed)']
+
+        # Add per-subtask compact summaries
+        for subtask_id, result in execution_summary.items():
+            if self._is_error_result(result):
+                continue
+            summary = self._summarize_result_for_prompt(result)
+            if summary:
+                lines.append(f'\n### {subtask_id}\n{summary}')
+
+        # Key values for calculations
+        calculation_values: List[str] = []
+        for subtask_id, result in execution_summary.items():
+            if self._is_error_result(result) or not isinstance(result, dict):
+                continue
+
+            if result.get('extracted_counts'):
+                for item in result['extracted_counts']:
+                    val = item.get('value')
+                    if val is not None:
+                        calculation_values.append(f'- {subtask_id}: {val}')
+            elif result.get('llm_extraction') and isinstance(
+                result['llm_extraction'], dict
+            ):
+                ev = result['llm_extraction'].get('extracted_value')
+                if ev is not None:
+                    calculation_values.append(f'- {subtask_id}: {ev}')
+
+        if calculation_values:
+            lines.append('\n## Key Values for Calculations (use exactly)')
+            lines.extend(calculation_values[:10])
+
+        return '\n'.join(lines)
+
+    def _build_reasoning_summary_str(self, reasoning_summary: Dict[str, Any]) -> str:
+        if not reasoning_summary:
+            return ''
+        acc: List[str] = ['## Reasoning Summary (condensed)']
+        used = 0
+        for key, value in reasoning_summary.items():
+            if used >= self.MAX_REASONING_SECTION:
+                break
+            value_str = self._truncate(
+                str(value), min(500, self.MAX_REASONING_SECTION - used)
+            )
+            acc.append(f'\n### {key}\n{value_str}')
+            used += len(value_str)
+        return '\n'.join(acc)
+
+    def _build_knowledge_facts_str(self) -> str:
+        facts = [
+            {'entity': f.entity, 'relationship': f.relationship, 'value': f.value}
+            for f in self.state_manager.knowledge_graph
+        ]
+        if not facts:
+            return ''
+        limited = facts[: self.MAX_KNOWLEDGE_FACTS]
+        try:
+            facts_str = json.dumps(limited, ensure_ascii=False, default=str)
+        except Exception:
+            facts_str = str(limited)
+        return '## Knowledge Graph Facts\n' + facts_str
+
+    def _build_system_prompt(self) -> str:
+        """
+        Concise, strict system prompt to minimize tokens while enforcing rules.
+        """
+        return (
+            'CRITICAL: Respond with a single valid JSON object only. No markdown, no extra text.\n'
+            'Role: Expert answer synthesizer. Combine evidence to produce a precise final answer.\n\n'
+            'Output schema: {"final_answer": string, "description": string}.\n\n'
+            'Rules:\n'
+            '- final_answer MUST strictly follow all format constraints (e.g., single word, number only, date, zip).\n'
+            "- Use EXACT extracted values found in execution results: sections 'Extracted Structured Data' or 'Key Values for Calculations', fields 'extracted_counts' or 'llm_extraction' are authoritative.\n"
+            '- Do NOT add units unless explicitly required.\n'
+            '- For characters/symbols, return the NAME (e.g., backtick, dot, comma).\n'
+            "- If reasoning_summary identifies a 'best_ball' (or explicit optimal number), use it as final_answer.\n"
+            '- No explanations or meta-text in final_answer.\n\n'
+            'Return only the JSON object.'
+        )
+
+    def _build_user_prompt(
+        self,
+        problem: str,
+        answer_format_str: str,
+        requirements_str: str,
+        attachment_info: str,
+        execution_summary_str: str,
+        reasoning_summary_str: str,
+        knowledge_facts_str: str,
+    ) -> str:
+        return (
+            f'Problem:\n{problem}\n\n'
+            f'Answer Format Requirements:\n{answer_format_str}\n'
+            f'{requirements_str}\n\n'
+            f'Available Sources:{attachment_info}\n\n'
+            f'{execution_summary_str}\n\n'
+            f'{reasoning_summary_str}\n\n'
+            f'{knowledge_facts_str}\n\n'
+            'Instructions:\n'
+            '- Extract the exact answer that matches the format.\n'
+            "- For calculations, use values shown under 'Key Values for Calculations' exactly.\n"
+            '- Show brief work in description, but keep final_answer strictly formatted.\n'
+        )
+
     def _validate_and_correct_format(
         self,
         final_answer: str,
@@ -233,129 +517,6 @@ class AnswerSynthesizer:
 
         return final_answer
 
-    def _extract_structured_data_hints(
-        self, execution_summary: Dict[str, Any], query_analysis: Dict[str, Any]
-    ) -> str:
-        """
-        Extract structured data (numbers, dates, zip codes) from execution results
-        and format as hints for the synthesis prompt.
-
-        Args:
-            execution_summary: Dictionary of execution results.
-            query_analysis: Query analysis with requirements.
-
-        Returns:
-            Formatted string with extracted structured data.
-        """
-        hints = []
-
-        # PRIORITY 1: Extract from browser_navigate extracted_counts (most reliable)
-        extracted_counts_found = []
-        for result in execution_summary.values():
-            # Skip error results
-            if isinstance(result, dict) and result.get('status') == 'failed':
-                continue
-            if isinstance(result, str) and (
-                result.startswith('Error:')
-                or result.startswith('Name Error:')
-                or result.startswith('Execution Error:')
-            ):
-                continue
-
-            if isinstance(result, dict):
-                # Check for extracted_counts (from extract_count/extract_statistics)
-                if 'extracted_counts' in result and result.get('extracted_counts'):
-                    for count_item in result['extracted_counts']:
-                        value = count_item.get('value')
-                        if value is not None:
-                            context = count_item.get('context', '')[:100]
-                            confidence = count_item.get('confidence', 'N/A')
-                            extracted_counts_found.append(
-                                {
-                                    'value': value,
-                                    'context': context,
-                                    'confidence': confidence,
-                                }
-                            )
-
-                # Check for llm_extraction (from LLM-based extraction)
-                if 'llm_extraction' in result and result.get('llm_extraction'):
-                    llm_extraction = result['llm_extraction']
-                    extracted_value = llm_extraction.get('extracted_value')
-                    if extracted_value is not None:
-                        confidence = llm_extraction.get('confidence', 0.0)
-                        reasoning = llm_extraction.get('reasoning', '')[:100]
-                        extracted_counts_found.append(
-                            {
-                                'value': extracted_value,
-                                'context': reasoning,
-                                'confidence': confidence,
-                            }
-                        )
-
-                # Check for numeric_data.counts (fallback from regex extraction)
-                if 'numeric_data' in result and result.get('numeric_data'):
-                    numeric_data = result['numeric_data']
-                    counts = numeric_data.get('counts', [])
-                    if counts:
-                        for count_item in counts[:3]:  # Top 3 counts
-                            value = count_item.get('value')
-                            if value is not None:
-                                context = count_item.get('context', '')[:100]
-                                extracted_counts_found.append(
-                                    {
-                                        'value': value,
-                                        'context': context,
-                                        'confidence': 'regex_extraction',
-                                    }
-                                )
-
-        # Add extracted counts as primary hints
-        if extracted_counts_found:
-            for item in extracted_counts_found:
-                conf_str = (
-                    f' (confidence: {item["confidence"]:.2f})'
-                    if isinstance(item['confidence'], (int, float))
-                    else ''
-                )
-                context_str = f' - {item["context"]}' if item.get('context') else ''
-                hints.append(
-                    f'EXTRACTED COUNT VALUE: {item["value"]}{conf_str}{context_str}'
-                )
-
-        # Fallback: Extract numeric values from text (lower priority)
-        all_results_text = ' '.join(
-            [str(result) for result in execution_summary.values()]
-        )
-
-        # Only extract from text if we didn't find explicit extracted counts
-        if not extracted_counts_found:
-            numeric_value = self._extract_numeric_value(all_results_text)
-            if numeric_value is not None:
-                hints.append(f'Numeric value found (from text): {numeric_value}')
-
-        # Extract zip codes
-        zip_codes = self._extract_zip_codes(all_results_text)
-        if zip_codes:
-            hints.append(f'Zip codes found: {", ".join(zip_codes)}')
-
-        # Extract dates
-        dates = self._extract_dates(all_results_text)
-        if dates:
-            hints.append(f'Dates found: {", ".join(dates[:5])}')  # Limit to first 5
-
-        # Extract exact matches from requirements
-        all_requirements = query_analysis.get(
-            'explicit_requirements', []
-        ) + query_analysis.get('implicit_requirements', [])
-        exact_matches = self._extract_exact_matches(all_results_text, all_requirements)
-        if exact_matches:
-            hints.append(
-                f'Potential answer terms found: {", ".join(exact_matches[:5])}'
-            )
-
-        return '\n'.join(hints) if hints else ''
-
     def synthesize(
         self,
         problem: str,
@@ -382,51 +543,7 @@ class AnswerSynthesizer:
         """
         self.logger.info('Synthesizing final report answer')
 
-        system_prompt = """You are an expert at synthesizing final answers from multiple sources.
-
-Your task is to generate a precise answer that:
-1. Directly addresses the user's problem/question
-2. Integrates all available information from execution results, knowledge graph, and attachments
-3. STRICTLY follows the format requirements specified (e.g., "word" = single word only, "number" = number only)
-4. Provides ONLY the factual answer without extra explanations
-5. **CRITICAL: ALWAY return the NAME in words using the shortest common name rather than the symbol**
-
-CRITICAL: USE EXACT EXTRACTED VALUES FOR CALCULATIONS
-- When execution results show extracted values (e.g., "EXTRACTED VALUE: XXX"), you MUST use that EXACT number for calculations
-- DO NOT assume, estimate, or guess different numbers when an extracted value is available
-- If a calculation is needed, use the exact extracted value from the results
-- Look for sections marked "=== EXTRACTED VALUES (PRIMARY DATA) ===" or "EXTRACTED COUNT VALUE:" - these are the actual extracted values to use
-- DO NOT use phrases like "assumed", "approximately", or "estimated" when an exact extracted value exists
-
-CRITICAL FORMAT COMPLIANCE RULES:
-- If format requirement says "word" or "single word": return ONLY a single word (no explanations, no sentences)
-- If format requirement says "number": return ONLY a number (no text, no units unless specified)
-- If format requirement says "phrase": return a short phrase only
-- The final_answer MUST strictly match the format requirements - no deviations
-- DO NOT add explanations, summaries, or meta-commentary to the answer
-- DO NOT expand beyond the format constraint even if you think more context would help
-
-GENERATION GUIDELINES:
-- Extract the exact answer from the execution results that matches the format requirement
-- SHOW YOUR WORK: Before providing the final answer, identify and extract all intermediate values from execution results (numbers, dates, strings, etc.)
-- For calculations: Use the EXACT extracted values shown in the execution results (look for "EXTRACTED VALUE" markers)
-- If format requires a word, find the exact word in the results and return ONLY that word
-- If format requires a number, extract the number and return ONLY that number (no text, no units, no explanations)
-- If format requires a date, extract the date in the exact format specified
-- If format requires zip codes, extract the five-digit zip codes found in results
-- Prioritize format compliance over completeness - better to return a correctly formatted partial answer than a well-formatted but incorrectly formatted complete answer
-- Pay special attention to structured data extraction hints provided in the execution results
-- If information is missing, return the best available answer that still meets format requirements
-
-CRITICAL: If the `reasoning_summary` explicitly identifies a specific number as the 'best_ball' or optimal choice to maximize winning probability, you MUST use that number as the `final_answer`. Ensure the `final_answer` is consistent with the `reasoning_summary`.
-
-ALWAYS return a JSON object with EXACTLY these two fields:
-- "final_answer": The answer in the exact format specified (e.g., if "word" required, return just the word, not a sentence explaining the word). This is the ONLY field that should be used for answer extraction.
-- "description": A brief description of how the final_answer was derived (optional explanation, but final_answer is the authoritative answer)
-
-CRITICAL: The "final_answer" field is the ONLY answer that should be extracted and used. Do NOT include dates, intermediate values, or other information in final_answer unless they are the actual answer to the question.
-
-The final_answer MUST be formatted exactly as required - no exceptions."""
+        system_prompt = self._build_system_prompt()
 
         # Extract and simplify answer_format to avoid confusion
         answer_format_raw = query_analysis.get('answer_format', 'text')
@@ -443,231 +560,43 @@ The final_answer MUST be formatted exactly as required - no exceptions."""
         explicit_requirements = query_analysis.get('explicit_requirements', [])
         implicit_requirements = query_analysis.get('implicit_requirements', [])
 
-        # Build requirements section for prompt
-        requirements_str = ''
-        all_requirements = explicit_requirements + implicit_requirements
-        if all_requirements:
-            requirements_str = '\n\nCRITICAL ANSWER REQUIREMENTS (MUST BE FOLLOWED):\n'
-            for req in all_requirements:
-                requirements_str += f'- {req}\n'
-            # Check for format constraints in requirements (e.g., "word", "single word", "number")
-            format_keywords = [
-                'word',
-                'single word',
-                'one word',
-                'number',
-                'phrase',
-                'sentence',
-            ]
-            format_requirements = [
-                r
-                for r in all_requirements
-                if any(kw in r.lower() for kw in format_keywords)
-            ]
-            if format_requirements:
-                requirements_str += '\n⚠️ FORMAT CONSTRAINT DETECTED - Answer MUST strictly adhere to format requirements above!'
+        # Build requirements section for prompt (condensed)
+        requirements_str = self._build_requirements_str(
+            explicit_requirements, implicit_requirements
+        )
 
-        # Build attachment information for the prompt
-        attachment_info = ''
-        if attachments:
-            attachment_info = (
-                f'\n\nAvailable Attachments ({len(attachments)} file(s)):\n'
-            )
-            for i, att in enumerate(attachments):
-                file_size = len(att.data) if att.data else 0
-                file_size_kb = file_size / 1024 if file_size > 0 else 0
-                attachment_info += (
-                    f'  - Attachment {i}: {att.filename} ({file_size_kb:.1f} KB)\n'
-                )
-            attachment_info += '\nNOTE: These attachments (including any files downloaded during execution) are available for analysis. '
-            attachment_info += 'If the execution results reference these files or if you need to extract information from them, '
-            attachment_info += 'you may reference them in your answer. However, note that the actual file contents have already been '
-            attachment_info += (
-                'processed and should be reflected in the execution results above.'
-            )
+        # Build attachment information for the prompt (compact)
+        attachment_info = self._build_attachment_info(attachments)
 
-        # Build comprehensive execution summary
+        # Build comprehensive but condensed execution summary
         execution_summary = execution_results.get('execution_summary', {})
         reasoning_summary = execution_results.get('reasoning_summary', {})
 
-        # Format execution results for better readability
-        execution_summary_str = ''
-        if execution_summary:
-            execution_summary_str = '## Execution Results Summary\n'
-            for subtask_id, result in execution_summary.items():
-                # Filter out error results - skip failed subtasks and error strings
-                if isinstance(result, dict) and result.get('status') == 'failed':
-                    self.logger.debug(
-                        f'Skipping failed subtask {subtask_id} from synthesis'
-                    )
-                    continue
+        execution_summary_str = self._build_execution_summary_str(
+            execution_summary, query_analysis
+        )
 
-                # Check if result is an error string
-                if isinstance(result, str) and (
-                    result.startswith('Error:')
-                    or result.startswith('Name Error:')
-                    or result.startswith('Execution Error:')
-                    or result.startswith('Import Error:')
-                ):
-                    self.logger.debug(
-                        f'Skipping error result from subtask {subtask_id}: {result[:100]}'
-                    )
-                    continue
+        # Format reasoning summary (condensed)
+        reasoning_summary_str = self._build_reasoning_summary_str(reasoning_summary)
 
-                if isinstance(result, dict):
-                    result_str = json.dumps(
-                        result, indent=2, ensure_ascii=False, default=str
-                    )
-                else:
-                    result_str = str(result)
-                execution_summary_str += f'\n### Subtask {subtask_id}:\n{result_str}\n'
+        # Format knowledge graph facts (limited)
+        knowledge_facts_str = self._build_knowledge_facts_str()
 
-            # Add structured data extraction hints
-            structured_data_hints = self._extract_structured_data_hints(
-                execution_summary, query_analysis
-            )
-            if structured_data_hints:
-                execution_summary_str += f'\n## Extracted Structured Data (USE THESE VALUES FOR CALCULATIONS):\n{structured_data_hints}\n'
-
-            # Extract and highlight key values for calculations
-            calculation_values = []
-            for subtask_id, result in execution_summary.items():
-                # Skip error results
-                if isinstance(result, dict) and result.get('status') == 'failed':
-                    continue
-                if isinstance(result, str) and (
-                    result.startswith('Error:')
-                    or result.startswith('Name Error:')
-                    or result.startswith('Execution Error:')
-                    or result.startswith('Import Error:')
-                ):
-                    continue
-
-                if isinstance(result, dict):
-                    # Check for extracted_counts
-                    if 'extracted_counts' in result and result.get('extracted_counts'):
-                        for count_item in result['extracted_counts']:
-                            value = count_item.get('value')
-                            if value is not None:
-                                context = count_item.get('context', '')[:200]
-                                calculation_values.append(
-                                    {
-                                        'subtask': subtask_id,
-                                        'value': value,
-                                        'context': context,
-                                        'type': 'extracted_count',
-                                    }
-                                )
-                    # Check for llm_extraction
-                    elif 'llm_extraction' in result and result.get('llm_extraction'):
-                        llm_extraction = result['llm_extraction']
-                        extracted_value = llm_extraction.get('extracted_value')
-                        if extracted_value is not None:
-                            reasoning = llm_extraction.get('reasoning', '')[:200]
-                            calculation_values.append(
-                                {
-                                    'subtask': subtask_id,
-                                    'value': extracted_value,
-                                    'context': reasoning,
-                                    'type': 'llm_extraction',
-                                }
-                            )
-
-            if calculation_values:
-                calculation_hints = (
-                    '\n## Key Values for Calculations (USE THESE EXACT VALUES):\n'
-                )
-                calculation_hints += 'CRITICAL: These are actual extracted values. Use them EXACTLY in your calculations.\n\n'
-                for calc_val in calculation_values:
-                    calculation_hints += (
-                        f'- From {calc_val["subtask"]}: {calc_val["value"]}\n'
-                    )
-                    if calc_val.get('context'):
-                        calculation_hints += f'  Context: {calc_val["context"]}\n'
-                calculation_hints += '\n⚠️ When performing calculations, use these exact values. Do not assume or estimate different numbers.\n'
-                execution_summary_str += calculation_hints
-
-        # Format reasoning summary
-        reasoning_summary_str = ''
-        if reasoning_summary:
-            reasoning_summary_str = '## Reasoning Summary\n'
-            for key, value in reasoning_summary.items():
-                value_str = str(value)
-                if len(value_str) > 500:
-                    value_str = value_str[:500] + '... (truncated)'
-                reasoning_summary_str += f'\n### {key}:\n{value_str}\n'
-
-        # Format knowledge graph facts
-        knowledge_facts = [
-            {'entity': f.entity, 'relationship': f.relationship, 'value': f.value}
-            for f in self.state_manager.knowledge_graph
-        ]
-        knowledge_facts_str = ''
-        if knowledge_facts:
-            knowledge_facts_str = '## Knowledge Graph Facts\n'
-            knowledge_facts_str += json.dumps(knowledge_facts, indent=2, default=str)
-
-        user_prompt = f"""Problem Statement:
-{problem}
-
-Answer Format Requirements:
-{answer_format_str}
-{requirements_str}
-
-Your Task:
-Generate a final answer that directly addresses the problem above.
-Extract and synthesize information from all available sources below, then construct the answer.
-
-CRITICAL: Your final_answer MUST strictly comply with ALL format requirements and constraints listed above.
-
-Available Sources:{attachment_info}
-
-{execution_summary_str}
-
-{reasoning_summary_str}
-
-{knowledge_facts_str}
-
----
-
-Instructions:
-1. Review all execution results and extract the key factual information relevant to the problem
-2. Pay attention to the "Extracted Structured Data" and "Key Values for Calculations" sections above - these show the ACTUAL extracted values that MUST be used
-3. For calculations: Use the EXACT values shown in "Key Values for Calculations" section. Do NOT assume, estimate, or guess different numbers
-4. SHOW YOUR WORK: Identify the specific values from execution results that answer the question:
-   - If question asks for a calculated number, use the extracted values shown above in your calculation
-   - If question asks for a number, find and extract the exact number from results
-   - If question asks for a date, find and extract the exact date matching the format requirement
-   - If question asks for a word/term, find the exact word in results
-   - If question asks for zip codes, extract all five-digit zip codes from results
-   - **If question asks for "character name", convert any symbol (`, ., ,) to its NAME ("backtick", "dot", "comma")**
-5. When performing calculations:
-   - Find the extracted value in the "Key Values for Calculations" section
-   - Use that EXACT value in your calculation
-   - Show the calculation: extracted_value × multiplier = result
-6. Synthesize this information into a coherent answer
-7. STRICTLY follow the format requirements - if it says "word", return ONLY a single word; if it says "number", return ONLY a number; if it says "character name", return the NAME not the symbol
-8. Ensure the final_answer field contains ONLY the ACTUAL ANSWER (no explanations, no meta-commentary, no summaries)
-9. If format requires a word, extract the exact word from the results - do not add explanations
-10. Before finalizing, validate that your answer matches the expected format exactly and uses the extracted values correctly
-
-Return a JSON object with EXACTLY these two fields:
-- "final_answer": The actual answer to the question (extract and use this field only)
-- "description": Brief explanation of how the answer was derived
-
-CRITICAL:
-- The "final_answer" field is the ONLY answer value. Extract and use this field exclusively.
-- Do NOT include dates, intermediate calculations, or context in final_answer unless they ARE the answer.
-- If the question asks for a word, final_answer should contain ONLY that word.
-- If the question asks for a number, final_answer should contain ONLY that number.
-
-IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
+        user_prompt = self._build_user_prompt(
+            problem=problem,
+            answer_format_str=answer_format_str,
+            requirements_str=requirements_str,
+            attachment_info=attachment_info,
+            execution_summary_str=execution_summary_str,
+            reasoning_summary_str=reasoning_summary_str,
+            knowledge_facts_str=knowledge_facts_str,
+        )
 
         try:
             response = self.llm_service.call_with_system_prompt(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                temperature=0.0,  # Maximum determinism for consistent answer formatting
+                temperature=0.3,  # Maximum determinism for consistent answer formatting
                 response_format={'type': 'json_object'},
             )
 
@@ -693,6 +622,23 @@ IMPORTANT: Return your response as valid JSON only, without any markdown formatt
             self.logger.debug(
                 f'Extracted final_answer: {final_answer}, description: {description[:100] if description else "None"}'
             )
+
+            # Enforce final format compliance post-hoc for robustness
+            try:
+                corrected = self._validate_and_correct_format(
+                    str(final_answer),
+                    query_analysis=query_analysis,
+                    execution_summary=execution_results.get('execution_summary', {}),
+                )
+                if corrected != final_answer:
+                    self.logger.debug(
+                        f'Post-validated final_answer corrected from "{final_answer}" to "{corrected}"'
+                    )
+                    response_data['final_answer'] = corrected
+                    final_answer = corrected
+            except Exception:
+                # If anything goes wrong, keep the original final_answer
+                pass
 
             # Log summary
             answer_preview = (
@@ -776,17 +722,11 @@ IMPORTANT: Return your response as valid JSON only, without any markdown formatt
         system_prompt = """You are creating a human-readable reasoning monologue.
 Convert the problem-solving process into a clear, step-by-step narrative in first person.
 
-CRITICAL: You MUST use the EXACT values extracted from execution results. DO NOT assume, estimate, or guess numbers.
-- If execution results show an extracted count (e.g., "1002 articles"), you MUST use that exact number
-- DO NOT use phrases like "assumed", "estimated", "approximately" for values that were explicitly extracted
-- When showing calculations, use the actual extracted values, not assumptions
-
 The monologue should:
 - Be written in first person ("I", "my")
 - Follow markdown formatting with headers (##)
 - Explain each step clearly
 - Show the reasoning process
-- Use ACTUAL extracted values from execution results, not assumptions
 - Be professional but accessible
 
 Format the monologue with sections like:
@@ -796,12 +736,11 @@ Format the monologue with sections like:
 ...
 ## Final Answer"""
 
-        # Extract key values from execution results for the monologue
+        # Extract only key values from execution results (simplified)
         execution_summary = execution_results.get('execution_summary', {})
-        extracted_values_summary = []
+        key_values = []
 
         for subtask_id, result in execution_summary.items():
-            # Skip error results
             if isinstance(result, dict) and result.get('status') == 'failed':
                 continue
             if isinstance(result, str) and (
@@ -812,83 +751,48 @@ Format the monologue with sections like:
                 continue
 
             if isinstance(result, dict):
-                # Check for extracted_counts
+                # Extract key values only
                 if 'extracted_counts' in result and result.get('extracted_counts'):
-                    for count_item in result['extracted_counts']:
+                    for count_item in result['extracted_counts'][
+                        :2
+                    ]:  # Limit to 2 per subtask
                         value = count_item.get('value')
                         if value is not None:
-                            context = count_item.get('context', '')[:150]
-                            extracted_values_summary.append(
-                                f'  - Subtask {subtask_id}: Extracted value = {value}'
-                                f' (Context: {context})'
-                            )
-                # Check for llm_extraction
+                            key_values.append(f'Subtask {subtask_id}: {value}')
                 elif 'llm_extraction' in result and result.get('llm_extraction'):
-                    llm_extraction = result['llm_extraction']
-                    extracted_value = llm_extraction.get('extracted_value')
+                    extracted_value = result['llm_extraction'].get('extracted_value')
                     if extracted_value is not None:
-                        reasoning = llm_extraction.get('reasoning', '')[:150]
-                        extracted_values_summary.append(
-                            f'  - Subtask {subtask_id}: Extracted value = {extracted_value}'
-                            f' (Reasoning: {reasoning})'
-                        )
+                        key_values.append(f'Subtask {subtask_id}: {extracted_value}')
 
-        extracted_values_str = ''
-        if extracted_values_summary:
-            extracted_values_str = (
-                '\n\n=== EXTRACTED VALUES FROM EXECUTION (USE THESE EXACT VALUES) ===\n'
-            )
-            extracted_values_str += '\n'.join(extracted_values_summary)
-            extracted_values_str += '\n\nCRITICAL: These are ACTUAL extracted values. Use them exactly, do not assume or estimate different values.\n'
+        # Build simplified user prompt
+        problem_type = problem_classification.get('primary_type', 'Unknown')
+        plan_steps = len(plan)
+        final_answer = synthesis.get('final_answer', 'N/A')
 
-        # Format execution summary for monologue
-        execution_summary_str = ''
-        if execution_summary:
-            execution_summary_str = '\n\n=== Execution Results ===\n'
-            for subtask_id, result in execution_summary.items():
-                # Skip error results from monologue
-                if isinstance(result, dict) and result.get('status') == 'failed':
-                    continue
-                if isinstance(result, str) and (
-                    result.startswith('Error:')
-                    or result.startswith('Name Error:')
-                    or result.startswith('Execution Error:')
-                    or result.startswith('Import Error:')
-                ):
-                    continue
+        # Summarize query analysis (avoid full JSON dump)
+        query_summary = query_analysis.get('answer_format', 'text')
+        if isinstance(query_summary, dict):
+            query_summary = str(query_summary.get('for_final_factual_answer', 'text'))
 
-                if isinstance(result, dict):
-                    result_str = json.dumps(
-                        result, indent=2, ensure_ascii=False, default=str
-                    )
-                else:
-                    result_str = str(result)
-                # Truncate long results
-                if len(result_str) > 1000:
-                    result_str = result_str[:1000] + '... (truncated)'
-                execution_summary_str += f'\nSubtask {subtask_id}:\n{result_str}\n'
+        values_str = '\n'.join(key_values[:10]) if key_values else 'None'
 
         user_prompt = f"""Problem: {problem}
 
-Query Analysis: {json.dumps(query_analysis, indent=2)}
+Problem Type: {problem_type}
+Answer Format: {query_summary}
+Execution Steps: {plan_steps}
+Final Answer: {final_answer}
 
-Problem Type: {problem_classification.get('primary_type', 'Unknown')}
+Key Values Found:
+{values_str}
 
-Execution Plan: {len(plan)} steps{extracted_values_str}{execution_summary_str}
-
-Final Synthesis: {synthesis.get('final_answer', 'N/A')}
-
-Create a comprehensive reasoning monologue that:
-1. Uses the EXACT extracted values shown above (do not assume different numbers)
-2. Shows the actual calculation using the extracted values
-3. Explains each step clearly
-4. Does not use phrases like "assumed" or "estimated" for values that were explicitly extracted"""
+Create a reasoning monologue explaining how the problem was solved."""
 
         try:
             monologue = self.llm_service.call_with_system_prompt(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                temperature=0.3,  # Consistent but readable monologue generation
+                temperature=0.3,
             )
             return monologue
         except Exception as e:
@@ -900,7 +804,7 @@ I analyzed the problem: {problem}
 Problem type: {problem_classification.get('primary_type', 'Unknown')}
 
 ## Execution
-Executed {len(plan)} steps with {len(execution_results)} results.
+Executed {len(plan)} steps with {len(execution_results.get('execution_summary', {}))} results.
 
 ## Final Answer
 {synthesis.get('final_answer', 'Unable to determine answer')}"""

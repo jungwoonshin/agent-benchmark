@@ -2,7 +2,7 @@
 
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 from urllib.parse import urlparse
 
 import requests
@@ -46,7 +46,7 @@ class FileHandler:
         options: dict = None,
         problem: Optional[str] = None,
         query_analysis: Optional[Dict[str, Any]] = None,
-    ) -> str:
+    ) -> Union[str, Dict[str, Any]]:
         """
         Smart file reader that extracts text and images from various common formats.
         For PDFs, extracts both text and images, processing images with visual LLM if available.
@@ -59,7 +59,9 @@ class FileHandler:
             query_analysis: Optional query analysis for relevance filtering (PDFs only).
 
         Returns:
-            Extracted text content from the file.
+            Extracted text content (string) or structured data (dict) for PDFs with sections.
+            For PDFs with problem/query_analysis: Returns dict with 'type', 'filename', 'sections', etc.
+            Otherwise: Returns string content.
         """
         self.logger.info(f"Tool 'read_attachment' called for: {attachment.filename}")
         self.logger.debug(f'Read options: {options}')

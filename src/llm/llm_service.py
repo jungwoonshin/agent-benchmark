@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Union
 import openai
 from dotenv import load_dotenv
 
-from ..utils import CircuitBreaker, classify_error, retry_with_backoff
+from ..utils import classify_error, retry_with_backoff
 
 # Load environment variables
 load_dotenv()
@@ -17,10 +17,24 @@ load_dotenv()
 class LLMService:
     """Service for interacting with OpenAI API."""
 
+    MODEL_CONFIG = {
+        'gpt-4.1': {
+            'base_url_env': 'OPENAI_URL',
+            'is_reasoning_model': True,
+            'use_max_completion_tokens': True,
+            'supports_response_format': False,
+        },
+        'openai/gpt-oss-120b': {
+            'base_url_env': 'OPENAI_BASE_URL',
+            'supports_response_format': False,
+            'is_reasoning_model': False,
+            'use_max_completion_tokens': True,  # Use max_completion_tokens instead of max_tokens
+        },
+    }
+
+
     # Class-level cache for models that don't support response_format
     _response_format_unsupported_models: set = set()
-    # Class-level circuit breaker (shared across instances)
-    _circuit_breaker: Optional[CircuitBreaker] = None
 
     def __init__(
         self,
@@ -29,66 +43,77 @@ class LLMService:
         visual_model: str = None,
         timeout: float = 60.0,
         max_retries: int = 3,
-        enable_circuit_breaker: bool = True,
     ):
         """
         Initialize LLM service.
 
         Args:
             logger: Logger instance for logging.
-            model: OpenAI model to use (default: from LLM_MODEL env var, or 'gpt-5').
+            model: OpenAI model to use (default: from LLM_MODEL env var, or 'openai/gpt-oss-120b').
             visual_model: Vision model for image processing (default: from VISUAL_LLM_MODEL env var, or 'gpt-4o').
             timeout: Request timeout in seconds (default: 60.0).
             max_retries: Maximum number of retries for transient errors (default: 3).
-            enable_circuit_breaker: Whether to use circuit breaker pattern (default: True).
         """
         self.logger = logger
-        # Load model from environment variable if not provided
-        self.model = model or os.getenv('LLM_MODEL', 'gpt-5')
-        # Load visual model for image processing
+        self.model = model or os.getenv('LLM_MODEL', 'openai/gpt-oss-120b')
         self.visual_model = visual_model or os.getenv('VISUAL_LLM_MODEL', 'gpt-4.1')
         self.timeout = timeout
         self.max_retries = max_retries
-        api_key = os.getenv('OPENAI_API_KEY')
-        if not api_key:
+        self.api_key = os.getenv('OPENAI_API_KEY')
+        if not self.api_key:
             raise ValueError(
                 'OPENAI_API_KEY not found in environment variables. '
                 'Please set it in .env file.'
             )
-        # Initialize OpenAI client with timeout
-        self.client = openai.OpenAI(
-            api_key=api_key,
-            timeout=openai.Timeout(timeout),
-        )
-        # Initialize vision client with custom URL if gpt-4.1 is used and OPENAI_URL is set
-        self.vision_client = None
-        if self.visual_model == 'gpt-4.1':
-            openai_url = os.getenv('OPENAI_URL')
-            if openai_url:
-                self.vision_client = openai.OpenAI(
-                    api_key=api_key,
-                    base_url=openai_url,
-                    timeout=openai.Timeout(timeout),
-                )
-                self.logger.info(
-                    f'Initialized vision client with custom URL: {openai_url}'
-                )
 
-        # Initialize circuit breaker if enabled (shared across instances)
-        if enable_circuit_breaker:
-            if LLMService._circuit_breaker is None:
-                LLMService._circuit_breaker = CircuitBreaker(
-                    failure_threshold=5,
-                    recovery_timeout=60,
-                    logger=logger,
-                )
-            self.circuit_breaker = LLMService._circuit_breaker
-        else:
-            self.circuit_breaker = None
+        self.clients = {}
+        self._initialize_clients()
+        self.DEFAULT_MAX_TOKENS = 8192
 
         self.logger.info(
             f'LLMService initialized with model: {self.model}, visual_model: {self.visual_model}, timeout: {timeout}s, max_retries: {max_retries}'
         )
+        
+
+    def _initialize_clients(self):
+        """Initialize OpenAI clients based on model configurations."""
+        self.clients['default'] = openai.OpenAI(
+            api_key=self.api_key,
+            timeout=openai.Timeout(self.timeout),
+        )
+
+        all_models = {self.model, self.visual_model}
+        for model_name in all_models:
+            if model_name in self.MODEL_CONFIG:
+                config = self.MODEL_CONFIG[model_name]
+                base_url_env = config.get('base_url_env')
+                if base_url_env:
+                    base_url = os.getenv(base_url_env)
+                    if base_url:
+                        self.clients[model_name] = openai.OpenAI(
+                            api_key=self.api_key,
+                            base_url=base_url,
+                            timeout=openai.Timeout(self.timeout),
+                        )
+                        self.logger.info(
+                            f'Initialized client for {model_name} with custom URL from {base_url_env}'
+                        )
+
+    def _get_client_for_model(self, model_name: str) -> openai.OpenAI:
+        """Get the appropriate OpenAI client for a given model."""
+        return self.clients.get(model_name, self.clients['default'])
+
+    def _validate_messages(self, messages: List[Dict[str, str]]):
+        """Validate the format of messages."""
+        if not isinstance(messages, list):
+            raise ValueError(f'messages must be a list, got {type(messages)}')
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                raise ValueError(f'Message {i} must be a dict, got {type(msg)}')
+            if 'role' not in msg:
+                raise ValueError(f'Message {i} missing required "role" field')
+            if 'content' not in msg:
+                raise ValueError(f'Message {i} missing required "content" field')
 
     def call(
         self,
@@ -114,232 +139,176 @@ class LLMService:
             Exception: If the call fails after all retries, with improved error message.
         """
         self.logger.debug(f'Calling LLM with {len(messages)} messages')
+        self._validate_messages(messages)
 
-        # Validate messages format - some custom API endpoints have strict requirements
-        if not isinstance(messages, list):
-            raise ValueError(f'messages must be a list, got {type(messages)}')
+        # Log input prompts if not skipped
+        if not _skip_logging:
+            self._log_call_inputs(messages, temperature, max_tokens, response_format)
 
+        # Consolidate messages if there are too many
         if len(messages) > 10:
-            self.logger.warning(
-                f'Large messages array detected ({len(messages)} messages). '
-                f'Some API endpoints may have strict format requirements. '
-                f'First few message roles: {[msg.get("role") for msg in messages[:5]]}'
+            raise Exception('Too many messages. Please consolidate messages.')
+
+        try:
+            content = self._call_with_response_format_fallback(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
             )
 
-        # Validate each message has required fields
-        for i, msg in enumerate(messages):
-            if not isinstance(msg, dict):
-                raise ValueError(f'Message {i} must be a dict, got {type(msg)}')
-            if 'role' not in msg:
-                raise ValueError(f'Message {i} missing required "role" field')
-            if 'content' not in msg:
-                raise ValueError(f'Message {i} missing required "content" field')
-
-        # Extract prompts from messages for logging (if not skipped)
-        system_prompts = [
-            msg['content'] for msg in messages if msg.get('role') == 'system'
-        ]
-        user_prompts = [msg['content'] for msg in messages if msg.get('role') == 'user']
-
-        # Log input prompts if not skipped (call_with_system_prompt handles its own logging)
-        should_log = not _skip_logging and (system_prompts or user_prompts)
-        if should_log:
-            self.logger.info('=' * 80)
-            self.logger.info('LLM CALL INPUT (from messages):')
-            if system_prompts:
-                for i, prompt in enumerate(system_prompts):
-                    self.logger.info(f'System Prompt {i + 1}:\n{prompt}')
-            if user_prompts:
-                for i, prompt in enumerate(user_prompts):
-                    self.logger.info(f'User Prompt {i + 1}:\n{prompt}')
-            self.logger.info(
-                f'Parameters: temperature={temperature}, max_tokens={max_tokens}, response_format={response_format}'
-            )
-
-        # Check circuit breaker
-        if self.circuit_breaker and not self.circuit_breaker.can_proceed():
-            error_type, error_category, user_message = classify_error(
-                Exception(self.circuit_breaker.get_state_message())
-            )
-            raise Exception(
-                f'Circuit breaker is open: {self.circuit_breaker.get_state_message()}. '
-                f'Please wait before retrying.'
-            )
-
-        # Check if model is openai/gpt-oss-120b - this model doesn't support response_format
-        # If so, add JSON instruction to prompts instead
-        if response_format and self.model == 'openai/gpt-oss-120b':
-            self.logger.debug(
-                f'Model {self.model} does not support response_format, adding JSON instruction to prompts'
-            )
-            if response_format.get('type') == 'json_object':
-                messages_copy = []
-                for i, msg in enumerate(messages):
-                    msg_copy = msg.copy()
-                    # Add JSON instruction to the last user message
-                    if msg_copy['role'] == 'user' and i == len(messages) - 1:
-                        msg_copy['content'] += (
-                            '\n\nIMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text.'
-                        )
-                    messages_copy.append(msg_copy)
-                messages = messages_copy
-            # Skip response_format for this model
-            response_format = None
-
-        kwargs = {
-            'model': self.model,
-            'messages': messages,
-            'temperature': temperature,
-        }
-        if max_tokens:
-            kwargs['max_tokens'] = max_tokens
-
-        def _make_api_call(with_format: bool = True) -> str:
-            """Internal function to make the API call."""
-            call_kwargs = kwargs.copy()
-            if with_format and response_format:
-                call_kwargs['response_format'] = response_format
-
-            # Some custom API endpoints have strict message format requirements
-            # If we detect an unusually large messages array, log it for debugging
-            messages_to_send = call_kwargs.get('messages', [])
-            if len(messages_to_send) > 10:
-                self.logger.error(
-                    f'CRITICAL: Attempting to send {len(messages_to_send)} messages to API. '
-                    f'This may cause API format errors. '
-                    f'Message roles: {[msg.get("role") for msg in messages_to_send[:10]]}...'
-                )
-                # Log the first message structure for debugging
-                if messages_to_send:
-                    first_msg = messages_to_send[0]
-                    self.logger.error(
-                        f'First message structure: role={first_msg.get("role")}, '
-                        f'content_type={type(first_msg.get("content"))}, '
-                        f'content_length={len(str(first_msg.get("content", "")))}'
-                    )
-
-                # Try to fix: if we have too many messages, try to combine them
-                # or take only the system and last user message
-                if len(messages_to_send) > 2:
-                    self.logger.warning(
-                        f'Too many messages ({len(messages_to_send)}). '
-                        f'Attempting to reduce to 2 messages (system + user)'
-                    )
-                    # Find system message if exists
-                    system_msg = None
-                    user_msgs = []
-                    for msg in messages_to_send:
-                        if msg.get('role') == 'system':
-                            system_msg = msg
-                        elif msg.get('role') == 'user':
-                            user_msgs.append(msg)
-
-                    # Combine all user messages into one
-                    if user_msgs:
-                        combined_user_content = '\n\n'.join(
-                            str(msg.get('content', '')) for msg in user_msgs
-                        )
-                        combined_user_msg = {
-                            'role': 'user',
-                            'content': combined_user_content,
-                        }
-
-                        # Create new messages array with max 2 messages
-                        fixed_messages = []
-                        if system_msg:
-                            fixed_messages.append(system_msg)
-                        fixed_messages.append(combined_user_msg)
-
-                        self.logger.info(
-                            f'Reduced messages from {len(messages_to_send)} to {len(fixed_messages)}'
-                        )
-                        call_kwargs['messages'] = fixed_messages
-                        messages_to_send = fixed_messages
-
-            response = self.client.chat.completions.create(**call_kwargs)
-            content = response.choices[0].message.content
-            self.logger.debug(f'LLM response received: {len(content)} characters')
-
-            # Log output if we logged input (i.e., if call() was called directly)
-            if should_log:
-                self.logger.info('LLM CALL OUTPUT:')
-                self.logger.info(f'Response:\n{content}')
-                self.logger.info('=' * 80)
-
-            # Record success in circuit breaker
-            if self.circuit_breaker:
-                self.circuit_breaker.record_success()
+            # Log outputs if not skipped
+            if not _skip_logging:
+                self._log_call_outputs(content)
 
             return content
-
-        # Try with response_format first if provided
-        if response_format:
-            try:
-                return retry_with_backoff(
-                    lambda: _make_api_call(with_format=True),
-                    max_retries=self.max_retries,
-                    base_delay=1.0,
-                    max_delay=60.0,
-                    logger=self.logger,
-                )
-            except Exception as e:
-                # If response_format is not supported, retry without it
-                error_msg = str(e).lower()
-                if (
-                    'response_format' in error_msg
-                    or 'not supported' in error_msg
-                    or self.model in LLMService._response_format_unsupported_models
-                ):
-                    self.logger.warning(
-                        f'Model {self.model} does not support response_format, retrying without it'
-                    )
-                    LLMService._response_format_unsupported_models.add(self.model)
-                    # Create a copy of messages and add JSON instruction if needed
-                    if response_format.get('type') == 'json_object':
-                        messages_copy = []
-                        for i, msg in enumerate(messages):
-                            msg_copy = msg.copy()
-                            if msg_copy['role'] == 'user' and i == len(messages) - 1:
-                                msg_copy['content'] += (
-                                    '\n\nIMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text.'
-                                )
-                            messages_copy.append(msg_copy)
-                        kwargs['messages'] = messages_copy
-                    # Fall through to try without response_format
-                else:
-                    # Record failure in circuit breaker
-                    if self.circuit_breaker:
-                        self.circuit_breaker.record_failure()
-
-                    # Classify error and raise with better message
-                    error_type, error_category, user_message = classify_error(e)
-                    self.logger.error(
-                        f'LLM API call failed ({error_category.value}/{error_type.value}): {user_message}',
-                        exc_info=True,
-                    )
-                    raise Exception(user_message) from e
-
-        # Call without response_format (either not requested or retry after error)
-        try:
-            return retry_with_backoff(
-                lambda: _make_api_call(with_format=False),
-                max_retries=self.max_retries,
-                base_delay=1.0,
-                max_delay=60.0,
-                logger=self.logger,
-            )
         except Exception as e:
-            # Record failure in circuit breaker
-            if self.circuit_breaker:
-                self.circuit_breaker.record_failure()
+            # Avoid re-wrapping exception if it's already classified
+            if 'LLM API call failed' in str(e):
+                raise e
 
-            # Classify error and raise with better message
             error_type, error_category, user_message = classify_error(e)
             self.logger.error(
                 f'LLM API call failed ({error_category.value}/{error_type.value}): {user_message}',
                 exc_info=True,
             )
-            raise Exception(user_message) from e
+            raise Exception(f'LLM API call failed: {user_message}') from e
+
+    def _call_with_response_format_fallback(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_tokens: Optional[int],
+        response_format: Optional[Dict[str, str]],
+    ) -> str:
+        """Attempt API call with response_format and fall back if not supported."""
+
+        model_supports_format = self.MODEL_CONFIG.get(self.model, {}).get(
+            'supports_response_format', True
+        )
+
+        # Handle models that are known not to support response_format
+        if response_format and (
+            not model_supports_format
+            or self.model in self._response_format_unsupported_models
+        ):
+            self.logger.warning(
+                f'Model {self.model} does not support response_format, skipping.'
+            )
+            messages = self._add_json_instruction(messages)
+            response_format = None
+
+        if response_format:
+            try:
+                return self._make_api_call(
+                    messages, temperature, max_tokens, response_format
+                )
+            except Exception as e:
+                error_msg = str(e).lower()
+                if 'response_format' in error_msg or 'not supported' in error_msg:
+                    self.logger.warning(
+                        f'Model {self.model} does not support response_format, retrying without it.'
+                    )
+                    self._response_format_unsupported_models.add(self.model)
+                    messages = self._add_json_instruction(messages)
+                else:
+                    raise e
+
+        return self._make_api_call(messages, temperature, max_tokens, None)
+
+    def _make_api_call(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_tokens: Optional[int],
+        response_format: Optional[Dict[str, str]],
+    ) -> str:
+        """Make a single attempt to call the OpenAI API."""
+        self.logger.info(f'Making API call with model: {self.model}')
+        model_config = self.MODEL_CONFIG.get(self.model, {})
+        is_reasoning_model = model_config.get('is_reasoning_model', False)
+
+        # For reasoning models, ensure only user messages (no system messages)
+        if is_reasoning_model and len(messages) > 1:
+            # Consolidate all messages into a single user message
+            combined_content = []
+            for msg in messages:
+                if msg.get('role') == 'system':
+                    combined_content.append(f'Instructions: {msg.get("content", "")}')
+                else:
+                    combined_content.append(msg.get('content', ''))
+            messages = [{'role': 'user', 'content': '\n\n'.join(combined_content)}]
+            self.logger.info(
+                f'Consolidated {len(messages)} messages for reasoning model'
+            )
+
+        kwargs = {
+            'model': self.model,
+            'messages': messages,
+        }
+
+        # Add temperature only if model supports it
+        supports_temperature = model_config.get('supports_temperature', True)
+        if supports_temperature:
+            kwargs['temperature'] = temperature
+        else:
+            self.logger.debug(
+                f'Model {self.model} does not support temperature parameter'
+            )
+
+        if response_format:
+            kwargs['response_format'] = response_format
+
+        def api_call_fn():
+            client = self._get_client_for_model(self.model)
+            response = client.chat.completions.create(**kwargs)
+            return response.choices[0].message.content
+
+        return retry_with_backoff(
+            api_call_fn,
+            max_retries=self.max_retries,
+            base_delay=1.0,
+            max_delay=60.0,
+            logger=self.logger,
+        )
+
+    def _add_json_instruction(
+        self, messages: List[Dict[str, str]]
+    ) -> List[Dict[str, str]]:
+        """Add instruction to the last user message to return JSON."""
+        messages_copy = [msg.copy() for msg in messages]
+        for i in reversed(range(len(messages_copy))):
+            if messages_copy[i]['role'] == 'user':
+                messages_copy[i]['content'] += (
+                    '\n\nIMPORTANT: Return your response as valid JSON only, '
+                    'without any markdown formatting or additional text.'
+                )
+                break
+        return messages_copy
+
+    def _log_call_inputs(self, messages, temperature, max_tokens, response_format):
+        """Log the inputs to an LLM call."""
+        self.logger.info('=' * 80)
+        self.logger.info('LLM CALL INPUT:')
+        system_prompts = [
+            msg['content'] for msg in messages if msg.get('role') == 'system'
+        ]
+        user_prompts = [msg['content'] for msg in messages if msg.get('role') == 'user']
+        if system_prompts:
+            for i, prompt in enumerate(system_prompts):
+                self.logger.info(f'System Prompt {i + 1}:\n{prompt}')
+        if user_prompts:
+            for i, prompt in enumerate(user_prompts):
+                self.logger.info(f'User Prompt {i + 1}:\n{prompt}')
+        self.logger.info(
+            f'Parameters: temperature={temperature}, max_tokens={max_tokens}, response_format={response_format}'
+        )
+
+    def _log_call_outputs(self, content: str):
+        """Log the outputs from an LLM call."""
+        self.logger.info('LLM CALL OUTPUT:')
+        self.logger.info(f'Response:\n{content}')
+        self.logger.info('=' * 80)
 
     def call_with_system_prompt(
         self,
@@ -363,18 +332,12 @@ class LLMService:
             Response content as string.
         """
         # Log input prompts
-        self.logger.info('=' * 80)
-        self.logger.info('LLM CALL INPUT:')
-        self.logger.info(f'System Prompt:\n{system_prompt}')
-        self.logger.info(f'User Prompt:\n{user_prompt}')
-        self.logger.info(
-            f'Parameters: temperature={temperature}, max_tokens={max_tokens}, response_format={response_format}'
-        )
-
         messages = [
             {'role': 'system', 'content': system_prompt},
             {'role': 'user', 'content': user_prompt},
         ]
+        self._log_call_inputs(messages, temperature, max_tokens, response_format)
+
         response = self.call(
             messages,
             temperature=temperature,
@@ -384,11 +347,35 @@ class LLMService:
         )
 
         # Log output
-        self.logger.info('LLM CALL OUTPUT:')
-        self.logger.info(f'Response:\n{response}')
-        self.logger.info('=' * 80)
-
+        self._log_call_outputs(response)
         return response
+
+    def _consolidate_vision_messages(self, messages):
+        """Consolidate vision messages to a system and a user message."""
+        if len(messages) > 2:
+            self.logger.warning(
+                f'Too many vision messages ({len(messages)}). Consolidating to 2 messages.'
+            )
+            system_msg = next(
+                (msg for msg in messages if msg['role'] == 'system'), None
+            )
+            user_msgs = [msg for msg in messages if msg['role'] == 'user']
+
+            if user_msgs:
+                combined_content = []
+                for msg in user_msgs:
+                    content = msg.get('content', [])
+                    if isinstance(content, list):
+                        combined_content.extend(content)
+                    else:
+                        combined_content.append({'type': 'text', 'text': str(content)})
+
+                new_messages = []
+                if system_msg:
+                    new_messages.append(system_msg)
+                new_messages.append({'role': 'user', 'content': combined_content})
+                return new_messages
+        return messages
 
     def call_with_images(
         self,
@@ -424,98 +411,71 @@ class LLMService:
             f'Calling vision LLM ({vision_model}) with {len(messages)} messages'
         )
 
-        # Check circuit breaker
-        if self.circuit_breaker and not self.circuit_breaker.can_proceed():
-            error_type, error_category, user_message = classify_error(
-                Exception(self.circuit_breaker.get_state_message())
-            )
-            raise Exception(
-                f'Circuit breaker is open: {self.circuit_breaker.get_state_message()}. '
-                f'Please wait before retrying.'
-            )
-
-        kwargs = {
-            'model': vision_model,
-            'messages': messages,
-            'temperature': temperature,
-        }
-        if max_tokens:
-            kwargs['max_tokens'] = max_tokens
-        if response_format:
-            kwargs['response_format'] = response_format
-
-        def _make_vision_api_call() -> str:
-            """Internal function to make the vision API call."""
-            # Use vision_client if model is gpt-4.1 and OPENAI_URL is set
-            client_to_use = self.client
-            if vision_model == 'gpt-4.1':
-                openai_url = os.getenv('OPENAI_URL')
-                if openai_url:
-                    # Use existing vision_client if available, or create one
-                    if self.vision_client:
-                        client_to_use = self.vision_client
-                    else:
-                        # Create vision client on-the-fly if needed
-                        api_key = os.getenv('OPENAI_API_KEY')
-                        client_to_use = openai.OpenAI(
-                            api_key=api_key,
-                            base_url=openai_url,
-                            timeout=openai.Timeout(self.timeout),
-                        )
-                        self.vision_client = client_to_use
-                        self.logger.info(
-                            f'Created vision client with custom URL: {openai_url}'
-                        )
-            response = client_to_use.chat.completions.create(**kwargs)
-            content = response.choices[0].message.content
-            self.logger.debug(
-                f'Vision LLM response received: {len(content)} characters'
-            )
-
-            # Log output
-            self.logger.info('=' * 80)
-            self.logger.info('VISION LLM CALL OUTPUT:')
-            self.logger.info(f'Response:\n{content}')
-            self.logger.info('=' * 80)
-
-            # Record success in circuit breaker
-            if self.circuit_breaker:
-                self.circuit_breaker.record_success()
-
-            return content
+        messages = self._consolidate_vision_messages(messages)
 
         try:
-            return retry_with_backoff(
-                _make_vision_api_call,
-                max_retries=self.max_retries,
-                base_delay=1.0,
-                max_delay=60.0,
-                logger=self.logger,
+            return self._make_vision_api_call(
+                model=vision_model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
             )
         except Exception as e:
-            # Record failure in circuit breaker
-            if self.circuit_breaker:
-                self.circuit_breaker.record_failure()
+            # Avoid re-wrapping exception if it's already classified
+            if 'LLM API call failed' in str(e):
+                raise e
 
-            # Classify error and raise with better message
             error_type, error_category, user_message = classify_error(e)
             self.logger.error(
                 f'Vision LLM API call failed ({error_category.value}/{error_type.value}): {user_message}',
                 exc_info=True,
             )
-            raise Exception(user_message) from e
+            raise Exception(f'LLM API call failed: {user_message}') from e
+
+    def _make_vision_api_call(
+        self,
+        model: str,
+        messages: List[Dict[str, any]],
+        temperature: float,
+        max_tokens: Optional[int],
+        response_format: Optional[Dict[str, str]],
+    ):
+        kwargs = {
+            'model': model,
+            'messages': messages,
+            'temperature': temperature,
+        }
+        # Validate max_tokens: must be at least 1 if provided
+        if max_tokens is not None:
+            if max_tokens < 1:
+                self.logger.warning(
+                    f'Invalid max_tokens value for vision API: {max_tokens}. Must be at least 1. '
+                    f'Setting max_tokens to None (will use model default).'
+                )
+                max_tokens = None
+
+        if max_tokens and max_tokens >= 1:
+            kwargs['max_tokens'] = max_tokens
+        if response_format:
+            kwargs['response_format'] = response_format
+
+        def api_call_fn():
+            client_to_use = self._get_client_for_model(model)
+            response = client_to_use.chat.completions.create(**kwargs)
+            return response.choices[0].message.content
+
+        return retry_with_backoff(
+            api_call_fn,
+            max_retries=self.max_retries,
+            base_delay=1.0,
+            max_delay=60.0,
+            logger=self.logger,
+        )
 
     @staticmethod
     def encode_image_to_base64(image_data: bytes) -> str:
-        """
-        Encode image bytes to base64 string for vision API.
-
-        Args:
-            image_data: Image data as bytes.
-
-        Returns:
-            Base64-encoded string.
-        """
+        """Encode image bytes to base64 string."""
         return base64.b64encode(image_data).decode('utf-8')
 
     @staticmethod
@@ -534,33 +494,19 @@ class LLMService:
         """
         base64_image = LLMService.encode_image_to_base64(image_data)
 
-        # Auto-detect format from image data if not specified
+        mime_type = 'image/png'  # Default MIME type
         if image_format == 'auto':
-            # Check PNG signature (starts with PNG magic bytes)
+            # Simple magic byte checks for common formats
             if image_data.startswith(b'\x89PNG\r\n\x1a\n'):
                 mime_type = 'image/png'
-            # Check JPEG signature (starts with FF D8)
             elif image_data.startswith(b'\xff\xd8'):
                 mime_type = 'image/jpeg'
-            # Check GIF signature
-            elif image_data.startswith(b'GIF'):
+            elif image_data.startswith(b'GIF87a') or image_data.startswith(b'GIF89a'):
                 mime_type = 'image/gif'
-            # Check WebP signature
-            elif image_data.startswith(b'RIFF') and b'WEBP' in image_data[:12]:
+            elif image_data.startswith(b'RIFF') and image_data[8:12] == b'WEBP':
                 mime_type = 'image/webp'
-            else:
-                # Default to PNG for unknown formats
-                mime_type = 'image/png'
         else:
-            # Use specified format
-            format_map = {
-                'png': 'image/png',
-                'jpeg': 'image/jpeg',
-                'jpg': 'image/jpeg',
-                'gif': 'image/gif',
-                'webp': 'image/webp',
-            }
-            mime_type = format_map.get(image_format.lower(), 'image/png')
+            mime_type = f'image/{image_format.lower()}'
 
         return {
             'type': 'image_url',

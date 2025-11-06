@@ -128,6 +128,7 @@ Propagate constraints and check for contradictions."""
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 temperature=0.3,  # Consistent space narrowing
+                max_tokens=8192,
                 response_format={'type': 'json_object'},
             )
             json_text = extract_json_from_text(response)

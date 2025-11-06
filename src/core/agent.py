@@ -36,7 +36,7 @@ class Agent:
         Args:
             tool_belt: An instance of the ToolBelt.
             logger: A pre-configured logging.Logger instance.
-            llm_model: OpenAI model to use (default: from LLM_MODEL env var, or 'gpt-5').
+            llm_model: OpenAI model to use (default: from LLM_MODEL env var, or 'openai/gpt-oss-120b').
         """
         self.tool_belt = tool_belt
         self.logger = logger
@@ -44,7 +44,7 @@ class Agent:
         self.tool_belt.set_logger(logger)
 
         # Load model from environment variable if not provided
-        model = llm_model or os.getenv('LLM_MODEL', 'gpt-5')
+        model = llm_model or os.getenv('LLM_MODEL', 'openai/gpt-oss-120b')
         # Initialize LLM service
         self.llm_service = LLMService(logger, model=model)
         # Pass LLM service to toolbelt for intelligent extraction
@@ -137,7 +137,7 @@ class Agent:
             execution_results = self.executor.execute_plan(
                 plan, problem, attachments, query_analysis
             )
-            
+
             # Include failed subtasks from state_manager that might not be in execution_results
             for subtask_id, subtask in self.state_manager.subtasks.items():
                 if subtask.status == 'failed' and subtask_id not in execution_results:
@@ -153,7 +153,7 @@ class Agent:
                     self.logger.info(
                         f'Included failed subtask {subtask_id} in execution_results'
                     )
-            
+
             self.logger.info(
                 f'Execution complete: {len(execution_results)} results obtained'
             )

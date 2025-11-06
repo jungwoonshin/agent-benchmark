@@ -119,6 +119,17 @@ class SearchResultProcessor:
                     content_parts.append(
                         f'[Web Page: {processed_result["title"]}]\nURL: {processed_result["url"]}\n{processed_result["content"]}'
                     )
+                elif processed_result['type'] == 'pdf':
+                    # Structured PDF with sections
+                    downloaded_files.append(processed_result['data'])
+                    # Build content summary with sections
+                    sections_text = '\n\n'.join(
+                        f'[Section: {s.get("title", "Untitled")}]\n{s.get("content", "")}'
+                        for s in processed_result.get('sections', [])
+                    )
+                    content_parts.append(
+                        f'[PDF: {processed_result["title"]}]\nURL: {processed_result["url"]}\n\n{sections_text}'
+                    )
                 elif processed_result['type'] == 'file':
                     downloaded_files.append(processed_result['data'])
                     content_parts.append(
@@ -193,17 +204,46 @@ class SearchResultProcessor:
                 result, attachments, subtask_description, problem, query_analysis
             )
             if file_content:
-                return {
-                    'type': 'file',
-                    'title': result.title,
-                    'url': result.url,
-                    'content': file_content,
-                    'data': {
+                # Check if file_content is structured (PDF with sections)
+                if isinstance(file_content, dict) and file_content.get('type') == 'pdf':
+                    # Structured PDF data with sections
+                    return {
+                        'type': 'pdf',
+                        'title': result.title,
                         'url': result.url,
-                        'type': file_type,
-                        'content': file_content,
-                    },
-                }
+                        'sections': file_content.get('sections', []),
+                        'image_analysis': file_content.get('image_analysis', ''),
+                        'content': file_content.get('full_text', ''),
+                        'data': {
+                            'url': result.url,
+                            'type': file_type,
+                            'title': result.title,
+                            'sections': file_content.get('sections', []),
+                            'image_analysis': file_content.get('image_analysis', ''),
+                            'content': file_content.get('full_text', ''),
+                        },
+                    }
+                else:
+                    # String content (backward compatibility)
+                    content_str = (
+                        file_content
+                        if isinstance(file_content, str)
+                        else str(file_content)
+                    )
+                    return {
+                        'type': 'file',
+                        'title': result.title,
+                        'url': result.url,
+                        'content': content_str[:250]
+                        if len(content_str) > 250
+                        else content_str,
+                        'data': {
+                            'url': result.url,
+                            'type': file_type,
+                            'title': result.title,
+                            'content': content_str,
+                        },
+                    }
         else:
             self.logger.info(f'Result {result_info} is a web page. Navigating...')
             page_content = self._handle_web_page_result(
@@ -389,7 +429,7 @@ Is this search result relevant to completing the subtask?"""
         subtask_description: str,
         problem: Optional[str] = None,
         query_analysis: Optional[Dict[str, Any]] = None,
-    ) -> Optional[str]:
+    ) -> Union[None, str, Dict[str, Any]]:
         """
         Handle a search result that is a file by downloading it.
 
@@ -401,7 +441,7 @@ Is this search result relevant to completing the subtask?"""
             query_analysis: Optional query analysis for relevance filtering.
 
         Returns:
-            String summary of file content if successful, None otherwise.
+            String summary of file content or structured dict (for PDFs) if successful, None otherwise.
         """
         try:
             self.logger.info(f'Downloading file from URL: {search_result.url}')
@@ -413,10 +453,21 @@ Is this search result relevant to completing the subtask?"""
                 attachment, problem, query_analysis
             )
 
-            self.logger.info(
-                f'Successfully downloaded and processed file: {attachment.filename} '
-                f'(size: {len(attachment.data)} bytes, content length: {len(file_content)} chars)'
-            )
+            if isinstance(file_content, dict):
+                # Structured PDF data
+                content_length = len(file_content.get('full_text', ''))
+                self.logger.info(
+                    f'Successfully downloaded and processed PDF: {attachment.filename} '
+                    f'(size: {len(attachment.data)} bytes, {len(file_content.get("sections", []))} sections)'
+                )
+            else:
+                content_length = (
+                    len(file_content) if isinstance(file_content, str) else 0
+                )
+                self.logger.info(
+                    f'Successfully downloaded and processed file: {attachment.filename} '
+                    f'(size: {len(attachment.data)} bytes, content length: {content_length} chars)'
+                )
 
             return file_content
 
@@ -431,7 +482,7 @@ Is this search result relevant to completing the subtask?"""
         attachment: Attachment,
         problem: Optional[str] = None,
         query_analysis: Optional[Dict[str, Any]] = None,
-    ) -> str:
+    ) -> Union[str, Dict[str, Any]]:
         """
         Extract text content from an attachment with optional relevance filtering.
 
@@ -441,14 +492,22 @@ Is this search result relevant to completing the subtask?"""
             query_analysis: Optional query analysis for relevance filtering (PDFs only).
 
         Returns:
-            Extracted text content.
+            Extracted text content (string) or structured data (dict) for PDFs with sections.
         """
         try:
             # Use tool_belt's read_attachment to extract content with relevance filtering
             content = self.tool_belt.read_attachment(
                 attachment, problem=problem, query_analysis=query_analysis
             )
-            return content if content else f'[Content of {attachment.filename}]'
+            if not content:
+                return f'[Content of {attachment.filename}]'
+
+            # Check if content is structured (dict) from PDF processing
+            if isinstance(content, dict) and content.get('type') == 'pdf':
+                return content
+
+            # Return string content (backward compatibility)
+            return content if isinstance(content, str) else str(content)
         except Exception as e:
             self.logger.debug(
                 f'Failed to extract content from {attachment.filename}: {e}'
@@ -709,7 +768,7 @@ Summarize this content, extracting key information relevant to solving the probl
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     temperature=0.3,  # Lower temperature for consistent summarization
-                    max_tokens=2000,  # Reasonable token limit per part
+                    max_tokens=8192,  # Reasonable token limit per part
                 )
 
                 summarized_parts.append(summary)

@@ -1,7 +1,7 @@
 """ToolBelt class providing various tools for the agent."""
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from ..models import Attachment, SearchResult
 from .browser_tool import BrowserTool
@@ -74,6 +74,9 @@ class ToolBelt:
         """
         Performs calculations, data processing, and analysis using LLM reasoning.
 
+        CRITICAL: For non-visual LLM reasoning tasks, this MUST use openai/gpt-oss-120b
+        regardless of the default model configured in the agent.
+
         Args:
             task_description: Description of what needs to be calculated/analyzed
             context: Optional context dictionary with variables and data available
@@ -83,7 +86,37 @@ class ToolBelt:
         """
         if not self.llm_reasoning_tool:
             raise ValueError('ToolBelt not initialized. Call set_logger() first.')
-        return self.llm_reasoning_tool.llm_reasoning(task_description, context)
+
+        # CRITICAL: For non-visual LLM reasoning tasks, we MUST use openai/gpt-oss-120b
+        # Check if the current LLM service is using the correct model
+        original_llm_service = self.llm_reasoning_tool.llm_service
+        if original_llm_service and original_llm_service.model != 'openai/gpt-oss-120b':
+            self.logger.info(
+                f'Switching LLM reasoning from {original_llm_service.model} '
+                f'to openai/gpt-oss-120b for non-visual reasoning task'
+            )
+            # Create a temporary LLMService with the correct model for reasoning
+            from ..llm import LLMService
+
+            reasoning_llm_service = LLMService(
+                self.logger,
+                model='openai/gpt-oss-120b',
+                timeout=original_llm_service.timeout,
+                max_retries=original_llm_service.max_retries,
+            )
+            # Temporarily switch the LLM service
+            self.llm_reasoning_tool.set_llm_service(reasoning_llm_service)
+            try:
+                result = self.llm_reasoning_tool.llm_reasoning(
+                    task_description, context
+                )
+            finally:
+                # Restore the original LLM service
+                self.llm_reasoning_tool.set_llm_service(original_llm_service)
+            return result
+        else:
+            # Already using the correct model, proceed normally
+            return self.llm_reasoning_tool.llm_reasoning(task_description, context)
 
     def llm_reasoning_with_images(
         self, task_description: str, context: dict = None, images: List[bytes] = None
@@ -175,7 +208,7 @@ class ToolBelt:
         options: dict = None,
         problem: Optional[str] = None,
         query_analysis: Optional[Dict[str, Any]] = None,
-    ) -> str:
+    ) -> Union[str, Dict[str, Any]]:
         """
         Smart file reader that extracts text and images from various common formats.
 
@@ -186,7 +219,9 @@ class ToolBelt:
             query_analysis: Optional query analysis for relevance filtering.
 
         Returns:
-            Extracted text content from the file.
+            Extracted text content (string) or structured data (dict) for PDFs with sections.
+            For PDFs with problem/query_analysis: Returns dict with 'type', 'filename', 'sections', etc.
+            Otherwise: Returns string content.
         """
         if not self.file_handler:
             raise ValueError('ToolBelt not initialized. Call set_logger() first.')

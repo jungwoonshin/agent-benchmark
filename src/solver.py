@@ -54,7 +54,7 @@ class GAIASolver:
         Initialize GAIASolver.
 
         Args:
-            llm_model: OpenAI model to use (default: from LLM_MODEL env var, or 'gpt-5').
+            llm_model: OpenAI model to use (default: from LLM_MODEL env var, or 'openai/gpt-oss-120b').
         """
         self.logger = logging.getLogger('src.solver')
         self.logger.info('Initializing GAIASolver')
@@ -63,7 +63,7 @@ class GAIASolver:
         tool_belt = ToolBelt()
 
         # Load model from environment variable if not provided
-        model = llm_model or os.getenv('LLM_MODEL', 'gpt-5')
+        model = llm_model or os.getenv('LLM_MODEL', 'openai/gpt-oss-120b')
         # Create Agent
         try:
             self.agent = Agent(tool_belt=tool_belt, logger=self.logger, llm_model=model)

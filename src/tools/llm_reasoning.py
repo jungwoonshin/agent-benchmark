@@ -2,13 +2,17 @@
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import List
+
+from src.llm.llm_service import LLMService
 
 
 class LLMReasoningTool:
     """Tool for performing calculations, data processing, and analysis using LLM reasoning."""
 
-    def __init__(self, llm_service, logger: logging.Logger, image_recognition=None):
+    def __init__(
+        self, llm_service: LLMService, logger: logging.Logger, image_recognition=None
+    ):
         """
         Initialize LLM reasoning tool.
 
@@ -69,9 +73,8 @@ class LLMReasoningTool:
                     f'- {item}' for item in context_items
                 )
 
-        # Combine system and user prompts into a single message to avoid API format issues
-        # Some custom API endpoints expect specific message formats
-        combined_prompt = f"""You are an expert at performing calculations, data analysis, and problem solving.
+        # Separate system and user prompts
+        system_prompt = """You are an expert at performing calculations, data analysis, and problem solving.
 Given a task description and available context, solve the problem step by step.
 
 Your task:
@@ -84,11 +87,9 @@ Your task:
 7. Return the final answer or result
 
 Be precise with numbers and calculations. Show your work when doing mathematical operations.
-If the context contains data from previous steps, use that data in your calculations.
+If the context contains data from previous steps, use that data in your calculations."""
 
----
-
-Task: {task_description}{context_str}
+        user_prompt = f"""Task: {task_description}{context_str}
 
 Solve this task step by step. Show your reasoning and calculations clearly.
 Extract and use any relevant data from the context provided.
@@ -98,11 +99,12 @@ Return your final answer or result."""
             self.logger.info(
                 f'Performing LLM reasoning for task: {task_description}...'
             )
-            # Use call() directly with a single user message to avoid format issues
-            result = self.llm_service.call(
-                messages=[{'role': 'user', 'content': combined_prompt}],
-                temperature=0.0,  # Low temperature for consistent, accurate calculations
-                max_tokens=2000,
+            # Use call_with_system_prompt() instead of call()
+            result = self.llm_service.call_with_system_prompt(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=0.3,  # Low temperature for consistent, accurate calculations
+                max_tokens=8192,
             )
             self.logger.info(f'LLM reasoning completed: {len(result)} chars')
             return result
@@ -154,4 +156,3 @@ Return your final answer or result."""
         # Convert Python code to task description
         task_description = f'Execute the following Python code logic: {python_code}'
         return self.llm_reasoning(task_description, context)
-

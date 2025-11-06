@@ -156,7 +156,7 @@ def main():
     # Load validation cases
     validation_file = 'gaia_dataset/validation.json'
     print(f'\nLoading validation cases from {validation_file}...')
-    cases = [load_validation_cases(validation_file, num_cases=10)[2]]
+    cases = load_validation_cases(validation_file, num_cases=10)[1:2]
     print(f'Loaded {len(cases)} cases')
 
     # Test each case

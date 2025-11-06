@@ -6,7 +6,10 @@ This module provides a single Browser class that can handle both static HTML pag
 
 import json
 import logging
+import os
 import re
+import stat
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from urllib.parse import urljoin
 
@@ -56,6 +59,106 @@ class Browser:
         # Selenium driver (initialized on demand)
         self.driver = None
 
+    def _resolve_chromedriver_path(self) -> str:
+        """
+        Resolve the correct chromedriver executable path.
+        Handles cases where ChromeDriverManager returns incorrect paths.
+        """
+        try:
+            driver_path = ChromeDriverManager().install()
+            driver_path = Path(driver_path)
+
+            # Helper function to check if a file is a binary executable
+            def is_binary_executable(file_path: Path) -> bool:
+                """Check if a file is a binary executable (not a text file)."""
+                try:
+                    if not file_path.exists() or not file_path.is_file():
+                        return False
+                    # Check file size (text files are usually smaller, but not foolproof)
+                    if (
+                        file_path.stat().st_size < 1000
+                    ):  # Very small files are likely not the driver
+                        return False
+                    # Check if it's a binary file by reading first bytes
+                    with open(file_path, 'rb') as f:
+                        first_bytes = f.read(16)
+                        # Check for common binary formats:
+                        # ELF (Linux): \x7fELF
+                        # Mach-O (macOS): \xcf\xfa\xed\xfe (64-bit) or \xce\xfa\xed\xfe (32-bit)
+                        # Universal binary: \xca\xfe\xba\xbe
+                        binary_magic = (
+                            first_bytes.startswith(b'\x7fELF')
+                            or first_bytes.startswith(b'\xcf\xfa\xed\xfe')
+                            or first_bytes.startswith(b'\xce\xfa\xed\xfe')
+                            or first_bytes.startswith(b'\xca\xfe\xba\xbe')
+                        )
+                        return binary_magic
+                except Exception:
+                    return False
+
+            # If the path exists, check if it's the executable
+            if driver_path.exists():
+                if driver_path.is_file() and driver_path.name == 'chromedriver':
+                    if is_binary_executable(driver_path):
+                        os.chmod(
+                            str(driver_path), stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+                        )
+                        return str(driver_path)
+                elif driver_path.is_dir():
+                    # If it's a directory, look for chromedriver inside
+                    chromedriver_candidate = driver_path / 'chromedriver'
+                    if chromedriver_candidate.exists() and is_binary_executable(
+                        chromedriver_candidate
+                    ):
+                        os.chmod(
+                            str(chromedriver_candidate),
+                            stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR,
+                        )
+                        return str(chromedriver_candidate)
+
+                # Search in parent directories for the actual chromedriver
+                search_paths = (
+                    [driver_path.parent, driver_path.parent.parent]
+                    if driver_path.is_file()
+                    else [driver_path]
+                )
+                for search_dir in search_paths:
+                    if search_dir and search_dir.exists():
+                        # Look for chromedriver files in this directory
+                        for item in search_dir.iterdir():
+                            if item.is_file() and item.name == 'chromedriver':
+                                if is_binary_executable(item):
+                                    os.chmod(
+                                        str(item),
+                                        stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR,
+                                    )
+                                    return str(item)
+
+            # If we still can't find it, search in the webdriver-manager cache
+            wdm_cache = Path.home() / '.wdm' / 'drivers' / 'chromedriver'
+            if wdm_cache.exists():
+                for chromedriver_file in wdm_cache.rglob('chromedriver'):
+                    if chromedriver_file.is_file() and is_binary_executable(
+                        chromedriver_file
+                    ):
+                        os.chmod(
+                            str(chromedriver_file),
+                            stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR,
+                        )
+                        self.logger.info(
+                            f'Found chromedriver in cache: {chromedriver_file}'
+                        )
+                        return str(chromedriver_file)
+
+            # Fallback: return the original path and let it fail with a clearer error
+            self.logger.warning(
+                f'Could not find chromedriver executable, using: {driver_path}'
+            )
+            return str(driver_path)
+        except Exception as e:
+            self.logger.error(f'Error resolving chromedriver path: {e}')
+            raise
+
     def _initialize_driver(self):
         """Initialize the Selenium WebDriver with Chrome."""
         if self.driver:
@@ -77,7 +180,9 @@ class Browser:
             chrome_options.add_experimental_option(
                 'excludeSwitches', ['enable-logging']
             )
-            service = Service(ChromeDriverManager().install())
+            chromedriver_path = self._resolve_chromedriver_path()
+            self.logger.debug(f'Using chromedriver at: {chromedriver_path}')
+            service = Service(chromedriver_path)
             self.driver = webdriver.Chrome(service=service, options=chrome_options)
             self.driver.set_page_load_timeout(self.timeout)
             self.logger.info(

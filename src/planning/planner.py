@@ -121,7 +121,15 @@ IMPORTANT: Do NOT use browser_navigate as a tool in your plan. Use 'search' inst
 Return a JSON object with:
 - subtasks: list of objects, each with:
   - id: unique identifier (e.g., "step_1", "step_2")
-  - description: what needs to be done (be concise)
+  - description: COMPLETE, SELF-CONTAINED instruction that includes:
+    * What needs to be done (clear action verb and objective)
+    * What specific information/data to find, process, or analyze (include key terms, dates, entities, requirements)
+    * Any constraints, formats, or requirements (e.g., date ranges, specific sources, output format)
+    * CRITICAL: The description must be complete enough that an LLM can process it WITHOUT needing the full problem context
+    * Include relevant details from the problem: specific dates, entities, requirements, formats mentioned in the problem
+    * For search tasks: specify what information to find (e.g., "Find arXiv papers about X submitted in Y month")
+    * For llm_reasoning tasks: specify what calculation/analysis to perform and what data to use
+    * For read_attachment tasks: specify what information to extract from which file
   - tool: which tool to use (llm_reasoning, search, read_attachment, analyze_media)
     * search: Use for ALL information gathering (web pages, archives, databases, files, PDFs). The system will automatically download and extract content from PDFs.
     * llm_reasoning: Use for computation, data processing, analysis, and reasoning tasks. This replaces code_interpreter with LLM-based problem solving.
@@ -168,7 +176,9 @@ IMPORTANT: Return your response as valid JSON only, without any markdown formatt
                 retry_context += (
                     f'Validation warnings: {"; ".join(validation_warnings[:3])}\n'
                 )
-            retry_context += "Create an IMPROVED plan that addresses these issues. CRITICAL: Each subtask with tool='search' MUST include a search_queries array with exactly 3 different search queries in KEYWORD-ONLY format (3-8 keywords each, no verbs or descriptive phrases). Example: ['arXiv Physics Society August 11 2016', 'arXiv Physics Society 2016', 'Physics Society arXiv August'] NOT ['arXiv Physics and Society article submitted August 11 2016']. Remove words like 'article', 'submitted', 'descriptors', 'about'. The search tool will automatically navigate and extract from archives.\n"
+            retry_context += 'Create an IMPROVED plan that addresses these issues. CRITICAL REQUIREMENTS:\n'
+            retry_context += "1. Each subtask description must be COMPLETE and SELF-CONTAINED, including what to do, why it's needed, what specific information/data to find/process, constraints, and expected output.\n"
+            retry_context += "2. Each subtask with tool='search' MUST include a search_queries array with exactly 3 different search queries in KEYWORD-ONLY format (3-8 keywords each, no verbs or descriptive phrases). Example: ['arXiv Physics Society August 11 2016', 'arXiv Physics Society 2016', 'Physics Society arXiv August'] NOT ['arXiv Physics and Society article submitted August 11 2016']. Remove words like 'article', 'submitted', 'descriptors', 'about'. The search tool will automatically navigate and extract from archives.\n"
 
         # Extract step classifications if available
         step_classifications_info = ''
@@ -204,6 +214,16 @@ Query Analysis:
 Problem Classification:
 {json.dumps(problem_classification, indent=2)}
 {step_classifications_info}
+
+CRITICAL REQUIREMENT FOR SUBTASK DESCRIPTIONS:
+Each subtask description must be COMPLETE and SELF-CONTAINED. It must include:
+1. What to do (clear action)
+2. Why it's needed (context from the problem)
+3. What specific information/data to find or process (include key terms, dates, entities from the problem)
+4. Any constraints or requirements (date ranges, formats, sources mentioned in the problem)
+5. Expected output or criteria
+
+Incorporate relevant details from the problem, query analysis, and problem classification into EACH subtask description. The description should be detailed enough that an LLM can execute it without needing to see the full problem context.
 
 Generate a concise, essential execution plan with the minimum number of steps needed.
 Remember: Only use search for steps that require information retrieval. Use llm_reasoning for computation, analysis, and LLM-only judgment tasks."""

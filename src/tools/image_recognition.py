@@ -1,7 +1,7 @@
 """Image recognition tool for processing images from PDFs and browser navigation."""
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from ..models import Attachment
 
@@ -30,7 +30,7 @@ class ImageRecognition:
         options: Optional[Dict[str, Any]] = None,
         problem: Optional[str] = None,
         query_analysis: Optional[Dict[str, Any]] = None,
-    ) -> str:
+    ) -> Union[str, Dict[str, Any]]:
         """
         Extract and recognize images from a PDF file with smart content filtering.
 
@@ -41,13 +41,21 @@ class ImageRecognition:
             query_analysis: Optional query analysis for relevance filtering.
 
         Returns:
-            Combined text and image analysis results.
+            If problem/query_analysis provided: Dictionary with structured data:
+            {
+                'type': 'pdf',
+                'filename': str,
+                'sections': [{'title': str, 'page': int, 'content': str}, ...],
+                'image_analysis': str,
+                'full_text': str
+            }
+            Otherwise: Combined text and image analysis results as string (backward compatibility).
         """
         if options is None:
             options = {}
 
         try:
-            import fitz  # PyMuPDF
+            import fitz  # type: ignore # PyMuPDF
         except ImportError:
             error_msg = 'PyMuPDF not available. Install with: uv pip install PyMuPDF'
             self.logger.warning(error_msg)
@@ -101,6 +109,7 @@ class ImageRecognition:
             # Only extract full content from relevant sections if filtering was applied
             text_parts = []
             extracted_images = []
+            structured_sections = []  # For structured return format
 
             for page_num in pages:
                 page = pdf_document[page_num]
@@ -140,55 +149,133 @@ class ImageRecognition:
                                 if s.get('page', 0) == page_num + 1
                             ]
                             if page_sections:
-                                # Extract text for relevant sections on this page
+                                # Extract text for relevant sections on this page using section_index
                                 section_texts = []
+                                # Get page blocks for block-based extraction
+                                blocks = page.get_text('dict')['blocks']
+                                blocks_text_list = []
+                                for block in blocks:
+                                    block_text = ''
+                                    if 'lines' in block:
+                                        for line in block['lines']:
+                                            if 'spans' in line:
+                                                for span in line['spans']:
+                                                    block_text += span.get('text', '')
+                                    blocks_text_list.append(block_text)
+
                                 for section in page_sections:
-                                    # Extract content starting from the section title
+                                    section_index = section.get('section_index')
                                     section_title = section.get('title', '')
-                                    # Try to find the section in the page text
-                                    if section_title in page_text:
-                                        # Extract from section title to next section or end of page
-                                        start_idx = page_text.find(section_title)
-                                        if start_idx >= 0:
-                                            # Find next section title or end of text
-                                            remaining_text = page_text[start_idx:]
-                                            # Limit to reasonable length (next 5000 chars or next section)
-                                            next_section_idx = len(remaining_text)
-                                            if pdf_structure:
-                                                for other_section in pdf_structure:
-                                                    if (
-                                                        other_section.get('page', 0)
-                                                        == page_num + 1
-                                                        and other_section.get('title')
-                                                        != section_title
-                                                    ):
-                                                        other_title = other_section.get(
-                                                            'title', ''
-                                                        )
-                                                        if (
-                                                            other_title
-                                                            in remaining_text
-                                                        ):
-                                                            other_idx = (
-                                                                remaining_text.find(
-                                                                    other_title
-                                                                )
-                                                            )
-                                                            if (
-                                                                other_idx > 0
-                                                                and other_idx
-                                                                < next_section_idx
-                                                            ):
-                                                                next_section_idx = (
-                                                                    other_idx
-                                                                )
-                                            section_text = remaining_text[
-                                                :next_section_idx
-                                            ].strip()
+
+                                    if section_index is not None and pdf_structure:
+                                        # Find the section in pdf_structure by section_index
+                                        current_section = None
+                                        for s in pdf_structure:
+                                            if s.get('section_index') == section_index:
+                                                current_section = s
+                                                break
+
+                                        if current_section:
+                                            # Get block index for current section
+                                            start_block_idx = current_section.get(
+                                                'block_index', 0
+                                            )
+
+                                            # Find next section's block index (section_index + 1)
+                                            next_block_idx = len(blocks)
+                                            next_section_index = section_index + 1
+                                            for s in pdf_structure:
+                                                if (
+                                                    s.get('section_index')
+                                                    == next_section_index
+                                                    and s.get('page') == page_num + 1
+                                                ):
+                                                    next_block_idx = s.get(
+                                                        'block_index', len(blocks)
+                                                    )
+                                                    break
+
+                                            # Extract text from blocks between start and next
+                                            section_blocks_text = blocks_text_list[
+                                                start_block_idx:next_block_idx
+                                            ]
+                                            section_text = '\n'.join(
+                                                section_blocks_text
+                                            ).strip()
+
                                             if section_text:
                                                 section_texts.append(
                                                     f'[Section: {section_title}]\n{section_text}'
                                                 )
+                                                # Add to structured sections
+                                                structured_sections.append(
+                                                    {
+                                                        'title': section_title,
+                                                        'page': page_num + 1,
+                                                        'content': section_text,
+                                                        'section_index': section_index,
+                                                    }
+                                                )
+                                            else:
+                                                # Fallback: try string matching if block extraction yielded no text
+                                                self.logger.debug(
+                                                    f'Block-based extraction failed for section {section_index}, trying string matching'
+                                                )
+                                                if section_title in page_text:
+                                                    start_idx = page_text.find(
+                                                        section_title
+                                                    )
+                                                    if start_idx >= 0:
+                                                        # Find next section on same page
+                                                        remaining_text = page_text[
+                                                            start_idx:
+                                                        ]
+                                                        next_section_idx = len(
+                                                            remaining_text
+                                                        )
+                                                        for s in pdf_structure:
+                                                            if (
+                                                                s.get('page')
+                                                                == page_num + 1
+                                                                and s.get(
+                                                                    'section_index', -1
+                                                                )
+                                                                > section_index
+                                                            ):
+                                                                other_title = s.get(
+                                                                    'title', ''
+                                                                )
+                                                                if (
+                                                                    other_title
+                                                                    in remaining_text
+                                                                ):
+                                                                    other_idx = remaining_text.find(
+                                                                        other_title
+                                                                    )
+                                                                    if (
+                                                                        other_idx > 0
+                                                                        and other_idx
+                                                                        < next_section_idx
+                                                                    ):
+                                                                        next_section_idx = other_idx
+                                                        section_text = remaining_text[
+                                                            :next_section_idx
+                                                        ].strip()
+                                                        if section_text:
+                                                            section_texts.append(
+                                                                f'[Section: {section_title}]\n{section_text}'
+                                                            )
+                                                            # Add to structured sections
+                                                            structured_sections.append(
+                                                                {
+                                                                    'title': section_title,
+                                                                    'page': page_num
+                                                                    + 1,
+                                                                    'content': section_text,
+                                                                    'section_index': section_index,
+                                                                }
+                                                            )
+
                                 if section_texts:
                                     text_parts.append(
                                         f'[Page {page_num + 1}]\n'
@@ -240,6 +327,25 @@ class ImageRecognition:
                 '\n\n'.join(text_parts) if text_parts else '[No text content found]'
             )
 
+            # Build context that includes relevant section titles if available
+            context_for_images = combined_text
+            if relevant_sections is not None and len(relevant_sections) > 0:
+                relevant_titles_info = (
+                    '\n\nRelevant Sections Identified:\n'
+                    + '\n'.join(
+                        f'- Page {s.get("page", "?")}: {s.get("title", "")}'
+                        for s in relevant_sections
+                    )
+                )
+                context_for_images = (
+                    relevant_titles_info + '\n\n' + combined_text
+                    if combined_text != '[No text content found]'
+                    else relevant_titles_info
+                )
+                self.logger.info(
+                    f'Including {len(relevant_sections)} relevant section titles in image analysis context'
+                )
+
             # Process images with visual LLM if available
             image_analysis = ''
             if extracted_images and self.llm_service:
@@ -248,7 +354,9 @@ class ImageRecognition:
                 )
                 image_analysis = self._process_images_with_visual_llm(
                     extracted_images,
-                    combined_text,
+                    task_description=problem
+                    or 'Analyze the images from this PDF and extract key information.',
+                    context_text=context_for_images,
                     source_type='PDF',
                     source_name=attachment.filename,
                 )
@@ -266,15 +374,27 @@ class ImageRecognition:
             # Combine results
             result = combined_text
             if image_analysis:
-                result += '\n\n' + '=' * 80 + '\n'
+                result += '\n\n'
                 result += 'IMAGE ANALYSIS (from visual LLM):\n'
-                result += '=' * 80 + '\n'
+                result += '\n'
                 result += image_analysis
 
             self.logger.info(
                 f'Successfully processed PDF {attachment.filename}. '
                 f'Text length: {len(combined_text)}, Images: {len(extracted_images)}'
             )
+
+            # Return structured data if problem/query_analysis provided and we have sections
+            if problem and query_analysis and structured_sections:
+                return {
+                    'type': 'pdf',
+                    'filename': attachment.filename,
+                    'sections': structured_sections,
+                    'image_analysis': image_analysis,
+                    'full_text': result,  # Include full combined text as fallback
+                }
+
+            # Backward compatibility: return string
             return result
 
         except Exception as e:
@@ -291,12 +411,10 @@ class ImageRecognition:
     ) -> str:
         """
         Recognize and analyze images from browser navigation (screenshots).
-
         Args:
             screenshot_data: Screenshot image data as bytes.
             context: Optional context dictionary with page information.
             task_description: Optional task description for analysis.
-
         Returns:
             Analysis result from visual LLM.
         """
@@ -310,82 +428,28 @@ class ImageRecognition:
             f'Processing browser screenshot with visual LLM ({len(screenshot_data)} bytes)'
         )
 
-        # Build context description
         context_str = ''
         if context:
             context_items = []
             for key, value in context.items():
-                # Skip image data in text context
                 if key in ('screenshot', 'image') or 'image' in key.lower():
                     continue
-                if isinstance(value, str):
-                    context_items.append(f'{key}: {value[:500]}')
-                elif isinstance(value, (dict, list)):
-                    import json
-
-                    context_items.append(f'{key}: {json.dumps(value, indent=2)[:500]}')
-                else:
-                    context_items.append(f'{key}: {str(value)[:500]}')
+                context_items.append(f'- {key}: {str(value)[:500]}')
             if context_items:
-                context_str = '\n\nAvailable Context:\n' + '\n'.join(
-                    f'- {item}' for item in context_items
-                )
+                context_str = '\n'.join(context_items)
 
-        # Build task description
-        if not task_description:
-            task_description = (
-                'Analyze this webpage screenshot and describe what you see. '
-                'What is the main content, layout, and any visible elements?'
-            )
+        final_task_description = (
+            task_description
+            or 'Analyze this webpage screenshot and determine the next action.'
+        )
 
-        # Build messages with screenshot
-        system_prompt = """You are an expert at analyzing webpage screenshots.
-Describe what you see in the screenshot, including:
-1. The overall layout and structure
-2. Main content and text visible
-3. Any images, buttons, forms, or interactive elements
-4. Colors, styling, and visual design
-5. Any important details or information visible"""
-
-        text_prompt = f"""{task_description}{context_str}
-
-Please provide a detailed analysis of the screenshot."""
-
-        content_items = [
-            {'type': 'text', 'text': text_prompt},
-        ]
-
-        # Add screenshot
-        try:
-            image_content = self.llm_service.create_image_content(
-                screenshot_data, image_format='auto'
-            )
-            content_items.append(image_content)
-        except Exception as e:
-            self.logger.warning(f'Failed to encode screenshot: {e}')
-            return f'[Error encoding screenshot: {str(e)}]'
-
-        messages = [
-            {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': content_items},
-        ]
-
-        try:
-            # Use visual LLM to analyze screenshot
-            analysis = self.llm_service.call_with_images(
-                messages=messages,
-                temperature=0.3,  # Lower temperature for consistent analysis
-                max_tokens=4000,  # Increased to ensure summary tables are included
-            )
-
-            self.logger.info(f'Visual LLM analysis completed: {len(analysis)} chars')
-            return analysis
-
-        except Exception as e:
-            self.logger.error(
-                f'Failed to process screenshot with visual LLM: {e}', exc_info=True
-            )
-            return f'[Error processing screenshot with visual LLM: {str(e)}]'
+        return self._process_images_with_visual_llm(
+            images=[screenshot_data],
+            task_description=final_task_description,
+            context_text=context_str,
+            source_type='browser',
+            source_name=context.get('url', 'unknown URL') if context else 'unknown URL',
+        )
 
     def recognize_images(
         self,
@@ -420,30 +484,28 @@ Please provide a detailed analysis of the screenshot."""
 
         return self._process_images_with_visual_llm(
             images,
+            task_description=task_description,
             context_text=str(context) if context else '',
             source_type=source_type,
             source_name=source_name or 'unknown',
-            task_description=task_description,
         )
 
     def _process_images_with_visual_llm(
         self,
         images: List[Any],
+        task_description: str,
         context_text: str = '',
         source_type: str = 'general',
         source_name: str = 'unknown',
-        task_description: Optional[str] = None,
     ) -> str:
         """
         Process images with visual LLM.
-
         Args:
             images: List of images (can be dicts with 'data' key or bytes).
+            task_description: Description of what to analyze in the images.
             context_text: Text context for analysis.
             source_type: Type of source.
             source_name: Name of the source.
-            task_description: Optional task description.
-
         Returns:
             Analysis result.
         """
@@ -454,31 +516,21 @@ Please provide a detailed analysis of the screenshot."""
             # Build content list with text and images
             content_items = []
 
-            # Add text context
-            if task_description:
-                text_prompt = f"""{task_description}
+            # System prompt is now universal and direct
+            system_prompt = """You are an expert at analyzing images to extract relevant information.
+Focus on answering the user's request based on the visual content.
+Be concise and directly address the user's query.
+If the image does not contain relevant information, state that clearly.
+Do not describe the image unless asked to."""
 
+            # User prompt is now a clear instruction
+            text_prompt = f"""Task: {task_description}
 Source: {source_type} ({source_name})"""
-            else:
-                text_prompt = f"""Analyze the images extracted from {source_type}: {source_name}"""
 
             if context_text:
-                text_prompt += (
-                    f'\n\nContext:\n{context_text[:2000]}'  # Limit context length
-                )
+                text_prompt += f'\n\nRelevant Text Context:\n{context_text[:2000]}'  # Limit context length
 
-            if source_type == 'PDF':
-                text_prompt += """
-
-Please analyze each image and describe:
-1. What is shown in the image
-2. How it relates to the text context
-3. Any important details, labels, diagrams, or information visible
-4. If there are multiple images, describe each one separately"""
-            else:
-                text_prompt += """
-
-Please analyze the image(s) and describe what you see, including any important details, labels, or information visible."""
+            text_prompt += '\n\nPlease analyze the following image(s) and provide a direct answer to the task.'
 
             content_items.append({'type': 'text', 'text': text_prompt})
 
@@ -501,26 +553,8 @@ Please analyze the image(s) and describe what you see, including any important d
                 except Exception as e:
                     self.logger.warning(f'Failed to encode image {i + 1}: {e}')
 
-            if len(content_items) == 1:  # Only text, no images added
+            if len(content_items) == 1:  # Only text, no valid images added
                 return '[Failed to process images with visual LLM - no valid images]'
-
-            # Build system prompt based on source type
-            if source_type == 'PDF':
-                system_prompt = (
-                    'You are an expert at analyzing images from PDF documents. '
-                    'Describe what you see in each image, how it relates to the text context, '
-                    'and extract any important information, labels, or details visible in the images.'
-                )
-            elif source_type == 'browser':
-                system_prompt = (
-                    'You are an expert at analyzing webpage screenshots. '
-                    'Describe the layout, content, and visual elements you see.'
-                )
-            else:
-                system_prompt = (
-                    'You are an expert at analyzing images. '
-                    'Describe what you see in each image and extract any important information.'
-                )
 
             messages = [
                 {'role': 'system', 'content': system_prompt},
@@ -534,8 +568,8 @@ Please analyze the image(s) and describe what you see, including any important d
             # Use visual LLM to analyze images
             analysis = self.llm_service.call_with_images(
                 messages=messages,
-                temperature=0.3,  # Lower temperature for consistent analysis
-                max_tokens=4000,  # Increased to ensure summary tables are included
+                temperature=0.1,  # Lower temperature for more focused analysis
+                max_tokens=8192,  # Increased from 4000 to reduce truncation risk
             )
 
             self.logger.info(f'Visual LLM analysis completed: {len(analysis)} chars')
@@ -569,7 +603,7 @@ Please analyze the image(s) and describe what you see, including any important d
                 blocks = page.get_text('dict')['blocks']
 
                 # Extract potential headers (larger text, bold, at start of blocks)
-                for block in blocks:
+                for block_idx, block in enumerate(blocks):
                     if 'lines' in block:
                         for line in block['lines']:
                             if 'spans' in line:
@@ -600,6 +634,7 @@ Please analyze the image(s) and describe what you see, including any important d
                                                 'page': page_num + 1,
                                                 'level': 1 if font_size >= 16 else 2,
                                                 'font_size': font_size,
+                                                'block_index': block_idx,
                                             }
                                         )
 
@@ -609,12 +644,33 @@ Please analyze the image(s) and describe what you see, including any important d
                 for item in toc:
                     level, title, page_num_toc = item
                     if page_num_toc - 1 in pages:  # Convert to 0-based
+                        # Try to find matching block index on the target page
+                        toc_page = pdf_document[page_num_toc - 1]
+                        toc_blocks = toc_page.get_text('dict')['blocks']
+                        block_index = None
+                        # Search for the title in blocks to get approximate position
+                        for block_idx, block in enumerate(toc_blocks):
+                            # Extract text from this block
+                            block_text = ''
+                            if 'lines' in block:
+                                for line in block['lines']:
+                                    if 'spans' in line:
+                                        for span in line['spans']:
+                                            block_text += span.get('text', '')
+                            if (
+                                title.lower() in block_text.lower()[:200]
+                            ):  # Check first 200 chars
+                                block_index = block_idx
+                                break
                         sections.append(
                             {
                                 'title': title,
                                 'page': page_num_toc,
                                 'level': level,
                                 'font_size': 14,  # Default for TOC entries
+                                'block_index': block_index
+                                if block_index is not None
+                                else 0,
                             }
                         )
 
@@ -627,8 +683,15 @@ Please analyze the image(s) and describe what you see, including any important d
                     seen.add(key)
                     unique_sections.append(section)
 
+            # Sort sections by page number, then by block_index within page
+            unique_sections.sort(key=lambda s: (s['page'], s.get('block_index', 0)))
+
+            # Assign 0-based sequential section_index to each section
+            for idx, section in enumerate(unique_sections):
+                section['section_index'] = idx
+
             self.logger.debug(
-                f'Extracted {len(unique_sections)} unique sections from PDF structure'
+                f'Extracted {len(unique_sections)} unique sections from PDF structure with indices 0-{len(unique_sections) - 1}'
             )
             return unique_sections
 
@@ -731,6 +794,7 @@ Example: {{"relevant_titles": ["Introduction", "Methodology", "Results"]}}"""
             relevant_titles_normalized = {t.strip().lower() for t in relevant_titles}
 
             # Filter sections by relevant titles (case-insensitive matching)
+            # Preserve section_index from original sections
             relevant_sections = [
                 s
                 for s in sections
@@ -740,6 +804,9 @@ Example: {{"relevant_titles": ["Introduction", "Methodology", "Results"]}}"""
             self.logger.info(
                 f'LLM identified {len(relevant_titles)} relevant titles out of {len(sections)} total sections'
             )
+            if relevant_sections:
+                indices = [s.get('section_index', '?') for s in relevant_sections]
+                self.logger.debug(f'Relevant section indices: {indices}')
 
             # Return only relevant sections (no fallback to all sections)
             return relevant_sections
