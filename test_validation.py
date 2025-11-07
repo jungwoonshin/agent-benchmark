@@ -3,19 +3,47 @@
 import json
 import logging
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from src.solver import GAIASolver
 from src.utils import setup_logging
 
 
-def load_validation_cases(file_path: str, num_cases: int = 10) -> list:
-    """Load validation cases from JSON file"""
+def load_validation_cases(
+    file_path: str, num_cases: int = 10, indexes: Optional[list[int]] = None
+) -> list:
+    """Load validation cases from JSON file
+
+    Args:
+        file_path: Path to the JSON file containing validation cases
+        num_cases: Number of cases to load (used when indexes is None)
+        indexes: Optional list of case indexes to select. If provided, selects
+                 those specific cases instead of first num_cases.
+
+    Returns:
+        List of selected validation cases
+    """
     logging.info(f'Loading validation cases from {file_path}')
     with open(file_path, 'r') as f:
         cases = json.load(f)
-    logging.info(f'Loaded {len(cases)} total cases, using first {num_cases}')
-    return cases[:num_cases]
+
+    if indexes is not None:
+        # Validate indexes
+        max_index = len(cases) - 1
+        invalid_indexes = [idx for idx in indexes if idx < 0 or idx > max_index]
+        if invalid_indexes:
+            raise ValueError(
+                f'Invalid indexes: {invalid_indexes}. Valid range is 0-{max_index}'
+            )
+        selected_cases = [cases[idx] for idx in indexes]
+        logging.info(
+            f'Loaded {len(cases)} total cases, selected {len(selected_cases)} '
+            f'cases at indexes: {indexes}'
+        )
+        return selected_cases
+    else:
+        logging.info(f'Loaded {len(cases)} total cases, using first {num_cases}')
+        return cases[:num_cases]
 
 
 def test_case(
@@ -156,7 +184,7 @@ def main():
     # Load validation cases
     validation_file = 'gaia_dataset/validation.json'
     print(f'\nLoading validation cases from {validation_file}...')
-    cases = load_validation_cases(validation_file, num_cases=20)
+    cases = load_validation_cases(validation_file, num_cases=20, indexes=[2,3,5,6,7])
     print(f'Loaded {len(cases)} cases')
 
     # Test each case
