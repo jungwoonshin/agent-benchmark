@@ -139,7 +139,6 @@ Every information-gathering subtask now:
 Each search result evaluated with:
 - Subtask context
 - Problem requirements
-- Query analysis constraints
 - Returns reasoning for transparency
 
 ### ✅ Intelligent Type Classification

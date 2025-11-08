@@ -3,12 +3,12 @@
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
 from ..execution import Executor
-from ..llm import LLMService, ReasoningEngine
+from ..llm import LLMService
 from ..models import Attachment
 from ..planning import Planner, ProblemClassifier, QueryUnderstanding
 from ..state import InformationStateManager
@@ -55,9 +55,6 @@ class Agent:
         self.query_understanding = QueryUnderstanding(self.llm_service, logger)
         self.problem_classifier = ProblemClassifier(self.llm_service, logger)
         self.planner = Planner(self.llm_service, self.state_manager, logger)
-        self.reasoning_engine = ReasoningEngine(
-            self.llm_service, self.state_manager, logger
-        )
         self.executor = Executor(
             tool_belt, self.llm_service, self.state_manager, logger
         )
@@ -70,7 +67,7 @@ class Agent:
 
     def solve(
         self, problem: str, attachments: Optional[List[Attachment]] = None
-    ) -> Tuple[str, str]:
+    ) -> str:
         """
         Solves a complex problem using tools and a step-by-step reasoning process.
 
@@ -79,19 +76,17 @@ class Agent:
         2. CLASSIFY: Determine the problem type
         3. PLAN: Generate execution strategy
         4. EXECUTE: Run tool operations
-        5. REASON: Analyze results and propagate constraints
-        6. SYNTHESIZE: Construct answer from components
-        7. VALIDATE: Check if answer is correct and retry incorrect execution steps if needed
+        5. SYNTHESIZE: Construct answer from components
+        6. VALIDATE: Check if answer is correct and retry incorrect execution steps if needed
 
-        Logs its operations to the logger and builds a human-readable monologue.
+        Logs its operations to the logger.
 
         Args:
             problem: The natural language problem description.
             attachments: An optional list of file attachments (images, PDFs, etc.).
 
         Returns:
-            A tuple containing:
-            (final_answer: str, reasoning_monologue: str)
+            final_answer: str
         """
         self.logger.info('--- New Problem Received ---')
         self.logger.info(f'Problem: {problem}')
@@ -104,33 +99,42 @@ class Agent:
             self.logger.info(f'Attachments: {[a.filename for a in attachments]}')
 
         try:
-            # Step 1: PARSE - Query Understanding
-            self.logger.info('=== Phase 1: PARSE ===')
-            query_analysis = self.query_understanding.analyze(problem, attachments)
-            self.logger.info(
-                f'Query analysis complete: {len(query_analysis.get("explicit_requirements", []))} '
-                f'explicit requirements identified'
-            )
-            # Log query analysis structure at DEBUG level only (not as final answer)
-            self.logger.debug(
-                f'Query analysis structure: {json.dumps(query_analysis, indent=2)[:500]}...'
-            )
-
-            # Step 2: Classify Problem
-            self.logger.info('=== Phase 2: CLASSIFY ===')
+            # Step 1: Classify Problem (basic classification without requirements)
+            self.logger.info('=== Phase 1: CLASSIFY ===')
+            # Create minimal query analysis for classification (without step-tagged requirements)
+            minimal_query_analysis = {
+                'explicit_requirements': [],
+                'dependencies': [],
+                'answer_format': '',
+                'cross_references': [],
+            }
             problem_classification = self.problem_classifier.classify(
-                problem, query_analysis
+                problem, minimal_query_analysis
             )
             self.logger.info(
                 f'Problem classified as: {problem_classification.get("primary_type")}'
             )
 
-            # Step 3: PLAN - Generate execution strategy
-            self.logger.info('=== Phase 3: PLAN ===')
+            # Step 2: PLAN - Generate execution strategy first (before query understanding)
+            self.logger.info('=== Phase 2: PLAN ===')
             plan = self.planner.create_plan(
-                problem, query_analysis, problem_classification
+                problem, minimal_query_analysis, problem_classification
             )
             self.logger.info(f'Execution plan created with {len(plan)} subtasks')
+
+            # Step 3: PARSE - Query Understanding (assign step numbers based on generated subtasks)
+            self.logger.info('=== Phase 3: PARSE ===')
+            query_analysis = self.query_understanding.analyze(
+                problem, attachments, subtasks=plan
+            )
+            self.logger.info(
+                f'Query analysis complete: {len(query_analysis.get("explicit_requirements", []))} '
+                f'explicit requirements identified and assigned to steps'
+            )
+            # Log query analysis structure at DEBUG level only (not as final answer)
+            self.logger.debug(
+                f'Query analysis structure: {json.dumps(query_analysis, indent=2)[:500]}...'
+            )
 
             # Step 4: EXECUTE - Run tool operations
             self.logger.info('=== Phase 4: EXECUTE ===')
@@ -158,36 +162,17 @@ class Agent:
                 f'Execution complete: {len(execution_results)} results obtained'
             )
 
-            # Step 5: REASON - Propagate constraints and analyze results
-            self.logger.info('=== Phase 5: REASON ===')
-            constraints = query_analysis.get('constraints', {})
-            reasoning_results = {}
-            if constraints:
-                self.logger.info('Propagating constraints to refine results.')
-                # Convert execution results to a list for reasoning engine
-                knowledge_from_execution = list(execution_results.values())
-                reasoning_results = self.reasoning_engine.propagate_constraints(
-                    constraints, knowledge_from_execution
-                )
-                self.logger.info(
-                    'Reasoning complete. Narrowed space: '
-                    f'{reasoning_results.get("narrowed_space")}'
-                )
-            else:
-                self.logger.info('No constraints found to propagate.')
-
-            # Combine execution and reasoning results for synthesis
+            # Combine execution results for synthesis
             combined_results = {
                 'execution_summary': execution_results,
-                'reasoning_summary': reasoning_results,
             }
 
             # MONITOR & ADAPT (logging state)
             state_summary = self.state_manager.get_state_summary()
             self.logger.info(f'Current state summary: {state_summary}')
 
-            # Step 6: SYNTHESIZE - Construct answer (with retry on validation failure)
-            self.logger.info('=== Phase 6: SYNTHESIZE ===')
+            # Step 5: SYNTHESIZE - Construct answer (with retry on validation failure)
+            self.logger.info('=== Phase 5: SYNTHESIZE ===')
             max_retries = 2
             retry_count = 0
             synthesis = None
@@ -259,24 +244,9 @@ class Agent:
                         # Merge retry results with existing execution results
                         execution_results.update(retry_results)
 
-                        # Re-run reasoning if constraints exist
-                        if constraints:
-                            self.logger.info('=== Phase 5 (RETRY): REASON ===')
-                            knowledge_from_execution = list(execution_results.values())
-                            reasoning_results = (
-                                self.reasoning_engine.propagate_constraints(
-                                    constraints, knowledge_from_execution
-                                )
-                            )
-                            combined_results = {
-                                'execution_summary': execution_results,
-                                'reasoning_summary': reasoning_results,
-                            }
-                        else:
-                            combined_results = {
-                                'execution_summary': execution_results,
-                                'reasoning_summary': {},
-                            }
+                        combined_results = {
+                            'execution_summary': execution_results,
+                        }
                     else:
                         # No failed subtasks, but validation still failed
                         # This means we need to create additional subtasks for missing requirements
@@ -318,26 +288,9 @@ class Agent:
                                 # Merge with existing results
                                 execution_results.update(new_execution_results)
 
-                                # Re-run reasoning if constraints exist
-                                if constraints:
-                                    self.logger.info('=== Phase 5 (RETRY): REASON ===')
-                                    knowledge_from_execution = list(
-                                        execution_results.values()
-                                    )
-                                    reasoning_results = (
-                                        self.reasoning_engine.propagate_constraints(
-                                            constraints, knowledge_from_execution
-                                        )
-                                    )
-                                    combined_results = {
-                                        'execution_summary': execution_results,
-                                        'reasoning_summary': reasoning_results,
-                                    }
-                                else:
-                                    combined_results = {
-                                        'execution_summary': execution_results,
-                                        'reasoning_summary': {},
-                                    }
+                                combined_results = {
+                                    'execution_summary': execution_results,
+                                }
 
                     retry_count += 1
                 else:
@@ -349,18 +302,8 @@ class Agent:
             # Log final answer clearly (this is the actual answer, not query analysis)
             self.logger.info(f'FINAL ANSWER: {final_answer}')
 
-            # Build reasoning monologue
-            monologue = self.answer_synthesizer.build_monologue(
-                problem,
-                query_analysis,
-                problem_classification,
-                plan,
-                combined_results,
-                synthesis,
-            )
-
-            # Step 7: VALIDATE - Check if answer is correct
-            self.logger.info('=== Phase 7: VALIDATE ===')
+            # Step 6: VALIDATE - Check if answer is correct
+            self.logger.info('=== Phase 6: VALIDATE ===')
             validation_result = self.answer_validator.validate_answer(
                 problem,
                 final_answer,
@@ -373,7 +316,7 @@ class Agent:
             if validation_result['is_correct']:
                 self.logger.info('Answer validation passed. Answer is correct.')
                 self.logger.info('Problem solved. Returning answer.')
-                return (final_answer, monologue)
+                return final_answer
             else:
                 # Answer is incorrect, identify and retry only incorrect execution steps
                 self.logger.warning(
@@ -406,40 +349,17 @@ class Agent:
                     # Merge retry results with existing execution results
                     execution_results.update(retry_results)
 
-                    # Re-run reasoning if constraints exist
-                    if constraints:
-                        self.logger.info('=== Phase 5 (VALIDATION RETRY): REASON ===')
-                        knowledge_from_execution = list(execution_results.values())
-                        reasoning_results = self.reasoning_engine.propagate_constraints(
-                            constraints, knowledge_from_execution
-                        )
-                        combined_results = {
-                            'execution_summary': execution_results,
-                            'reasoning_summary': reasoning_results,
-                        }
-                    else:
-                        combined_results = {
-                            'execution_summary': execution_results,
-                            'reasoning_summary': {},
-                        }
+                    combined_results = {
+                        'execution_summary': execution_results,
+                    }
 
                     # Re-synthesize answer with corrected results
-                    self.logger.info('=== Phase 6 (VALIDATION RETRY): SYNTHESIZE ===')
+                    self.logger.info('=== Phase 5 (VALIDATION RETRY): SYNTHESIZE ===')
                     synthesis = self.answer_synthesizer.synthesize(
                         problem, combined_results, query_analysis, attachments
                     )
                     final_answer = synthesis.get(
                         'final_answer', 'Unable to determine answer'
-                    )
-
-                    # Rebuild monologue with updated information
-                    monologue = self.answer_synthesizer.build_monologue(
-                        problem,
-                        query_analysis,
-                        problem_classification,
-                        plan,
-                        combined_results,
-                        synthesis,
                     )
 
                     self.logger.info(
@@ -452,14 +372,14 @@ class Agent:
                     )
 
             self.logger.info('Problem solved. Returning answer.')
-            return (final_answer, monologue)
+            return final_answer
 
         except Exception as e:
             self.logger.error(f'An error occurred during problem solving: {e}')
             import traceback
 
             self.logger.error(traceback.format_exc())
-            return 'I encountered an error and could not solve the problem.', str(e)
+            return 'I encountered an error and could not solve the problem.'
 
     def _retry_incorrect_subtasks(
         self,

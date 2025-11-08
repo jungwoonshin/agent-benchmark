@@ -183,23 +183,20 @@ class ToolBelt:
         )
 
     # Search method
-    def search(
-        self, query: str, num_results: int = 5, search_type: str = 'web'
-    ) -> List[SearchResult]:
+    def search(self, query: str, num_results: int = 5) -> List[SearchResult]:
         """
-        Performs a web or specialized search using Google Custom Search API.
+        Performs a web search using Google Custom Search API.
 
         Args:
             query: Search query string.
             num_results: Number of results to return (default: 5).
-            search_type: Type of search (default: 'web').
 
         Returns:
             List of SearchResult objects.
         """
         if not self.search_tool:
             raise ValueError('ToolBelt not initialized. Call set_logger() first.')
-        return self.search_tool.search(query, num_results, search_type)
+        return self.search_tool.search(query, num_results)
 
     # File handling methods
     def read_attachment(
@@ -208,6 +205,7 @@ class ToolBelt:
         options: dict = None,
         problem: Optional[str] = None,
         query_analysis: Optional[Dict[str, Any]] = None,
+        skip_image_processing: bool = False,
     ) -> Union[str, Dict[str, Any]]:
         """
         Smart file reader that extracts text and images from various common formats.
@@ -217,6 +215,7 @@ class ToolBelt:
             options: Optional dict with file-specific options.
             problem: Optional problem description for relevance filtering.
             query_analysis: Optional query analysis for relevance filtering.
+            skip_image_processing: If True, skip image processing (for relevance check).
 
         Returns:
             Extracted text content (string) or structured data (dict) for PDFs with sections.
@@ -226,7 +225,7 @@ class ToolBelt:
         if not self.file_handler:
             raise ValueError('ToolBelt not initialized. Call set_logger() first.')
         return self.file_handler.read_attachment(
-            attachment, options, problem, query_analysis
+            attachment, options, problem, query_analysis, skip_image_processing
         )
 
     def analyze_media(self, attachment: Attachment, analysis_type: str = 'auto') -> str:

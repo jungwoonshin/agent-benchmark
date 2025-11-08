@@ -2,11 +2,9 @@
 
 import json
 import logging
-import re
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from typing import Any, Dict, List, Optional
 
-from ..models import Attachment, SearchResult
+from ..models import Attachment
 from ..tools import ToolBelt
 from ..utils import extract_json_from_text
 
@@ -31,177 +29,6 @@ class SearchHandler:
         self.tool_belt = tool_belt
         self.llm_service = llm_service
         self.logger = logger
-
-    def filter_search_results_by_relevance(
-        self,
-        search_results: List[Any],
-        query: str,
-        problem: str,
-        query_analysis: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[List[Any], bool]:
-        """
-        Use LLM to filter and rank search results by relevance to the query.
-
-        Args:
-            search_results: List of SearchResult objects from search tool.
-            query: The search query that produced these results.
-            problem: The original problem being solved.
-            query_analysis: Optional query analysis results containing requirements and constraints.
-
-        Returns:
-            Tuple of (filtered list of most relevant SearchResult objects, was_selected_indices_empty).
-            was_selected_indices_empty is True if the LLM returned 0 selected indices.
-        """
-        if not search_results:
-            return search_results, False
-
-        self.logger.info(
-            f'Filtering {len(search_results)} search results by relevance using LLM'
-        )
-
-        # Build a formatted list of search results for the LLM
-        results_list = []
-        for i, result in enumerate(search_results):
-            if isinstance(result, SearchResult):
-                results_list.append(
-                    {
-                        'index': i,
-                        'title': result.title,
-                        'snippet': result.snippet,
-                        'url': result.url,
-                    }
-                )
-            elif isinstance(result, dict):
-                # Handle already-serialized SearchResult dictionaries
-                results_list.append(
-                    {
-                        'index': i,
-                        'title': result.get('title', ''),
-                        'snippet': result.get('snippet', ''),
-                        'url': result.get('url', ''),
-                    }
-                )
-
-        # Extract requirement information from query analysis
-        requirements_context = ''
-        if query_analysis:
-            explicit_reqs = query_analysis.get('explicit_requirements', [])
-            implicit_reqs = query_analysis.get('implicit_requirements', [])
-            constraints = query_analysis.get('constraints', {})
-            answer_format = query_analysis.get('answer_format', '')
-
-            requirements_context = '\n\nKey Requirements from Query Analysis:\n'
-            if explicit_reqs:
-                requirements_context += (
-                    f'- Explicit Requirements: {", ".join(explicit_reqs)}\n'
-                )
-            if implicit_reqs:
-                requirements_context += (
-                    f'- Implicit Requirements: {", ".join(implicit_reqs)}\n'
-                )
-            if constraints:
-                constraints_str = []
-                if constraints.get('temporal'):
-                    constraints_str.append(
-                        f'Temporal: {", ".join(constraints["temporal"])}'
-                    )
-                if constraints.get('spatial'):
-                    constraints_str.append(
-                        f'Spatial: {", ".join(constraints["spatial"])}'
-                    )
-                if constraints.get('categorical'):
-                    constraints_str.append(
-                        f'Categorical: {", ".join(constraints["categorical"])}'
-                    )
-                if constraints_str:
-                    requirements_context += (
-                        f'- Constraints: {"; ".join(constraints_str)}\n'
-                    )
-            if answer_format:
-                requirements_context += f'- Expected Answer Format: {answer_format}\n'
-
-        system_prompt = """You are an expert at evaluating search result relevance.
-Given a search query/subtask description, query requirements analysis, and a list of search results, identify which results are relevant to answering the query.
-
-Consider the explicit and implicit requirements from the query analysis when determining relevance.
-A result is relevant if it helps satisfy any of the stated requirements or constraints.
-
-Return a JSON object with:
-- selected_indices: list of integers representing the indices (0-based) of ALL relevant results, ordered by relevance (most relevant first)
-- reasoning: brief explanation of why these results were selected, specifically referencing which requirements they address
-
-IMPORTANT:
-- Select ALL results that are relevant to the query, not just a fixed number
-- Include any result that could help answer the query or satisfy the requirements
-- Order results by relevance (most relevant first)
-- Return your response as valid JSON only, without any markdown formatting or additional text
-
-Focus on:
-- Direct relevance to the query/subtask terms and intent
-- Alignment with explicit and implicit requirements from query analysis
-- How well each result addresses the specific requirements and constraints
-- Information quality and usefulness for satisfying the problem requirements
-- For aggregate/statistical queries (e.g., "how many articles"), prioritize archive/browse pages over individual articles"""
-
-        user_prompt = f"""Original Problem: {problem}
-
-Subtask/Query: {query}
-{requirements_context}
-
-Search Results (combined from multiple search queries):
-{json.dumps(results_list, indent=2)}
-
-Identify ALL relevant search results for answering the query/subtask. Pay special attention to which results satisfy the requirements identified in the query analysis. Return the indices of all relevant results, ordered by relevance (most relevant first). Include any result that could help answer the query or satisfy the requirements."""
-
-        try:
-            response = self.llm_service.call_with_system_prompt(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                temperature=0.7,  # Creative but focused for search result filtering
-                response_format={'type': 'json_object'},
-            )
-            json_text = extract_json_from_text(response)
-            result_data = json.loads(json_text)
-
-            selected_indices = result_data.get('selected_indices', [])
-            reasoning = result_data.get('reasoning', 'No reasoning provided')
-            was_selected_indices_empty = len(selected_indices) == 0
-
-            self.logger.info(
-                f'LLM selected {len(selected_indices)} most relevant result(s) out of {len(search_results)}. Reasoning: {reasoning}'
-            )
-
-            # Filter results to only include selected indices, preserving order
-            filtered_results = []
-            seen_indices = set()  # Avoid duplicates
-            for idx in selected_indices:
-                if 0 <= idx < len(search_results) and idx not in seen_indices:
-                    filtered_results.append(search_results[idx])
-                    seen_indices.add(idx)
-                elif idx not in seen_indices:
-                    self.logger.warning(
-                        f'Invalid index {idx} in selected_indices (valid range: 0-{len(search_results) - 1})'
-                    )
-
-            # If no valid results were selected, return all original results as fallback
-            if not filtered_results:
-                self.logger.warning(
-                    'No valid results selected by LLM, using all original results as fallback'
-                )
-                return search_results, was_selected_indices_empty
-
-            self.logger.info(
-                f'LLM filtered {len(search_results)} results down to {len(filtered_results)} most relevant'
-            )
-            return filtered_results, was_selected_indices_empty
-
-        except Exception as e:
-            self.logger.error(
-                f'Failed to filter search results by relevance: {e}', exc_info=True
-            )
-            # Fallback to original results if filtering fails
-            self.logger.warning('Using all original search results as fallback')
-            return search_results, False
 
     def generate_new_search_queries(
         self,
@@ -230,17 +57,21 @@ Identify ALL relevant search results for answering the query/subtask. Pay specia
 Given a subtask description, problem context, and previous search queries that didn't yield relevant results, create 3 NEW and DIFFERENT search queries.
 
 CRITICAL REQUIREMENTS:
-- Create exactly 3 different search queries
+- Create exactly 3 different search queries with varying complexity levels:
+  * First query: Simple - use minimal essential keywords only
+  * Second query: Normal - include standard descriptive terms and context
+  * Third query: Complex - incorporate additional qualifiers, specific attributes, or detailed context
 - Use ONLY keywords and essential terms - NO verbs, NO descriptive phrases, NO unnecessary words
 - Keep each query SHORT: 3-8 keywords maximum (typically 5-6 words)
 - Remove filler words like "article", "submitted", "descriptors", "about", "related to"
 - Use dates in format: "August 11 2016" or "2016-08-11" or "August 2016"
 - Separate keywords with spaces, NOT commas or special formatting
+- **For paper/research exploration**: If the subtask involves finding academic papers, articles, preprints, or research documents, add "pdf" to prioritize PDF files (e.g., "arXiv AI regulation pdf")
 - Make queries DIFFERENT from the previous ones - try alternative keyword combinations, synonyms, or different phrasings
 - Focus on the core information needed to complete the subtask
 
 Return a JSON object with:
-- search_queries: array of exactly 3 different search queries in keyword-only format
+- search_queries: array of exactly 3 different search queries in keyword-only format, ordered from simple to complex
 
 IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
 
@@ -258,37 +89,13 @@ IMPORTANT: Return your response as valid JSON only, without any markdown formatt
         requirements_context = ''
         if query_analysis:
             explicit_reqs = query_analysis.get('explicit_requirements', [])
-            implicit_reqs = query_analysis.get('implicit_requirements', [])
-            constraints = query_analysis.get('constraints', {})
 
-            if explicit_reqs or implicit_reqs or constraints:
+            if explicit_reqs:
                 requirements_context = '\n\nKey Requirements:\n'
                 if explicit_reqs:
                     requirements_context += (
                         f'- Explicit Requirements: {", ".join(explicit_reqs)}\n'
                     )
-                if implicit_reqs:
-                    requirements_context += (
-                        f'- Implicit Requirements: {", ".join(implicit_reqs)}\n'
-                    )
-                if constraints:
-                    constraints_str = []
-                    if constraints.get('temporal'):
-                        constraints_str.append(
-                            f'Temporal: {", ".join(constraints["temporal"])}'
-                        )
-                    if constraints.get('spatial'):
-                        constraints_str.append(
-                            f'Spatial: {", ".join(constraints["spatial"])}'
-                        )
-                    if constraints.get('categorical'):
-                        constraints_str.append(
-                            f'Categorical: {", ".join(constraints["categorical"])}'
-                        )
-                    if constraints_str:
-                        requirements_context += (
-                            f'- Constraints: {"; ".join(constraints_str)}\n'
-                        )
 
         user_prompt = f"""Problem: {problem}
 
@@ -378,12 +185,7 @@ Return a JSON object with key "resources" containing an array of resource object
 If you cannot construct a direct URL but can identify a resource, include it with url as null and provide as much info as possible.
 If no resources are found, return {"resources": []}.
 
-IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text.
-
-Examples:
-- "Preprint paper 2207.01510" -> {"url": "https://repository.org/pdf/2207.01510.pdf", "title": "Preprint paper 2207.01510", "description": "Preprint paper with ID 2207.01510", "relevance": 1.0}
-- "Paper submitted to preprint repository in June 2022" -> {"url": null, "title": "June 2022 preprint submission", "description": "Paper submitted to preprint repository in June 2022", "relevance": 0.8}
-- "Document at https://example.com/doc.pdf" -> {"url": "https://example.com/doc.pdf", "title": "Document from example.com", "description": "PDF document", "relevance": 1.0}"""
+IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
 
         user_prompt = f"""Problem: {problem}
 
@@ -448,36 +250,12 @@ Return as JSON with "resources" key containing an array of resource objects."""
             requirements_context = ''
             if query_analysis:
                 explicit_reqs = query_analysis.get('explicit_requirements', [])
-                implicit_reqs = query_analysis.get('implicit_requirements', [])
-                constraints = query_analysis.get('constraints', {})
                 answer_format = query_analysis.get('answer_format', '')
 
                 if explicit_reqs:
                     requirements_context += (
                         f'\nExplicit Requirements: {", ".join(explicit_reqs)}'
                     )
-                if implicit_reqs:
-                    requirements_context += (
-                        f'\nImplicit Requirements: {", ".join(implicit_reqs)}'
-                    )
-                if constraints:
-                    constraints_str = []
-                    if constraints.get('temporal'):
-                        constraints_str.append(
-                            f'Temporal: {", ".join(constraints["temporal"])}'
-                        )
-                    if constraints.get('spatial'):
-                        constraints_str.append(
-                            f'Spatial: {", ".join(constraints["spatial"])}'
-                        )
-                    if constraints.get('categorical'):
-                        constraints_str.append(
-                            f'Categorical: {", ".join(constraints["categorical"])}'
-                        )
-                    if constraints_str:
-                        requirements_context += (
-                            f'\nConstraints: {"; ".join(constraints_str)}'
-                        )
                 if answer_format:
                     requirements_context += f'\nAnswer Format: {answer_format}'
 
@@ -506,25 +284,34 @@ Return as JSON with "resources" key containing an array of resource objects."""
 
 Given:
 1. A subtask description that needs to be completed
-2. Processed search results (content from web pages and files)
-3. Problem requirements and constraints
+2. An overall problem/question that the subtask is part of
+3. Processed search results (content from web pages and files)
+4. Problem requirements
 
 Your task:
-- Analyze the search results with respect to the subtask description
-- Extract and determine the answer or information that addresses the subtask
-- Provide a clear, focused response that directly answers what the subtask is asking for
-- If the search results don't contain the needed information, clearly state that
-- If multiple pieces of information are found, synthesize them appropriately
+- Analyze the search results and extract TWO types of information:
+  1. Information directly related to the SUBTASK DESCRIPTION - this should go in the "answer" field
+  2. Information related to the OVERALL PROBLEM but not directly answering the subtask - this should go in "additional_information"
+
+CRITICAL DISTINCTION:
+- "answer" (content): Must contain information that DIRECTLY addresses what the subtask_description is asking for. This is the primary answer to the specific subtask.
+- "additional_information": Should contain information that is relevant to the overall problem/question but does NOT directly answer the subtask. This includes:
+  * Contextual information about the problem domain
+  * Related concepts or background information
+  * Image analysis results
+  * Information that might be useful for other subtasks or the final answer synthesis
+  * Any findings that relate to the problem but not specifically to this subtask
 
 Return a JSON object with:
-- answer: The answer or information determined from the search results (string)
+- answer: The answer or information that DIRECTLY addresses the subtask description (string). This should focus ONLY on what the subtask is asking for.
 - reasoning: Brief explanation of how you arrived at this answer (string)
 - confidence: Confidence level from 0.0 to 1.0 (float)
-- sources_used: List of source titles/URLs that were most relevant (array of strings)
+- sources_used: List of source titles/URLs that were most relevant for the answer (array of strings)
+- additional_information: Information relevant to the overall problem/question but NOT directly answering the subtask. If no such information is available, use an empty string. (string)
 
 IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
 
-            user_prompt = f"""Problem: {problem}
+            user_prompt = f"""Overall Problem/Question: {problem}
 
 Subtask Description: {subtask_description}
 {requirements_context}
@@ -535,7 +322,9 @@ Processed Search Results:
 Materials Found ({len(materials)} total):
 {chr(10).join(materials_summary) if materials_summary else 'No materials found.'}
 
-Analyze these search results with respect to the subtask description and determine the answer or information that addresses what the subtask is asking for."""
+Analyze these search results and extract:
+1. Answer to the SUBTASK DESCRIPTION (put in "answer" field) - information that directly addresses what the subtask is asking for
+2. Information related to the OVERALL PROBLEM but not directly answering the subtask (put in "additional_information" field) - contextual information, related concepts, or findings relevant to the problem but not this specific subtask"""
 
             self.logger.info(
                 f'Analyzing search results with LLM for subtask: {subtask_description[:100]}...'
@@ -557,9 +346,11 @@ Analyze these search results with respect to the subtask description and determi
             reasoning = analysis_data.get('reasoning', 'No reasoning provided.')
             confidence = analysis_data.get('confidence', 0.0)
             sources_used = analysis_data.get('sources_used', [])
+            additional_information = analysis_data.get('additional_information', '')
 
             self.logger.info(
-                f'LLM analysis complete: answer length={len(answer)}, confidence={confidence:.2f}'
+                f'LLM analysis complete: answer length={len(answer)}, confidence={confidence:.2f}, '
+                f'additional_info length={len(additional_information)}'
             )
 
             # Return structured result with LLM analysis as primary content
@@ -568,6 +359,7 @@ Analyze these search results with respect to the subtask description and determi
                 'reasoning': reasoning,
                 'confidence': confidence,
                 'sources_used': sources_used,
+                'additional_information': additional_information,  # Extra relevant information
                 'analysis_type': 'search_results_analysis',
             }
 
@@ -667,15 +459,10 @@ Analyze these search results with respect to the subtask description and determi
             requirements_context = ''
             if query_analysis:
                 explicit_reqs = query_analysis.get('explicit_requirements', [])
-                implicit_reqs = query_analysis.get('implicit_requirements', [])
 
                 if explicit_reqs:
                     requirements_context += (
                         f'\nExplicit Requirements: {", ".join(explicit_reqs)}'
-                    )
-                if implicit_reqs:
-                    requirements_context += (
-                        f'\nImplicit Requirements: {", ".join(implicit_reqs)}'
                     )
 
             system_prompt = """You are an expert at evaluating whether a search result is relevant to solving a problem.
@@ -688,7 +475,6 @@ Return a JSON object with:
 IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
 
             user_prompt = f"""Problem: {problem}
-{requirements_context}
 
 Search Result:
 - Title: {search_result.title}
@@ -729,24 +515,139 @@ Is this search result relevant to solving the problem?"""
         subtask_id: str,
         problem: str,
         query_analysis: Optional[Dict[str, Any]] = None,
+        subtask_description: Optional[str] = None,
     ) -> None:
         """
-        Process search results: navigate to relevant non-file pages, download file URLs.
+        Process search results to find the most relevant web page or download files.
 
         Args:
-            search_results: List of SearchResult objects from search tool.
-            attachments: Attachments list to append downloaded files to.
+            search_results: List of SearchResult objects from selected_indices.
+            attachments: Attachments list to append downloaded files or relevant page content to.
             subtask_id: ID of the subtask that produced these results.
             problem: Original problem description.
             query_analysis: Optional query analysis results.
+            subtask_description: Description of the subtask (used to construct subtask_goal).
         """
-        if not search_results:
+        if not self.tool_belt.browser_navigator:
+            self.logger.error('BrowserNavigator not initialized in ToolBelt.')
             return
 
+        if not subtask_description:
+            self.logger.warning(
+                'No subtask_description provided, using problem as fallback.'
+            )
+            subtask_description = problem
+
         self.logger.info(
-            f'Processing {len(search_results)} search results: navigating relevant pages and downloading files...'
+            f'Starting intelligent search and navigation for subtask {subtask_id}'
         )
 
+        # Construct subtask goal for BrowserNavigator
+        subtask_goal = subtask_description
+        if query_analysis:
+            explicit_reqs = query_analysis.get('explicit_requirements', [])
+
+            if explicit_reqs:
+                goal_details = []
+                if explicit_reqs:
+                    goal_details.append(f'Explicit: {", ".join(explicit_reqs)}')
+                subtask_goal += f' (Requirements: {"; ".join(goal_details)})'
+
+        # First, try the standard search and navigation approach
+        relevant_page_info = self.tool_belt.browser_navigator.find_relevant_page(
+            subtask_goal
+        )
+
+        if relevant_page_info:
+            self.logger.info(
+                f'BrowserNavigator found a relevant page: {relevant_page_info["url"]}'
+            )
+            # Create an Attachment from the relevant page content and add to attachments
+            page_attachment = Attachment(
+                filename=f'page_content_{len(attachments) + 1}.md',
+                content=relevant_page_info['content'].encode('utf-8'),  # Store as bytes
+                url=relevant_page_info['url'],
+                content_type='text/markdown',
+                metadata={
+                    'title': f'Web Page: {relevant_page_info["url"]}',
+                    'summary': relevant_page_info['summary'],
+                    'relevance': relevant_page_info['relevance'],
+                },
+            )
+            attachments.append(page_attachment)
+            self.logger.info(
+                f'Added relevant page as attachment. Total attachments: {len(attachments)}'
+            )
+        else:
+            self.logger.info(
+                'BrowserNavigator did not find a relevant page via standard search.'
+            )
+
+            # If no relevant page found, try navigating from the most relevant homepage
+            # of the selected search results
+            if search_results:
+                self.logger.info(
+                    f'Attempting homepage navigation from {len(search_results)} selected search results.'
+                )
+
+                # Convert to SearchResult objects if needed
+                from ..models import SearchResult
+
+                selected_results = []
+                for result in search_results:
+                    if isinstance(result, SearchResult):
+                        selected_results.append(result)
+                    elif isinstance(result, dict):
+                        # Convert dict to SearchResult if needed
+                        selected_results.append(
+                            SearchResult(
+                                title=result.get('title', ''),
+                                url=result.get('url', ''),
+                                snippet=result.get('snippet', ''),
+                                relevance_score=result.get('relevance_score', 0.0),
+                            )
+                        )
+
+                if selected_results:
+                    homepage_page_info = (
+                        self.tool_belt.browser_navigator.navigate_from_homepage(
+                            selected_results, subtask_goal
+                        )
+                    )
+
+                    if homepage_page_info:
+                        self.logger.info(
+                            f'BrowserNavigator found a relevant page via homepage navigation: {homepage_page_info["url"]}'
+                        )
+                        # Create an Attachment from the homepage navigation result
+                        page_attachment = Attachment(
+                            filename=f'page_content_{len(attachments) + 1}.md',
+                            content=homepage_page_info['content'].encode('utf-8'),
+                            url=homepage_page_info['url'],
+                            content_type='text/markdown',
+                            metadata={
+                                'title': f'Web Page (via Homepage): {homepage_page_info["url"]}',
+                                'summary': homepage_page_info['summary'],
+                                'relevance': homepage_page_info['relevance'],
+                            },
+                        )
+                        attachments.append(page_attachment)
+                        self.logger.info(
+                            f'Added relevant page from homepage navigation as attachment. '
+                            f'Total attachments: {len(attachments)}'
+                        )
+                    else:
+                        self.logger.info(
+                            'BrowserNavigator did not find a relevant page via homepage navigation.'
+                        )
+                else:
+                    self.logger.warning(
+                        'No valid SearchResult objects found for homepage navigation.'
+                    )
+
+        # Old logic for downloading files (if still needed, can be integrated or replaced)
+        # For now, keeping the old download logic in case BrowserNavigator doesn't handle all file types.
+        # This part could be refactored to be called by BrowserNavigator or removed if BrowserNavigator covers all cases.
         downloadable_extensions = {
             '.pdf',
             '.doc',
@@ -757,75 +658,29 @@ Is this search result relevant to solving the problem?"""
             '.csv',
         }
 
-        downloaded_count = 0
-        navigated_count = 0
+        # The old iteration over search_results is no longer needed since BrowserNavigator handles it.
+        # The following commented out code is the original logic for reference or future integration.
+        # if not search_results:
+        #     return
 
-        def extract_paper_id(url_or_text: str) -> Optional[Tuple[str, str]]:
-            """
-            Extract paper/preprint ID from URL or text.
+        # self.logger.info(
+        #     f'Processing {len(search_results)} search results: navigating relevant pages and downloading files...'
+        # )
 
-            Returns:
-                Tuple of (paper_id, repository_type) if found, None otherwise.
-                repository_type can be 'preprint' (for preprint repositories) or None.
-            """
-            # Pattern for preprint IDs: YYMM.NNNNN or archive-category/YYMMNNN format
-            # This pattern works for preprint repositories using similar ID formats
-            preprint_patterns = [
-                # Direct URL patterns (domain-agnostic - works for any domain)
-                r'(?:abs|pdf)/(\d{4}\.\d{4,5}(?:v\d+)?)',  # abs/2207.01510 or pdf/2207.01510
-                r'(?:abs|pdf)/([a-z-]+/\d{7}(?:v\d+)?)',  # abs/cs/1234567 or pdf/math/1234567
-                # Citation patterns (common formats across repositories)
-                r'[:\s]+(\d{4}\.\d{4,5}(?:v\d+)?)',  # :2207.01510 or :2207.01510
-                r'[:\s]+([a-z-]+/\d{7}(?:v\d+)?)',  # :cs/1234567
-                r'\.(\d{4}\.\d{4,5}(?:v\d+)?)',  # .2207.01510
-                r'\.([a-z-]+/\d{7}(?:v\d+)?)',  # .cs/1234567
-                r'[:\.](\d{4}\.\d{4,5}(?:v\d+)?)',  # :2207.01510 or .2207.01510
-            ]
+        # downloaded_count = 0
+        # navigated_count = 0
 
-            for pattern in preprint_patterns:
-                match = re.search(pattern, url_or_text, re.IGNORECASE)
-                if match:
-                    paper_id = match.group(1)
-                    # Remove version suffix if present (e.g., v1, v2)
-                    paper_id = re.sub(r'v\d+$', '', paper_id)
-                    # Detect repository type based on ID format
-                    # YYMM.NNNNN or archive/category format suggests preprint repository
-                    if re.match(r'^\d{4}\.\d{4,5}$', paper_id) or '/' in paper_id:
-                        return (paper_id, 'preprint')
-                    return (paper_id, None)
-            return None
+        # def extract_paper_id(url_or_text: str) -> Optional[Tuple[str, str]]:
+        # ... (same as before)
+        # def get_pdf_url_from_paper_id(
+        # ... (same as before)
 
-        def get_pdf_url_from_paper_id(
-            paper_id: str, repository_type: str, original_url: str = ''
-        ) -> Optional[str]:
-            """
-            Construct PDF URL from paper ID based on repository type.
+        # for result in search_results:
+        # ... (rest of old logic)
 
-            Args:
-                paper_id: The extracted paper ID
-                repository_type: Type of repository ('preprint' for preprint repositories, etc.)
-                original_url: Original URL from search result (used to infer domain)
-
-            Returns:
-                PDF URL if repository type is known and domain can be inferred, None otherwise
-            """
-            if repository_type == 'preprint':
-                # Try to infer base URL from original URL
-                if original_url:
-                    try:
-                        parsed = urlparse(original_url)
-                        if parsed.netloc:
-                            # Use the domain from original URL
-                            base_url = f'{parsed.scheme}://{parsed.netloc}'
-                            return f'{base_url}/pdf/{paper_id}.pdf'
-                    except Exception:
-                        pass
-
-                # If we can't infer domain from URL, we cannot construct a valid download URL
-                # without domain-specific knowledge
-                return None
-            return None
-
+        # This part of the function will now only handle direct file downloads if `search_results` were used externally
+        # and `BrowserNavigator` didn't cover it. Given the new approach, it's likely redundant or needs explicit calling.
+        # I'll leave a simplified version for explicit downloads in case some non-web-navigable files are still in search_results.
         for result in search_results:
             if not isinstance(result, SearchResult):
                 continue
@@ -834,85 +689,20 @@ Is this search result relevant to solving the problem?"""
             if not url:
                 continue
 
-            # Check if URL looks like a downloadable file
             url_lower = url.lower()
-            is_downloadable = False
-            download_url = url
-
-            # First, check by file extension (direct downloadable files)
+            is_downloadable_file = False
             for ext in downloadable_extensions:
                 if ext in url_lower:
-                    is_downloadable = True
+                    is_downloadable_file = True
                     break
 
-            # If not directly downloadable, try to extract paper ID from URL or snippet
-            if not is_downloadable:
-                # Try extracting paper ID from URL first
-                paper_info = extract_paper_id(url)
-
-                # If not found in URL, try snippet
-                if not paper_info:
-                    paper_info = extract_paper_id(result.snippet or '')
-
-                if paper_info:
-                    paper_id, repository_type = paper_info
-                    # Construct PDF URL from paper ID
-                    download_url = get_pdf_url_from_paper_id(
-                        paper_id, repository_type, url
-                    )
-                    if download_url:
-                        is_downloadable = True
-                        self.logger.info(
-                            f'Extracted paper ID {paper_id} from URL/snippet, constructing PDF URL: {download_url}'
-                        )
-
-            # Determine if URL is a file (using new helper method)
-            is_file = self.is_file_url(url) or is_downloadable
-
-            if is_file:
-                # It's a file - download it
+            if is_downloadable_file:
                 try:
-                    self.logger.info(
-                        f'Downloading file from search result: {download_url}'
-                    )
-                    attachment = self.tool_belt.download_file_from_url(download_url)
+                    self.logger.info(f'Attempting to download direct file: {url}')
+                    attachment = self.tool_belt.download_file_from_url(url)
                     attachments.append(attachment)
-                    downloaded_count += 1
                     self.logger.info(
-                        f'Added attachment {attachment.filename} from search result '
-                        f'(subtask {subtask_id}). Total attachments: {len(attachments)}'
+                        f'Downloaded file {attachment.filename}. Total attachments: {len(attachments)}'
                     )
                 except Exception as e:
-                    self.logger.warning(
-                        f'Failed to download file from {download_url}: {e}. Continuing...'
-                    )
-                    continue
-            else:
-                # Not a file - check relevance and navigate if relevant
-                try:
-                    is_relevant = self.is_result_relevant(
-                        result, problem, query_analysis
-                    )
-                    if is_relevant:
-                        self.logger.info(f'Navigating to relevant non-file page: {url}')
-                        # Navigate to the page (this will load content and add to state)
-                        nav_result = self.tool_belt.browser_navigate(url)
-                        navigated_count += 1
-                        self.logger.info(
-                            f'Successfully navigated to {url}. '
-                            f'Page loaded: {nav_result.get("success", False)}'
-                        )
-                    else:
-                        self.logger.info(f'Skipping non-relevant page: {url}')
-                except Exception as e:
-                    self.logger.warning(
-                        f'Failed to process search result {url}: {e}. Continuing...'
-                    )
-                    continue
-
-        if downloaded_count > 0 or navigated_count > 0:
-            self.logger.info(
-                f'Processed {len(search_results)} search results: '
-                f'Downloaded {downloaded_count} file(s), navigated to {navigated_count} page(s). '
-                f'Total attachments now: {len(attachments)}'
-            )
+                    self.logger.warning(f'Failed to download direct file {url}: {e}')

@@ -133,8 +133,7 @@ processing_result = search_processor.process_search_results(...)
 Each search result is evaluated for relevance using the LLM with:
 - **Subtask context** - What the current subtask is trying to accomplish
 - **Problem context** - The original problem being solved
-- **Requirements** - Explicit and implicit requirements from query analysis
-- **Constraints** - Temporal, spatial, and categorical constraints
+- **Requirements** - Explicit requirements from query analysis
 
 ```python
 def _check_relevance(

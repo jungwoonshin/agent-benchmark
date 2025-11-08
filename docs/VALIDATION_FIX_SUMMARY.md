@@ -7,7 +7,7 @@ The user reported that validation was checking ALL requirements from the query a
 ## Root Cause
 
 The validation in `answer_synthesizer.py` was comparing:
--  ALL requirements from query analysis (explicit + implicit)
+-  ALL requirements from query analysis (explicit)
 - Against only the executed subtasks' results
 
 This mismatch caused it to flag requirements as "missing" even when no subtask had been executed to address them yet.

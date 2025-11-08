@@ -5,10 +5,9 @@
 #### 1. **Query Understanding Module**
 ```
 Input Analysis:
-- Parse natural language for explicit and implicit requirements
+- Parse natural language for explicit requirements
 - Identify information dependencies and sequencing constraints
 - Detect cross-references between different data sources
-- Extract temporal, spatial, and categorical constraints
 - Recognize answer format requirements
 ```
 

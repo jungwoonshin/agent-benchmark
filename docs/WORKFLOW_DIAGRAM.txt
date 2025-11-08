@@ -39,7 +39,6 @@ SYSTEMATIC SEARCH RESULT PROCESSING WORKFLOW
    │  Context:                                            │
    │    - Subtask description                             │
    │    - Problem requirements                            │
-   │    - Query analysis constraints                      │
    │                                                       │
    │  LLM Response:                                       │
    │    {                                                 │

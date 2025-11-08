@@ -46,6 +46,7 @@ class FileHandler:
         options: dict = None,
         problem: Optional[str] = None,
         query_analysis: Optional[Dict[str, Any]] = None,
+        skip_image_processing: bool = False,
     ) -> Union[str, Dict[str, Any]]:
         """
         Smart file reader that extracts text and images from various common formats.
@@ -74,7 +75,7 @@ class FileHandler:
 
             # Handle PDF files
             if '.pdf' in filename_lower:
-                return self._read_pdf(attachment, options, problem, query_analysis)
+                return self._read_pdf(attachment, options, problem, query_analysis, skip_image_processing)
 
             # Handle text files
             elif '.txt' in filename_lower:
@@ -103,6 +104,7 @@ class FileHandler:
         options: dict,
         problem: Optional[str] = None,
         query_analysis: Optional[Dict[str, Any]] = None,
+        skip_image_processing: bool = False,
     ) -> str:
         """
         Read PDF file and extract text and images.
@@ -113,6 +115,7 @@ class FileHandler:
             options: Options dict with optional 'page_range' key.
             problem: Optional problem description for relevance filtering.
             query_analysis: Optional query analysis for relevance filtering.
+            skip_image_processing: If True, skip image processing (for relevance check).
 
         Returns:
             Combined text and image analysis results.
@@ -125,7 +128,7 @@ class FileHandler:
 
         # Use image recognition tool for PDF processing
         return self.image_recognition.recognize_images_from_pdf(
-            attachment, options, problem, query_analysis
+            attachment, options, problem, query_analysis, skip_image_processing
         )
 
     def analyze_media(self, attachment: Attachment, analysis_type: str = 'auto') -> str:

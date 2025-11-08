@@ -4,7 +4,7 @@ from .agent import Agent
 
 # Re-export from new module locations for backward compatibility
 from ..execution import Executor
-from ..llm import LLMService, ReasoningEngine
+from ..llm import LLMService
 from ..models import Attachment, RevisionData, SearchResult
 from ..planning import Planner, ProblemClassifier, QueryUnderstanding
 from ..state import InformationStateManager
@@ -22,7 +22,6 @@ __all__ = [
     'ProblemClassifier',
     'InformationStateManager',
     'Planner',
-    'ReasoningEngine',
     'Executor',
     'AnswerSynthesizer',
 ]

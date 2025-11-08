@@ -32,7 +32,6 @@ class LLMService:
         },
     }
 
-
     # Class-level cache for models that don't support response_format
     _response_format_unsupported_models: set = set()
 
@@ -73,7 +72,6 @@ class LLMService:
         self.logger.info(
             f'LLMService initialized with model: {self.model}, visual_model: {self.visual_model}, timeout: {timeout}s, max_retries: {max_retries}'
         )
-        
 
     def _initialize_clients(self):
         """Initialize OpenAI clients based on model configurations."""
@@ -407,20 +405,42 @@ class LLMService:
             Exception: If the call fails after all retries, with improved error message.
         """
         vision_model = model or self.visual_model
+        
+        # Count images in the request
+        image_count = 0
+        text_length = 0
+        for msg in messages:
+            if isinstance(msg.get('content'), list):
+                for item in msg['content']:
+                    if isinstance(item, dict):
+                        if item.get('type') == 'image_url':
+                            image_count += 1
+                        elif item.get('type') == 'text':
+                            text_length += len(item.get('text', ''))
+            elif isinstance(msg.get('content'), str):
+                text_length += len(msg['content'])
+        
         self.logger.info(
-            f'Calling vision LLM ({vision_model}) with {len(messages)} messages'
+            f'[Visual LLM] Calling vision model: {vision_model}, '
+            f'messages: {len(messages)}, images: {image_count}, '
+            f'text length: {text_length} chars, temperature: {temperature}, '
+            f'max_tokens: {max_tokens}'
         )
 
         messages = self._consolidate_vision_messages(messages)
 
         try:
-            return self._make_vision_api_call(
+            response = self._make_vision_api_call(
                 model=vision_model,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 response_format=response_format,
             )
+            self.logger.info(
+                f'[Visual LLM] API call successful: {len(response)} chars returned'
+            )
+            return response
         except Exception as e:
             # Avoid re-wrapping exception if it's already classified
             if 'LLM API call failed' in str(e):
@@ -428,7 +448,7 @@ class LLMService:
 
             error_type, error_category, user_message = classify_error(e)
             self.logger.error(
-                f'Vision LLM API call failed ({error_category.value}/{error_type.value}): {user_message}',
+                f'[Visual LLM] API call failed ({error_category.value}/{error_type.value}): {user_message}',
                 exc_info=True,
             )
             raise Exception(f'LLM API call failed: {user_message}') from e
@@ -450,7 +470,7 @@ class LLMService:
         if max_tokens is not None:
             if max_tokens < 1:
                 self.logger.warning(
-                    f'Invalid max_tokens value for vision API: {max_tokens}. Must be at least 1. '
+                    f'[Visual LLM] Invalid max_tokens value for vision API: {max_tokens}. Must be at least 1. '
                     f'Setting max_tokens to None (will use model default).'
                 )
                 max_tokens = None
@@ -460,8 +480,15 @@ class LLMService:
         if response_format:
             kwargs['response_format'] = response_format
 
+        self.logger.debug(
+            f'[Visual LLM] Making API call with model={model}, '
+            f'temperature={temperature}, max_tokens={max_tokens}, '
+            f'response_format={response_format}'
+        )
+
         def api_call_fn():
             client_to_use = self._get_client_for_model(model)
+            self.logger.debug(f'[Visual LLM] Executing API request to {model}')
             response = client_to_use.chat.completions.create(**kwargs)
             return response.choices[0].message.content
 

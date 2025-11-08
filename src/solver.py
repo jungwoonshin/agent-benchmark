@@ -94,7 +94,7 @@ class GAIASolver:
 
         try:
             # Call agent.solve()
-            final_answer, monologue = self.agent.solve(question, attachments)
+            final_answer = self.agent.solve(question, attachments)
 
             # Extract confidence and sources from state manager
             state_summary = self.agent.state_manager.get_state_summary()
@@ -130,14 +130,6 @@ class GAIASolver:
                     seen.add(source)
                     unique_sources.append(source)
             sources = unique_sources
-
-            # Fallback: extract URLs from monologue if no sources found
-            if not sources:
-                import re
-
-                url_pattern = r'https?://[^\s\)]+'
-                urls = re.findall(url_pattern, monologue)
-                sources = list(set(urls))  # Remove duplicates
 
             self.logger.info(f'Answer: {final_answer if final_answer else "None"}...')
             self.logger.info(f'Confidence: {confidence:.2f}')

@@ -30,6 +30,7 @@ class ImageRecognition:
         options: Optional[Dict[str, Any]] = None,
         problem: Optional[str] = None,
         query_analysis: Optional[Dict[str, Any]] = None,
+        skip_image_processing: bool = False,
     ) -> Union[str, Dict[str, Any]]:
         """
         Extract and recognize images from a PDF file with smart content filtering.
@@ -45,7 +46,7 @@ class ImageRecognition:
             {
                 'type': 'pdf',
                 'filename': str,
-                'sections': [{'title': str, 'page': int, 'content': str}, ...],
+                'sections': [{'title': str, 'page': int, 'content': str}, ...],  # Can be empty list
                 'image_analysis': str,
                 'full_text': str
             }
@@ -117,12 +118,13 @@ class ImageRecognition:
                 # Check if this page should be included (if relevance filtering is active)
                 should_extract_text = True
                 if relevant_sections is not None:  # None means filtering was attempted
-                    # If filtering was attempted but no relevant sections found, skip all text
+                    # If filtering was attempted but no relevant sections found, still extract text as fallback
                     if len(relevant_sections) == 0:
-                        should_extract_text = False
                         self.logger.debug(
-                            f'Skipping page {page_num + 1} - no relevant sections found in PDF'
+                            f'No relevant sections found in PDF, but extracting full text as fallback for page {page_num + 1}'
                         )
+                        # Still extract text, just don't filter by sections
+                        should_extract_text = True
                     else:
                         # Check if any relevant section is on this page
                         page_sections = [
@@ -282,15 +284,25 @@ class ImageRecognition:
                                         + '\n\n'.join(section_texts)
                                     )
                                 else:
-                                    # Skip if section extraction failed (no fallback to full page text)
+                                    # Fallback to full page text if section extraction failed
                                     self.logger.debug(
-                                        f'Section extraction failed for page {page_num + 1}, skipping text extraction'
+                                        f'Section extraction failed for page {page_num + 1}, using full page text as fallback'
                                     )
-                            # else: No relevant sections on this page, skip text extraction
+                                    if page_text.strip():
+                                        text_parts.append(
+                                            f'[Page {page_num + 1}]\n{page_text}'
+                                        )
+                            else:
+                                # No relevant sections on this page, but still extract text as fallback
+                                if page_text.strip():
+                                    text_parts.append(
+                                        f'[Page {page_num + 1}]\n{page_text}'
+                                    )
                         else:
                             # No relevance filtering applied (problem/query_analysis not provided)
                             # Extract full page text for backward compatibility
-                            text_parts.append(f'[Page {page_num + 1}]\n{page_text}')
+                            if page_text.strip():
+                                text_parts.append(f'[Page {page_num + 1}]\n{page_text}')
 
                 # Always extract images from all pages (images might be relevant even if text isn't)
                 image_list = page.get_images()
@@ -346,34 +358,41 @@ class ImageRecognition:
                     f'Including {len(relevant_sections)} relevant section titles in image analysis context'
                 )
 
-            # Process images with visual LLM if available
+            # Process images with visual LLM if available and not skipping
             image_analysis = ''
-            if extracted_images and self.llm_service:
-                self.logger.info(
-                    f'Found {len(extracted_images)} image(s) in PDF. Processing with visual LLM...'
-                )
-                image_analysis = self._process_images_with_visual_llm(
-                    extracted_images,
-                    task_description=problem
-                    or 'Analyze the images from this PDF and extract key information.',
-                    context_text=context_for_images,
-                    source_type='PDF',
-                    source_name=attachment.filename,
-                )
-            elif extracted_images:
-                # If no visual LLM available, just note that images were found
-                image_info = ', '.join(
-                    f'page {img["page"]} (image {img["index"] + 1})'
-                    for img in extracted_images
-                )
-                image_analysis = (
-                    f'\n\n[Note: {len(extracted_images)} image(s) found in PDF ({image_info}), '
-                    f'but visual LLM not available for analysis]'
-                )
+            if not skip_image_processing:
+                if extracted_images and self.llm_service:
+                    self.logger.info(
+                        f'Found {len(extracted_images)} image(s) in PDF. Processing with visual LLM...'
+                    )
+                    image_analysis = self._process_images_with_visual_llm(
+                        extracted_images,
+                        task_description=problem
+                        or 'Analyze the images from this PDF and extract key information.',
+                        context_text=context_for_images,
+                        source_type='PDF',
+                        source_name=attachment.filename,
+                    )
+                elif extracted_images:
+                    # If no visual LLM available, just note that images were found
+                    image_info = ', '.join(
+                        f'page {img["page"]} (image {img["index"] + 1})'
+                        for img in extracted_images
+                    )
+                    image_analysis = (
+                        f'\n\n[Note: {len(extracted_images)} image(s) found in PDF ({image_info}), '
+                        f'but visual LLM not available for analysis]'
+                    )
+            else:
+                # Skip image processing but note that images were found
+                if extracted_images:
+                    self.logger.debug(
+                        f'Skipping image processing: {len(extracted_images)} image(s) found in PDF'
+                    )
 
             # Combine results
             result = combined_text
-            if image_analysis:
+            if image_analysis and not skip_image_processing:
                 result += '\n\n'
                 result += 'IMAGE ANALYSIS (from visual LLM):\n'
                 result += '\n'
@@ -384,17 +403,23 @@ class ImageRecognition:
                 f'Text length: {len(combined_text)}, Images: {len(extracted_images)}'
             )
 
-            # Return structured data if problem/query_analysis provided and we have sections
-            if problem and query_analysis and structured_sections:
+            # Return structured data if problem/query_analysis provided
+            # (sections can be empty - that's okay, we still want type='pdf' for metadata extraction)
+            if problem and query_analysis:
                 return {
                     'type': 'pdf',
                     'filename': attachment.filename,
-                    'sections': structured_sections,
-                    'image_analysis': image_analysis,
+                    'sections': structured_sections,  # Can be empty list
+                    'image_analysis': image_analysis
+                    if not skip_image_processing
+                    else '',
                     'full_text': result,  # Include full combined text as fallback
+                    'extracted_images': extracted_images
+                    if skip_image_processing
+                    else None,  # Store images for later processing
                 }
 
-            # Backward compatibility: return string
+            # Backward compatibility: return string when problem/query_analysis not provided
             return result
 
         except Exception as e:
@@ -402,6 +427,51 @@ class ImageRecognition:
                 f'Failed to process PDF {attachment.filename}: {e}', exc_info=True
             )
             return f'Error: Failed to process PDF {attachment.filename}: {str(e)}'
+
+    def process_pdf_images_after_relevance(
+        self,
+        attachment: Attachment,
+        extracted_images: List[Dict[str, Any]],
+        problem: Optional[str] = None,
+        context_text: str = '',
+    ) -> str:
+        """
+        Process images from a PDF after relevance has been determined.
+
+        Args:
+            attachment: PDF attachment.
+            extracted_images: List of extracted images from previous processing.
+            problem: Optional problem description for image analysis.
+            context_text: Optional context text to help with image analysis.
+
+        Returns:
+            Image analysis string.
+        """
+        if not extracted_images:
+            return ''
+
+        if not self.llm_service:
+            image_info = ', '.join(
+                f'page {img["page"]} (image {img["index"] + 1})'
+                for img in extracted_images
+            )
+            return (
+                f'[Note: {len(extracted_images)} image(s) found in PDF ({image_info}), '
+                f'but visual LLM not available for analysis]'
+            )
+
+        self.logger.info(
+            f'Processing {len(extracted_images)} image(s) from PDF {attachment.filename} with visual LLM...'
+        )
+
+        return self._process_images_with_visual_llm(
+            extracted_images,
+            task_description=problem
+            or 'Analyze the images from this PDF and extract key information.',
+            context_text=context_text,
+            source_type='PDF',
+            source_name=attachment.filename,
+        )
 
     def recognize_images_from_browser(
         self,
@@ -419,13 +489,19 @@ class ImageRecognition:
             Analysis result from visual LLM.
         """
         if not screenshot_data:
+            self.logger.warning('[Visual LLM Analysis] No screenshot data provided')
             return 'Error: No screenshot data provided'
 
         if not self.llm_service:
+            self.logger.warning(
+                '[Visual LLM Analysis] Visual LLM not available for screenshot analysis'
+            )
             return '[Visual LLM not available for screenshot analysis]'
 
+        source_name = context.get('url', 'unknown URL') if context else 'unknown URL'
         self.logger.info(
-            f'Processing browser screenshot with visual LLM ({len(screenshot_data)} bytes)'
+            f'[Visual LLM Analysis] Processing browser screenshot from {source_name} '
+            f'({len(screenshot_data)} bytes)'
         )
 
         context_str = ''
@@ -437,6 +513,9 @@ class ImageRecognition:
                 context_items.append(f'- {key}: {str(value)[:500]}')
             if context_items:
                 context_str = '\n'.join(context_items)
+                self.logger.debug(
+                    f'[Visual LLM Analysis] Context provided: {len(context_str)} chars'
+                )
 
         final_task_description = (
             task_description
@@ -448,7 +527,7 @@ class ImageRecognition:
             task_description=final_task_description,
             context_text=context_str,
             source_type='browser',
-            source_name=context.get('url', 'unknown URL') if context else 'unknown URL',
+            source_name=source_name,
         )
 
     def recognize_images(
@@ -473,13 +552,18 @@ class ImageRecognition:
             Analysis result from visual LLM.
         """
         if not images:
+            self.logger.warning('[Visual LLM Analysis] No images provided')
             return '[No images provided]'
 
         if not self.llm_service:
+            self.logger.warning(
+                f'[Visual LLM Analysis] Visual LLM not available for {source_type} ({source_name or "unknown"})'
+            )
             return '[Visual LLM not available]'
 
+        source_name = source_name or 'unknown'
         self.logger.info(
-            f'Processing {len(images)} image(s) from {source_type} with visual LLM'
+            f'[Visual LLM Analysis] Processing {len(images)} image(s) from {source_type} ({source_name})'
         )
 
         return self._process_images_with_visual_llm(
@@ -487,7 +571,7 @@ class ImageRecognition:
             task_description=task_description,
             context_text=str(context) if context else '',
             source_type=source_type,
-            source_name=source_name or 'unknown',
+            source_name=source_name,
         )
 
     def _process_images_with_visual_llm(
@@ -510,9 +594,23 @@ class ImageRecognition:
             Analysis result.
         """
         if not self.llm_service:
+            self.logger.warning(
+                f'Visual LLM not available for {source_type} ({source_name})'
+            )
             return '[Visual LLM not available]'
 
         try:
+            # Log visual LLM analysis start with details
+            self.logger.info(
+                f'[Visual LLM Analysis] Starting analysis for {source_type} ({source_name})'
+            )
+            self.logger.info(
+                f'[Visual LLM Analysis] Task: {task_description[:200]}{"..." if len(task_description) > 200 else ""}'
+            )
+            self.logger.info(
+                f'[Visual LLM Analysis] Image count: {len(images)}, Context length: {len(context_text)} chars'
+            )
+
             # Build content list with text and images
             content_items = []
 
@@ -534,26 +632,42 @@ Source: {source_type} ({source_name})"""
 
             content_items.append({'type': 'text', 'text': text_prompt})
 
-            # Add all images
+            # Add all images and log image details
+            image_sizes = []
+            valid_image_count = 0
             for i, img in enumerate(images):
                 try:
                     # Handle both dict format (from PDF) and bytes format
                     if isinstance(img, dict):
                         image_data = img['data']
                         image_format = img.get('ext', 'auto')
+                        page_info = (
+                            f' (page {img.get("page", "?")})' if 'page' in img else ''
+                        )
                     else:
                         image_data = img
                         image_format = 'auto'
+                        page_info = ''
 
+                    image_size = len(image_data)
+                    image_sizes.append(image_size)
                     image_content = self.llm_service.create_image_content(
                         image_data, image_format=image_format
                     )
                     content_items.append(image_content)
-                    self.logger.debug(f'Added image {i + 1} to visual LLM request')
+                    valid_image_count += 1
+                    self.logger.debug(
+                        f'[Visual LLM Analysis] Added image {i + 1}{page_info} ({image_size} bytes, format: {image_format})'
+                    )
                 except Exception as e:
-                    self.logger.warning(f'Failed to encode image {i + 1}: {e}')
+                    self.logger.warning(
+                        f'[Visual LLM Analysis] Failed to encode image {i + 1}: {e}'
+                    )
 
             if len(content_items) == 1:  # Only text, no valid images added
+                self.logger.error(
+                    '[Visual LLM Analysis] No valid images could be added to request'
+                )
                 return '[Failed to process images with visual LLM - no valid images]'
 
             messages = [
@@ -561,23 +675,37 @@ Source: {source_type} ({source_name})"""
                 {'role': 'user', 'content': content_items},
             ]
 
+            total_image_size = sum(image_sizes)
             self.logger.info(
-                f'Processing {len(images)} image(s) from {source_type} with visual LLM...'
+                f'[Visual LLM Analysis] Request prepared: {valid_image_count} valid image(s), '
+                f'total size: {total_image_size} bytes, prompt length: {len(text_prompt)} chars'
             )
 
             # Use visual LLM to analyze images
-            analysis = self.llm_service.call_with_images(
-                messages=messages,
-                temperature=0.1,  # Lower temperature for more focused analysis
-                max_tokens=8192,  # Increased from 4000 to reduce truncation risk
+            temperature = 0.1  # Lower temperature for more focused analysis
+            max_tokens = 8192  # Increased from 4000 to reduce truncation risk
+            self.logger.info(
+                f'[Visual LLM Analysis] Calling visual LLM with temperature={temperature}, max_tokens={max_tokens}'
             )
 
-            self.logger.info(f'Visual LLM analysis completed: {len(analysis)} chars')
+            analysis = self.llm_service.call_with_images(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+            self.logger.info(
+                f'[Visual LLM Analysis] Analysis completed: {len(analysis)} chars returned'
+            )
+            self.logger.info(
+                f'[Visual LLM Analysis] Analysis preview: {analysis}{"..." if len(analysis) > 200 else ""}'
+            )
             return analysis
 
         except Exception as e:
             self.logger.error(
-                f'Failed to process images with visual LLM: {e}', exc_info=True
+                f'[Visual LLM Analysis] Failed to process images from {source_type} ({source_name}): {e}',
+                exc_info=True,
             )
             return f'[Error processing images with visual LLM: {str(e)}]'
 
@@ -729,23 +857,20 @@ Source: {source_type} ({source_name})"""
             )
 
             explicit_requirements = query_analysis.get('explicit_requirements', [])
-            implicit_requirements = query_analysis.get('implicit_requirements', [])
 
             system_prompt = """You are an expert at analyzing document structure and determining relevance.
 Your task is to identify which sections of a PDF document are relevant to answering a specific question.
 
 Consider:
 1. The explicit requirements mentioned in the question
-2. The implicit requirements inferred from the question
-3. The context and domain of the question
-4. Whether the section title suggests it contains relevant information
+2. The context and domain of the question
+3. Whether the section title suggests it contains relevant information
 
 Return a JSON object with a "relevant_titles" key containing an array of relevant section titles."""
 
             user_prompt = f"""Problem/Question: {problem}
 
 Explicit Requirements: {', '.join(explicit_requirements) if explicit_requirements else 'None specified'}
-Implicit Requirements: {', '.join(implicit_requirements) if implicit_requirements else 'None specified'}
 
 PDF Section Titles:
 {sections_text}
@@ -816,3 +941,366 @@ Example: {{"relevant_titles": ["Introduction", "Methodology", "Results"]}}"""
                 f'Failed to filter sections by relevance: {e}. Will skip content extraction.'
             )
             return []  # Return empty list if filtering fails - no fallback to all sections
+
+    def extract_arxiv_metadata_from_pdf(
+        self, attachment: Attachment
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Extract arXiv metadata (submission date, paper ID) from PDF content using LLM.
+
+        Args:
+            attachment: PDF attachment to extract metadata from.
+
+        Returns:
+            Dictionary with keys:
+            - paper_id: arXiv paper ID (extracted from URL if available)
+            - submission_date: Original submission date (YYYY-MM-DD format if found)
+            - submission_date_text: Raw submission date text from PDF
+            - submission_month: Month of submission (YYYY-MM format if found)
+            - confidence: Confidence score (0.0-1.0)
+            None if extraction fails.
+        """
+        if not self.llm_service:
+            self.logger.warning(
+                'LLM service not available for arXiv metadata extraction'
+            )
+            return None
+
+        try:
+            import json
+            import re
+
+            import fitz  # type: ignore # PyMuPDF
+        except ImportError as e:
+            self.logger.warning(f'Required library not available: {e}')
+            return None
+
+        try:
+            # Extract paper ID from URL if available
+            paper_id = None
+            if hasattr(attachment, 'metadata') and attachment.metadata:
+                source_url = attachment.metadata.get('source_url', '')
+                if source_url:
+                    arxiv_match = re.search(
+                        r'arxiv\.org/(?:abs|pdf)/([\d.]+)', source_url, re.IGNORECASE
+                    )
+                    if arxiv_match:
+                        paper_id = re.sub(r'v\d+$', '', arxiv_match.group(1))
+
+            # Extract text from first page and PDF metadata
+            pdf_document = fitz.open(stream=attachment.data, filetype='pdf')
+            if len(pdf_document) == 0:
+                pdf_document.close()
+                return None
+
+            # Extract text from first 3 pages to increase chances of finding submission date
+            # Submission dates are often on the first page but sometimes on page 2 or 3
+            pages_text = []
+            max_pages_to_check = min(1, len(pdf_document))
+            for page_num in range(max_pages_to_check):
+                page_text = pdf_document[page_num].get_text().strip()
+                if page_text:
+                    pages_text.append(f'--- Page {page_num + 1} ---\n{page_text}')
+
+            combined_text = '\n\n'.join(pages_text)
+            pdf_metadata = pdf_document.metadata
+            pdf_document.close()
+
+            if not combined_text:
+                self.logger.warning('No text found in PDF pages')
+                return None
+
+            # Extract paper ID month from paper_id if available (format: YYMM.XXXXX)
+            # This can help infer submission month even if not explicitly stated
+            inferred_month = None
+            if paper_id:
+                # arXiv paper IDs: YYMM.XXXXX where YYMM is year-month
+                # e.g., 1608.03637 -> August 2016
+                month_match = re.match(r'(\d{2})(\d{2})\.', paper_id)
+                if month_match:
+                    year_part = month_match.group(1)
+                    month_part = month_match.group(2)
+                    # Convert YY to YYYY (assuming 20XX for years 00-99)
+                    full_year = (
+                        f'20{year_part}' if int(year_part) < 50 else f'19{year_part}'
+                    )
+                    inferred_month = f'{full_year}-{month_part}'
+                    self.logger.debug(
+                        f'Inferred submission month from paper ID {paper_id}: {inferred_month}'
+                    )
+
+            # Use LLM to extract all metadata from text
+            system_prompt = """Extract arXiv paper metadata from PDF content. Look carefully for:
+- Paper ID (if not provided)
+- Original submission date (may differ from paper ID month)
+- Submission date patterns: "Submitted on [date]", "Originally submitted [date]", "Submitted [date]", "Submission date: [date]", etc.
+- arXiv header format: "arXiv:YYYY.MMDDvN  [category]  D MMM YYYY" (e.g., "arXiv:2207.01510v1  [cs.CY]  8 Jun 2022")
+  In this format, the submission date appears at the end: "8 Jun 2022" (day, abbreviated month, year)
+- Look in headers, footers, and metadata sections
+- Dates may be in various formats: "August 11, 2016", "2016-08-11", "11 Aug 2016", "8 Jun 2022", etc.
+
+IMPORTANT: The submission date is often found near the top or bottom of the first page, in small text, or in a metadata section. Look carefully for any date-related text. Pay special attention to arXiv header lines that follow the pattern "arXiv:XXXX.XXXXXvN  [category]  D MMM YYYY" where the date at the end is the submission date.
+
+Return JSON with:
+- paper_id: arXiv paper ID (if found in text, otherwise use provided value)
+- submission_date: Date in YYYY-MM-DD format (null if not found)
+- submission_date_text: Raw submission date text from PDF (exact text as it appears)
+- submission_month: Month in YYYY-MM format (null if not found)
+- confidence: 0.0-1.0 confidence score (higher if submission date found, lower if only paper ID found)"""
+
+            user_prompt = f"""Extract metadata from this arXiv PDF content (pages 1-{max_pages_to_check}):
+
+{combined_text}
+
+PDF Creation Date: {pdf_metadata.get('creationDate', 'N/A')}
+PDF Modification Date: {pdf_metadata.get('modDate', 'N/A')}
+Paper ID from URL: {paper_id if paper_id else 'Not available'}
+Inferred submission month from paper ID: {inferred_month if inferred_month else 'Not available (paper ID format: YYMM.XXXXX)'}
+
+Extract all available metadata. Pay special attention to any date information, especially near the top or bottom of pages."""
+
+            response = self.llm_service.call_with_system_prompt(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=0.0,
+                response_format={'type': 'json_object'},
+            )
+
+            from ..utils.json_utils import extract_json_from_text
+
+            json_text = extract_json_from_text(response)
+            metadata = json.loads(json_text)
+
+            result = {
+                'paper_id': metadata.get('paper_id') or paper_id,
+                'submission_date': metadata.get('submission_date'),
+                'submission_date_text': metadata.get('submission_date_text'),
+                'submission_month': metadata.get('submission_month'),
+                'confidence': metadata.get('confidence', 0.0),
+            }
+
+            # Fallback: If no submission month found but we can infer from paper ID, use it
+            if not result['submission_month'] and inferred_month:
+                result['submission_month'] = inferred_month
+                self.logger.info(
+                    f'No explicit submission month found in PDF, using inferred month from paper ID: {inferred_month}'
+                )
+                # If confidence is low, increase it slightly since we have inferred month
+                if result['confidence'] < 0.5:
+                    result['confidence'] = 0.6
+
+            if result['submission_date']:
+                self.logger.info(
+                    f'Extracted arXiv metadata - Date: {result["submission_date"]}, '
+                    f'Paper ID: {result["paper_id"]}, Confidence: {result["confidence"]:.2f}'
+                )
+            elif result['submission_month']:
+                self.logger.info(
+                    f'Extracted arXiv metadata - Month: {result["submission_month"]}, '
+                    f'Paper ID: {result["paper_id"]}, Confidence: {result["confidence"]:.2f}'
+                )
+
+            return result
+
+        except Exception as e:
+            self.logger.warning(
+                f'Failed to extract arXiv metadata from PDF: {e}', exc_info=True
+            )
+            return None
+
+    def extract_arxiv_metadata_from_pdf_no_llm(
+        self, attachment: Attachment
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Extract arXiv metadata without using LLM - uses PDF metadata and regex patterns.
+
+        This method extracts submission dates using:
+        1. PDF document metadata (creation date)
+        2. Regex pattern matching on first page text
+        3. Header/footer text extraction
+
+        Args:
+            attachment: PDF attachment to extract metadata from.
+
+        Returns:
+            Dictionary with keys:
+            - paper_id: arXiv paper ID (extracted from URL if available)
+            - submission_date: Original submission date (YYYY-MM-DD format if found)
+            - submission_date_text: Raw submission date text from PDF
+            - submission_month: Month of submission (YYYY-MM format if found)
+            - confidence: Confidence score (0.0-1.0)
+            None if extraction fails.
+        """
+        try:
+            import re
+
+            import fitz  # type: ignore # PyMuPDF
+        except ImportError:
+            self.logger.warning('PyMuPDF not available for arXiv metadata extraction')
+            return None
+
+        try:
+            # Extract paper ID from URL if available
+            paper_id = None
+            if hasattr(attachment, 'metadata') and attachment.metadata:
+                source_url = attachment.metadata.get('source_url', '')
+                if source_url:
+                    # Extract arXiv paper ID from URL
+                    arxiv_match = re.search(
+                        r'arxiv\.org/(?:abs|pdf)/([\d.]+)', source_url, re.IGNORECASE
+                    )
+                    if arxiv_match:
+                        paper_id = arxiv_match.group(1)
+                        # Remove version suffix if present
+                        paper_id = re.sub(r'v\d+$', '', paper_id)
+
+            # Open PDF and extract metadata
+            pdf_document = fitz.open(stream=attachment.data, filetype='pdf')
+            if len(pdf_document) == 0:
+                pdf_document.close()
+                return {'paper_id': paper_id} if paper_id else None
+
+            # Get PDF document metadata (title, author, creation date, etc.)
+            pdf_metadata = pdf_document.metadata
+            creation_date = pdf_metadata.get('creationDate', '')
+
+            # Extract first page text (where submission info is typically found)
+            first_page = pdf_document[0]
+            first_page_text = first_page.get_text().strip()
+
+            # Also try to get text from header/footer areas
+            blocks = first_page.get_text('dict')['blocks']
+            header_footer_text = ''
+            page_height = first_page.rect.height
+
+            for block in blocks:
+                if 'bbox' in block and 'lines' in block:
+                    bbox = block['bbox']
+                    # Check if block is in header (top 15%) or footer (bottom 15%)
+                    if bbox[1] < page_height * 0.15 or bbox[3] > page_height * 0.85:
+                        for line in block.get('lines', []):
+                            if 'spans' in line:
+                                for span in line.get('spans', []):
+                                    header_footer_text += span.get('text', '') + ' '
+
+            # Combine first page text with header/footer text
+            combined_text = (
+                first_page_text + '\n\n' + header_footer_text.strip()
+            ).strip()
+
+            pdf_document.close()
+
+            if not combined_text:
+                self.logger.warning('No text found in first page of PDF')
+                return {'paper_id': paper_id} if paper_id else None
+
+            # Use regex patterns to find submission dates
+            submission_date = None
+            submission_date_text = None
+            submission_month = None
+
+            # Pattern 1: "Submitted on [date]" or "Originally submitted [date]"
+            # Match various date formats
+            date_patterns = [
+                # YYYY-MM-DD format
+                r'(?:submitted|originally submitted|submission date)[:\s]+(\d{4}[-/]\d{1,2}[-/]\d{1,2})',
+                # Month DD, YYYY format
+                r'(?:submitted|originally submitted|submission date)[:\s]+([A-Za-z]+\s+\d{1,2},?\s+\d{4})',
+                # DD Month YYYY format
+                r'(?:submitted|originally submitted|submission date)[:\s]+(\d{1,2}\s+[A-Za-z]+\s+\d{4})',
+                # MM/DD/YYYY format
+                r'(?:submitted|originally submitted|submission date)[:\s]+(\d{1,2}/\d{1,2}/\d{4})',
+                # Just look for dates near "submitted" keywords
+                r'submitted[:\s]+([A-Za-z]+\s+\d{1,2},?\s+\d{4})',
+                r'submitted[:\s]+(\d{4}[-/]\d{1,2}[-/]\d{1,2})',
+            ]
+
+            for pattern in date_patterns:
+                match = re.search(pattern, combined_text, re.IGNORECASE)
+                if match:
+                    date_str = match.group(1).strip()
+                    submission_date_text = match.group(0).strip()
+                    # Try to parse the date
+                    submission_date = self._parse_date_string(date_str)
+                    if submission_date:
+                        submission_month = submission_date[:7]  # YYYY-MM
+                        break
+
+            # If no submission date found, try to extract from PDF creation date
+            if not submission_date and creation_date:
+                # PDF dates are in format: D:YYYYMMDDHHmmSSOHH'mm'
+                pdf_date_match = re.search(r'D:(\d{4})(\d{2})(\d{2})', creation_date)
+                if pdf_date_match:
+                    year, month, day = pdf_date_match.groups()
+                    submission_date = f'{year}-{month}-{day}'
+                    submission_month = f'{year}-{month}'
+                    submission_date_text = f'PDF creation date: {creation_date}'
+
+            result = {
+                'paper_id': paper_id,
+                'submission_date': submission_date,
+                'submission_date_text': submission_date_text,
+                'submission_month': submission_month,
+                'confidence': 0.8 if submission_date else 0.0,
+            }
+
+            if result['submission_date']:
+                self.logger.info(
+                    f'Extracted arXiv submission date (regex): {result["submission_date"]}'
+                )
+            else:
+                self.logger.debug('No submission date found in PDF content (regex)')
+
+            return result
+
+        except Exception as e:
+            self.logger.warning(
+                f'Failed to extract arXiv metadata from PDF (regex): {e}', exc_info=True
+            )
+            return None
+
+    def _parse_date_string(self, date_str: str) -> Optional[str]:
+        """
+        Parse various date string formats into YYYY-MM-DD format.
+
+        Args:
+            date_str: Date string in various formats.
+
+        Returns:
+            Date in YYYY-MM-DD format or None if parsing fails.
+        """
+        import re
+        from datetime import datetime
+
+        # Try different date formats
+        date_formats = [
+            '%Y-%m-%d',
+            '%Y/%m/%d',
+            '%B %d, %Y',  # June 15, 2022
+            '%B %d %Y',  # June 15 2022
+            '%d %B %Y',  # 15 June 2022
+            '%m/%d/%Y',  # 06/15/2022
+            '%d/%m/%Y',  # 15/06/2022
+        ]
+
+        # Clean up the date string
+        date_str = date_str.strip()
+
+        for fmt in date_formats:
+            try:
+                dt = datetime.strptime(date_str, fmt)
+                return dt.strftime('%Y-%m-%d')
+            except ValueError:
+                continue
+
+        # Try to extract year-month-day from numeric formats
+        numeric_match = re.search(r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})', date_str)
+        if numeric_match:
+            year, month, day = numeric_match.groups()
+            try:
+                dt = datetime(int(year), int(month), int(day))
+                return dt.strftime('%Y-%m-%d')
+            except ValueError:
+                pass
+
+        return None

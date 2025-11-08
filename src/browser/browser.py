@@ -486,6 +486,7 @@ class Browser:
             self.logger.error(f'Click failed: {e}', exc_info=True)
             return {'success': False, 'error': str(e)}
 
+
     def find_link(
         self,
         page_data: Dict[str, Any],

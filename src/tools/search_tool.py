@@ -1,4 +1,4 @@
-"""Search functionality using Google Custom Search API."""
+"""Search functionality using Serper API."""
 
 import logging
 import os
@@ -10,7 +10,7 @@ from ..models import SearchResult
 
 
 class SearchTool:
-    """Tool for performing web searches using Google Custom Search API."""
+    """Tool for performing web searches using Serper API."""
 
     def __init__(self, logger: logging.Logger):
         """
@@ -20,76 +20,76 @@ class SearchTool:
             logger: Logger instance.
         """
         self.logger = logger
+        # Default API key, can be overridden by environment variable
+        self.default_api_key = 'cbf9fdb489521d2528d60175f2e5665e71ee6904'
 
-    def search(
-        self, query: str, num_results: int = 5, search_type: str = 'web'
-    ) -> List[SearchResult]:
+    def search(self, query: str, num_results: int = 5) -> List[SearchResult]:
         """
-        Performs a web or specialized search using Google Custom Search API.
+        Performs a web search using Serper API.
 
-        Requires GOOGLE_API_KEY and GOOGLE_CX (Custom Search Engine ID) in .env file.
-        Falls back to mock results if API keys are not configured.
+        Uses SERPER_API_KEY from environment if available, otherwise uses default key.
+        Falls back to empty results if API request fails.
 
         Args:
             query: Search query string.
             num_results: Number of results to return (default: 5).
-            search_type: Type of search (default: 'web').
 
         Returns:
             List of SearchResult objects.
         """
-        self.logger.info(f"Tool 'search' called (type: {search_type}).")
+        self.logger.info("Tool 'search' called.")
         self.logger.info(f'Search query: {query}')
 
         try:
-            # Get Google API credentials from environment
-            api_key = os.getenv('GOOGLE_API_KEY') or os.getenv('GOOGLE_SEARCH_API_KEY')
-            cx = os.getenv('GOOGLE_CX') or os.getenv('GOOGLE_SEARCH_CX_ID')
+            # Get Serper API key from environment or use default
+            api_key = os.getenv('SERPER_API_KEY') or self.default_api_key
 
-            # Fallback to mock results if API keys are not configured
-            if not api_key or not cx:
+            if not api_key:
                 self.logger.warning(
-                    'Google API keys not found. Using fallback mock results. '
-                    'Set GOOGLE_API_KEY and GOOGLE_CX in .env for real search.'
+                    'Serper API key not found. Using fallback empty results. '
+                    'Set SERPER_API_KEY in .env for real search.'
                 )
                 results = []
                 self.logger.info(f'Search returned {len(results)} result(s) (mock).')
                 return results
 
-            # Perform real Google Custom Search API request
-            url = 'https://www.googleapis.com/customsearch/v1'
-            params = {
-                'key': api_key,
-                'cx': cx,
+            # Perform Serper API request using google.serper.dev endpoint
+            url = 'https://google.serper.dev/search'
+            headers = {
+                'X-API-KEY': api_key,
+                'Content-Type': 'application/json',
+            }
+            payload = {
                 'q': query,
-                'num': min(
-                    num_results, 10
-                ),  # Google API limits to 10 results per request
+                'num': min(num_results, 100),  # Serper API supports up to 100 results
+                'gl': 'us',  # Fixed geographic location to disable location-based personalization
+                'hl': 'en',  # Fixed language to disable language-based personalization
             }
 
-            self.logger.info(f'Calling Google Custom Search API with query: "{query}"')
-            response = requests.get(url, params=params, timeout=10)
+            self.logger.info(f'Calling Serper API with query: "{query}"')
+            response = requests.post(url, headers=headers, json=payload, timeout=10)
             response.raise_for_status()
 
             data = response.json()
             results = []
 
-            # Parse search results
-            if 'items' in data:
-                for item in data['items'][:num_results]:
+            # Parse search results from Serper API response
+            # Serper returns results in 'organic' field
+            if 'organic' in data:
+                for idx, item in enumerate(data['organic'][:num_results]):
                     results.append(
                         SearchResult(
                             snippet=item.get('snippet', ''),
                             url=item.get('link', ''),
                             title=item.get('title', ''),
-                            relevance_score=float(item.get('rank', 0))
-                            if 'rank' in item
-                            else 0.0,
+                            relevance_score=float(
+                                idx + 1
+                            ),  # Use position as relevance score
                         )
                     )
 
             self.logger.info(
-                f'Search returned {len(results)} result(s) from Google API.'
+                f'Search returned {len(results)} result(s) from Serper API.'
             )
             return results
 
@@ -99,4 +99,3 @@ class SearchTool:
         except Exception as e:
             self.logger.error(f'Search FAILED: {e}', exc_info=True)
             return []
-

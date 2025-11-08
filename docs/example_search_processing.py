@@ -79,11 +79,6 @@ def main():
 
     query_analysis = {
         'explicit_requirements': ['climate change research', 'published in 2020'],
-        'implicit_requirements': ['peer-reviewed papers', 'scientific sources'],
-        'constraints': {
-            'temporal': ['year: 2020'],
-            'categorical': ['topic: climate change'],
-        },
     }
 
     # Process search results
@@ -138,11 +133,6 @@ def main():
 
     query_analysis = {
         'explicit_requirements': ['count articles', 'machine learning', 'June 2023'],
-        'implicit_requirements': ['use ArXiv archive', 'accurate count'],
-        'constraints': {
-            'temporal': ['month: June 2023'],
-            'categorical': ['topic: machine learning'],
-        },
     }
 
     processing_result = search_processor.process_search_results(
@@ -190,11 +180,6 @@ def main():
 
     query_analysis = {
         'explicit_requirements': ['Tokyo population', 'year 2020'],
-        'implicit_requirements': ['official statistics', 'accurate numbers'],
-        'constraints': {
-            'temporal': ['year: 2020'],
-            'spatial': ['location: Tokyo'],
-        },
     }
 
     processing_result = search_processor.process_search_results(

@@ -285,10 +285,8 @@ class AnswerSynthesizer:
         # If no image analysis, just truncate
         return self._truncate(result_str, self.MAX_CONTEXT_PER_SUBTASK)
 
-    def _build_requirements_str(
-        self, explicit_requirements: List[str], implicit_requirements: List[str]
-    ) -> str:
-        all_requirements = (explicit_requirements or []) + (implicit_requirements or [])
+    def _build_requirements_str(self, explicit_requirements: List[str]) -> str:
+        all_requirements = explicit_requirements or []
         if not all_requirements:
             return ''
         lines = ['\nCRITICAL ANSWER REQUIREMENTS:']
@@ -314,6 +312,26 @@ class AnswerSynthesizer:
                 '\nFORMAT CONSTRAINT ACTIVE: Answer MUST strictly follow the requirements above.'
             )
         return '\n'.join(lines)
+
+    def _build_query_analysis_str(self, query_analysis: Dict[str, Any]) -> str:
+        """Build a formatted string from query analysis for the prompt."""
+        lines = ['Query Analysis:']
+
+        # Add answer format if present
+        answer_format = query_analysis.get('answer_format', '')
+        if answer_format:
+            if isinstance(answer_format, dict):
+                # If answer_format is a dict, extract relevant instruction
+                format_str = answer_format.get(
+                    'for_final_factual_answer',
+                    answer_format.get('for_this_analysis_step', str(answer_format)),
+                )
+            else:
+                format_str = str(answer_format)
+            if format_str:
+                lines.append(f'Answer Format: {format_str}')
+
+        return '\n'.join(lines) if len(lines) > 1 else ''
 
     def _build_attachment_info(self, attachments: Optional[List['Attachment']]) -> str:
         if not attachments:
@@ -364,21 +382,6 @@ class AnswerSynthesizer:
 
         return '\n'.join(lines)
 
-    def _build_reasoning_summary_str(self, reasoning_summary: Dict[str, Any]) -> str:
-        if not reasoning_summary:
-            return ''
-        acc: List[str] = ['## Reasoning Summary (condensed)']
-        used = 0
-        for key, value in reasoning_summary.items():
-            if used >= self.MAX_REASONING_SECTION:
-                break
-            value_str = self._truncate(
-                str(value), min(500, self.MAX_REASONING_SECTION - used)
-            )
-            acc.append(f'\n### {key}\n{value_str}')
-            used += len(value_str)
-        return '\n'.join(acc)
-
     def _build_knowledge_facts_str(self) -> str:
         facts = [
             {'entity': f.entity, 'relationship': f.relationship, 'value': f.value}
@@ -393,45 +396,85 @@ class AnswerSynthesizer:
             facts_str = str(limited)
         return '## Knowledge Graph Facts\n' + facts_str
 
-    def _build_system_prompt(self) -> str:
+    def _build_system_prompt(self, query_analysis: Dict[str, Any] = None) -> str:
         """
         Concise, strict system prompt to minimize tokens while enforcing rules.
         """
-        return (
+        base_prompt = (
             'CRITICAL: Respond with a single valid JSON object only. No markdown, no extra text.\n'
             'Role: Expert answer synthesizer. Combine evidence to produce a precise final answer.\n\n'
             'Output schema: {"final_answer": string, "description": string}.\n\n'
             'Rules:\n'
             '- final_answer MUST strictly follow all format constraints (e.g., single word, number only, date, zip).\n'
             "- Use EXACT extracted values found in execution results: sections 'Extracted Structured Data' or 'Key Values for Calculations', fields 'extracted_counts' or 'llm_extraction' are authoritative.\n"
+            '- When execution results contain reasoning or analysis, identify the specific conclusion or answer that directly solves the problem, not intermediate steps or discussed concepts.\n'
+            '- Distinguish between what is analyzed or discussed in reasoning versus what is determined to be the actual answer to the problem.\n'
+            '- If the problem asks for a character name, extract the NAME (the word used to refer to the character), not the character symbol or code that uses it.\n'
             '- Do NOT add units unless explicitly required.\n'
-            '- For characters/symbols, return the NAME (e.g., backtick, dot, comma).\n'
-            "- If reasoning_summary identifies a 'best_ball' (or explicit optimal number), use it as final_answer.\n"
             '- No explanations or meta-text in final_answer.\n\n'
-            'Return only the JSON object.'
         )
+
+        # Add general terminology guidance when ambiguity is possible
+        if query_analysis and query_analysis.get('has_terminology_ambiguity'):
+            terminology_context = query_analysis.get('terminology_context', '').lower()
+
+            terminology_guidance = '\nCRITICAL: TERMINOLOGY SELECTION GUIDANCE\n'
+            terminology_guidance += (
+                '- When multiple valid terms/names exist for the same concept, prioritize the most commonly recognized and widely used term\n'
+                '- Prefer the term that is most standard and frequently used in the relevant domain or context\n'
+                '- Select the term that is most unambiguous and clearly understood by the broadest audience\n'
+                '- When domain-specific terminology exists, use the term that is most standard within that domain\n'
+                '- Avoid less common or alternative names when a more standard term is available\n'
+                '- Consider the term that would be most immediately recognizable and unambiguous to experts in the field\n'
+                '- Follow any explicit requirements about term length or form while maintaining clarity and standard usage\n'
+            )
+
+            if terminology_context:
+                terminology_guidance += f'- The context is: {terminology_context}\n'
+                terminology_guidance += (
+                    f'- Prefer terminology standard in {terminology_context} contexts\n'
+                )
+
+            base_prompt += terminology_guidance + '\n'
+
+        base_prompt += 'Return only the JSON object.'
+        return base_prompt
 
     def _build_user_prompt(
         self,
         problem: str,
-        answer_format_str: str,
+        query_analysis: Dict[str, Any],
         requirements_str: str,
         attachment_info: str,
         execution_summary_str: str,
-        reasoning_summary_str: str,
         knowledge_facts_str: str,
     ) -> str:
+        # Build query analysis section
+        query_analysis_str = self._build_query_analysis_str(query_analysis)
+
+        # Add terminology context if relevant
+        terminology_info = ''
+        if query_analysis.get('has_terminology_ambiguity'):
+            context = query_analysis.get('terminology_context', '')
+            if context:
+                terminology_info = f'\nTerminology Context: {context}\n'
+                terminology_info += 'When multiple valid terms exist, prioritize the most commonly recognized and widely used term in this context. Prefer the most standard and frequently used terminology while following any explicit requirements.\n'
+
         return (
             f'Problem:\n{problem}\n\n'
-            f'Answer Format Requirements:\n{answer_format_str}\n'
+            f'{query_analysis_str}\n'
+            f'{terminology_info}'
             f'{requirements_str}\n\n'
             f'Available Sources:{attachment_info}\n\n'
             f'{execution_summary_str}\n\n'
-            f'{reasoning_summary_str}\n\n'
             f'{knowledge_facts_str}\n\n'
             'Instructions:\n'
             '- Extract the exact answer that matches the format.\n'
             "- For calculations, use values shown under 'Key Values for Calculations' exactly.\n"
+            '- When execution results contain step-by-step reasoning or analysis, identify the final conclusion or answer that the reasoning leads to.\n'
+            '- If the reasoning discusses multiple concepts or mentions various terms, extract the specific answer that directly addresses the problem question.\n'
+            '- When the problem asks for a character name, ensure you extract the NAME of the character (the word used to refer to it), not the character symbol itself.\n'
+            '- Distinguish between what the reasoning discusses or analyzes versus what it concludes is the actual answer.\n'
             '- Show brief work in description, but keep final_answer strictly formatted.\n'
         )
 
@@ -452,9 +495,7 @@ class AnswerSynthesizer:
         Returns:
             Corrected answer that matches format requirements.
         """
-        all_requirements = query_analysis.get(
-            'explicit_requirements', []
-        ) + query_analysis.get('implicit_requirements', [])
+        all_requirements = query_analysis.get('explicit_requirements', [])
         requirements_text = ' '.join(all_requirements).lower()
 
         # Check if format requires a single word
@@ -532,7 +573,7 @@ class AnswerSynthesizer:
 
         Args:
             problem: Original problem statement.
-            execution_results: Results from plan execution, containing execution_summary and reasoning_summary.
+            execution_results: Results from plan execution, containing execution_summary.
             query_analysis: Query analysis with answer format requirements.
             attachments: Optional list of file attachments (including downloaded files).
 
@@ -543,52 +584,33 @@ class AnswerSynthesizer:
         """
         self.logger.info('Synthesizing final report answer')
 
-        system_prompt = self._build_system_prompt()
+        system_prompt = self._build_system_prompt(query_analysis)
 
-        # Extract and simplify answer_format to avoid confusion
-        answer_format_raw = query_analysis.get('answer_format', 'text')
-        if isinstance(answer_format_raw, dict):
-            # If answer_format is a dict, extract the relevant instruction
-            answer_format_str = answer_format_raw.get(
-                'for_final_factual_answer',
-                answer_format_raw.get('for_this_analysis_step', str(answer_format_raw)),
-            )
-        else:
-            answer_format_str = str(answer_format_raw)
-
-        # Extract explicit and implicit requirements for format constraints
+        # Extract explicit requirements for format constraints
         explicit_requirements = query_analysis.get('explicit_requirements', [])
-        implicit_requirements = query_analysis.get('implicit_requirements', [])
 
         # Build requirements section for prompt (condensed)
-        requirements_str = self._build_requirements_str(
-            explicit_requirements, implicit_requirements
-        )
+        requirements_str = self._build_requirements_str(explicit_requirements)
 
         # Build attachment information for the prompt (compact)
         attachment_info = self._build_attachment_info(attachments)
 
         # Build comprehensive but condensed execution summary
         execution_summary = execution_results.get('execution_summary', {})
-        reasoning_summary = execution_results.get('reasoning_summary', {})
 
         execution_summary_str = self._build_execution_summary_str(
             execution_summary, query_analysis
         )
-
-        # Format reasoning summary (condensed)
-        reasoning_summary_str = self._build_reasoning_summary_str(reasoning_summary)
 
         # Format knowledge graph facts (limited)
         knowledge_facts_str = self._build_knowledge_facts_str()
 
         user_prompt = self._build_user_prompt(
             problem=problem,
-            answer_format_str=answer_format_str,
+            query_analysis=query_analysis,
             requirements_str=requirements_str,
             attachment_info=attachment_info,
             execution_summary_str=execution_summary_str,
-            reasoning_summary_str=reasoning_summary_str,
             knowledge_facts_str=knowledge_facts_str,
         )
 
@@ -598,6 +620,7 @@ class AnswerSynthesizer:
                 user_prompt=user_prompt,
                 temperature=0.3,  # Maximum determinism for consistent answer formatting
                 response_format={'type': 'json_object'},
+                max_tokens=4096,
             )
 
             # Validate response exists
@@ -693,118 +716,3 @@ class AnswerSynthesizer:
                 'final_answer': fallback_answer,
                 'description': 'Exception occurred during answer synthesis',
             }
-
-    def build_monologue(
-        self,
-        problem: str,
-        query_analysis: Dict[str, Any],
-        problem_classification: Dict[str, Any],
-        plan: List[Any],
-        execution_results: Dict[str, Any],
-        synthesis: Dict[str, Any],
-    ) -> str:
-        """
-        Build human-readable reasoning monologue.
-
-        Args:
-            problem: Original problem.
-            query_analysis: Query analysis.
-            problem_classification: Problem classification.
-            plan: Execution plan.
-            execution_results: Execution results.
-            synthesis: Final synthesis.
-
-        Returns:
-            Formatted monologue string.
-        """
-        self.logger.info('Building reasoning monologue')
-
-        system_prompt = """You are creating a human-readable reasoning monologue.
-Convert the problem-solving process into a clear, step-by-step narrative in first person.
-
-The monologue should:
-- Be written in first person ("I", "my")
-- Follow markdown formatting with headers (##)
-- Explain each step clearly
-- Show the reasoning process
-- Be professional but accessible
-
-Format the monologue with sections like:
-## Initiating Breakdown
-## Step 1: [Description]
-## Step 2: [Description]
-...
-## Final Answer"""
-
-        # Extract only key values from execution results (simplified)
-        execution_summary = execution_results.get('execution_summary', {})
-        key_values = []
-
-        for subtask_id, result in execution_summary.items():
-            if isinstance(result, dict) and result.get('status') == 'failed':
-                continue
-            if isinstance(result, str) and (
-                result.startswith('Error:')
-                or result.startswith('Name Error:')
-                or result.startswith('Execution Error:')
-            ):
-                continue
-
-            if isinstance(result, dict):
-                # Extract key values only
-                if 'extracted_counts' in result and result.get('extracted_counts'):
-                    for count_item in result['extracted_counts'][
-                        :2
-                    ]:  # Limit to 2 per subtask
-                        value = count_item.get('value')
-                        if value is not None:
-                            key_values.append(f'Subtask {subtask_id}: {value}')
-                elif 'llm_extraction' in result and result.get('llm_extraction'):
-                    extracted_value = result['llm_extraction'].get('extracted_value')
-                    if extracted_value is not None:
-                        key_values.append(f'Subtask {subtask_id}: {extracted_value}')
-
-        # Build simplified user prompt
-        problem_type = problem_classification.get('primary_type', 'Unknown')
-        plan_steps = len(plan)
-        final_answer = synthesis.get('final_answer', 'N/A')
-
-        # Summarize query analysis (avoid full JSON dump)
-        query_summary = query_analysis.get('answer_format', 'text')
-        if isinstance(query_summary, dict):
-            query_summary = str(query_summary.get('for_final_factual_answer', 'text'))
-
-        values_str = '\n'.join(key_values[:10]) if key_values else 'None'
-
-        user_prompt = f"""Problem: {problem}
-
-Problem Type: {problem_type}
-Answer Format: {query_summary}
-Execution Steps: {plan_steps}
-Final Answer: {final_answer}
-
-Key Values Found:
-{values_str}
-
-Create a reasoning monologue explaining how the problem was solved."""
-
-        try:
-            monologue = self.llm_service.call_with_system_prompt(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                temperature=0.3,
-            )
-            return monologue
-        except Exception as e:
-            self.logger.error(f'Monologue generation failed: {e}')
-            return f"""## Initiating Breakdown
-I analyzed the problem: {problem}
-
-## Problem Classification
-Problem type: {problem_classification.get('primary_type', 'Unknown')}
-
-## Execution
-Executed {len(plan)} steps with {len(execution_results.get('execution_summary', {}))} results.
-
-## Final Answer
-{synthesis.get('final_answer', 'Unable to determine answer')}"""

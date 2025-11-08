@@ -2,9 +2,11 @@
 
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from ..llm import LLMService
+from ..state import Subtask
 from ..utils import extract_json_from_text
 
 
@@ -23,21 +25,24 @@ class QueryUnderstanding:
         self.logger = logger
 
     def analyze(
-        self, problem: str, attachments: Optional[List[Any]] = None
+        self,
+        problem: str,
+        attachments: Optional[List[Any]] = None,
+        subtasks: Optional[List[Subtask]] = None,
     ) -> Dict[str, Any]:
         """
         Analyze a problem query to extract requirements and dependencies.
+        Assigns step numbers to requirements based on previously generated subtasks.
 
         Args:
             problem: The problem description.
             attachments: Optional list of attachments.
+            subtasks: Optional list of subtasks (if provided, requirements will be assigned to matching steps).
 
         Returns:
             Dictionary containing:
-            - explicit_requirements: List of explicit requirements
-            - implicit_requirements: List of implicit requirements
+            - explicit_requirements: List of explicit requirements with step numbers
             - dependencies: List of information dependencies
-            - constraints: Dictionary of constraints (temporal, spatial, categorical)
             - answer_format: Expected answer format
             - cross_references: List of cross-references between data sources
         """
@@ -47,30 +52,71 @@ class QueryUnderstanding:
         if attachments:
             attachment_info = f'\nAttachments: {[a.filename for a in attachments]}'
 
+        # Build subtasks context if provided
+        subtasks_context = ''
+        if subtasks:
+            subtasks_context = (
+                '\n\nGenerated Subtasks (assign requirements to these steps):\n'
+            )
+            for i, subtask in enumerate(subtasks, 1):
+                # Extract step number from subtask ID (e.g., "step_1" -> 1)
+                step_num_match = re.search(r'step_(\d+)', subtask.id)
+                step_num = step_num_match.group(1) if step_num_match else str(i)
+                subtasks_context += (
+                    f'  Step {step_num} (id: {subtask.id}): {subtask.description}\n'
+                )
+            subtasks_context += (
+                '\nIMPORTANT: Assign each requirement to the step number that matches the subtask ID. '
+                'For example, if subtask id is "step_1", assign requirements as "Step 1: requirement text".\n'
+            )
+
         system_prompt = """You are an expert at analyzing complex problem queries.
 Analyze the given problem and extract:
 1. Explicit requirements (stated directly)
-2. Implicit requirements (inferred from context)
-3. Information dependencies (what information is needed and in what order)
-4. Constraints (temporal, spatial, categorical)
-5. Answer format requirements
-6. Cross-references between different data sources
+2. Information dependencies (what information is needed and in what order)
+3. Answer format requirements
+4. Cross-references between different data sources
+5. **Terminology context** (when terminology choice matters)
+
+CRITICAL: TERMINOLOGY AMBIGUITY DETECTION
+- Detect if the problem asks for names, terms, or identifiers that might have multiple valid forms
+- Identify cases where a single concept, character, symbol, or entity may be referred to by different names or terms
+- When terminology ambiguity is possible, identify the domain/context where terminology matters
+- Consider that some concepts may have both common names and alternative names, or both technical and general terms
+- This helps ensure answers use context-appropriate, unambiguous terminology
+- The domain context helps select the most appropriate term when multiple valid options exist
+- Set has_terminology_ambiguity to true whenever the answer could legitimately be expressed using different but equally valid terminology
+
+CRITICAL RULES FOR EXPLICIT REQUIREMENTS:
+- Explicit requirements are CONSTRAINTS/CONDITIONS that must be satisfied, NOT action items or tasks
+- DO NOT include action verbs like "Identify", "Locate", "Determine", "Find", "Search", "Provide"
+- Extract the constraints/conditions from the problem, not the action verbs
+- Each requirement should describe WHAT must be true/satisfied, not WHAT to do
+- Requirements should be verifiable conditions that can be checked against results
+
+CRITICAL: STEP NUMBER ASSIGNMENT
+- If subtasks are provided, you MUST assign each requirement to the correct step number
+- Match requirements to subtasks based on which step the requirement applies to
+- Use the step number from the subtask ID (e.g., subtask id="step_1" → assign as "Step 1: requirement")
+- Each requirement should be tagged with "Step N:" where N matches the subtask step number
+- Requirements that apply to multiple steps should be assigned to the most relevant step
+- If no subtasks are provided, analyze the problem and assign step numbers based on logical flow
 
 Return your analysis as a JSON object with these keys:
-- explicit_requirements: list of strings
-- implicit_requirements: list of strings
+- explicit_requirements: list of strings (constraints/conditions with step context, e.g., "Step 1: requirement text", "Step 2: requirement text")
 - dependencies: list of strings describing information needs
-- constraints: object with keys: temporal, spatial, categorical (each a list)
 - answer_format: string describing expected format
 - cross_references: list of strings describing cross-references
+- has_terminology_ambiguity: boolean (true if the answer might have multiple valid forms due to terminology)
+- terminology_context: string describing the domain/context where terminology matters (e.g., "programming", "typography", "mathematics", "linguistics", "general", or empty if not applicable)
 
-Be thorough and precise.
+Be thorough and precise. Assign requirements to the correct step numbers based on the provided subtasks.
 
 IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
 
-        user_prompt = f"""Problem: {problem}{attachment_info}
+        user_prompt = f"""Problem: {problem}{attachment_info}{subtasks_context}
 
-Analyze this problem and provide a structured breakdown of requirements and dependencies."""
+Analyze this problem and assign requirements to the correct step numbers based on the generated subtasks."""
 
         try:
             response = self.llm_service.call_with_system_prompt(
@@ -84,7 +130,7 @@ Analyze this problem and provide a structured breakdown of requirements and depe
             analysis = json.loads(json_text)
             self.logger.info(
                 f'Query analysis complete: {len(analysis.get("explicit_requirements", []))} '
-                f'explicit, {len(analysis.get("implicit_requirements", []))} implicit requirements'
+                f'explicit requirements'
             )
             return analysis
         except json.JSONDecodeError as e:
@@ -93,9 +139,7 @@ Analyze this problem and provide a structured breakdown of requirements and depe
             # Fallback to basic structure
             return {
                 'explicit_requirements': [problem],
-                'implicit_requirements': [],
                 'dependencies': [],
-                'constraints': {'temporal': [], 'spatial': [], 'categorical': []},
                 'answer_format': 'text',
                 'cross_references': [],
             }

@@ -85,20 +85,13 @@ class AnswerValidator:
 
         # Truncate execution summary and reasoning summary to prevent prompt from being too long
         # Limit execution summary to avoid API errors
-        execution_summary_json = json.dumps(execution_summary, indent=2)
+        execution_summary_json = json.dumps(
+            execution_summary, indent=2, ensure_ascii=False
+        )
         max_execution_length = 8000  # Limit execution summary length
         if len(execution_summary_json) > max_execution_length:
             execution_summary_json = (
                 execution_summary_json[:max_execution_length] + '\n... [truncated]'
-            )
-
-        reasoning_summary_json = json.dumps(
-            combined_results.get('reasoning_summary', {}), indent=2
-        )
-        max_reasoning_length = 4000  # Limit reasoning summary length
-        if len(reasoning_summary_json) > max_reasoning_length:
-            reasoning_summary_json = (
-                reasoning_summary_json[:max_reasoning_length] + '\n... [truncated]'
             )
 
         # Create improved validation prompt
@@ -114,10 +107,6 @@ ANSWER FORMAT REQUIREMENT:
 EXECUTION STEPS:
 {execution_summary_json}
 
-
-REASONING SUMMARY (Derived Knowledge):
-{reasoning_summary_json}
-
 FINAL ANSWER:
 {final_answer}
 
@@ -126,7 +115,7 @@ Your task is to determine if the final answer is CORRECT for the problem, consid
 
 1. **Answer Correctness**: Does the answer correctly address the problem requirements? Even if some execution steps returned None or had partial results, the answer synthesizer may have successfully combined information from earlier steps.
 
-2. **Format Compliance**: Does the answer match the required format (e.g., if format requires "word", is it a single word? If format requires "number", is it a number? If format requires "zip codes", are they five-digit zip codes?). **CRITICAL: If the problem asks for "the name of a character" or "character name", the answer MUST be a character NAME in words (e.g., "backtick", "dot", "comma") NOT the symbol itself (`, ., ,).**
+2. **Format Compliance**: Does the answer match the required format (e.g., if format requires "word", is it a single word? If format requires "number", is it a number? If format requires "zip codes", are they five-digit zip codes?). **CRITICAL: If the problem asks for "the name of a character" or "character name", the answer MUST be a character NAME in words NOT the symbol itself.**
 
 3. **Information Synthesis**: Consider that the answer synthesizer may have successfully extracted and combined information from multiple execution steps, even if later steps didn't produce perfect results. The presence of "None" in a step doesn't necessarily mean the answer is wrong - it may mean the synthesizer used earlier successful steps.
 

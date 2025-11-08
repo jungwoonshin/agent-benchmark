@@ -77,7 +77,6 @@ Every search result goes through the same structured pipeline:
 - Relevance checking considers:
   - Subtask description
   - Problem requirements
-  - Query analysis constraints
   - Source credibility
 - Returns reasoning for each decision
 
@@ -111,7 +110,7 @@ processing_result = search_processor.process_search_results(
     search_results=search_results,
     subtask_description="Find climate change research from 2020",
     problem="What are the key findings in climate research from 2020?",
-    query_analysis={...},  # Requirements and constraints
+    query_analysis={...},  # Requirements
     attachments=[],
     max_results_to_process=5,
 )
@@ -152,7 +151,7 @@ processing_result = search_processor.process_search_results(
 
 ### LLM Service
 - Called by processor for relevance checking
-- Receives context about problem, requirements, and constraints
+- Receives context about problem and requirements
 - Returns structured decisions with reasoning
 
 ## Documentation

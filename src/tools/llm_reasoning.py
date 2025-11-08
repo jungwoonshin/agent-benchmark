@@ -60,11 +60,29 @@ class LLMReasoningTool:
                     # Handle dependency results specially
                     if isinstance(value, dict):
                         for dep_id, dep_result in value.items():
-                            context_items.append(
-                                f'{dep_id}: {json.dumps(dep_result, indent=2)[:500]}'
-                            )
-                elif isinstance(value, (dict, list)):
-                    # Serialize complex structures
+                            # Extract summary if available (contains full result including image analysis)
+                            if isinstance(dep_result, dict) and 'summary' in dep_result:
+                                summary = dep_result.get('summary', '')
+                                # Include full summary (no truncation) to preserve image analysis
+                                context_items.append(f'{dep_id}: {summary}')
+                            else:
+                                context_items.append(
+                                    f'{dep_id}: {json.dumps(dep_result, indent=2)[:500]}'
+                                )
+                elif isinstance(value, dict):
+                    # For structured context entries, extract summary if available
+                    # This preserves full results including image analysis
+                    if 'summary' in value:
+                        summary = value.get('summary', '')
+                        # Include full summary (no truncation) to preserve image analysis
+                        context_items.append(f'{key}: {summary}')
+                    else:
+                        # Fallback: serialize dict but with larger limit
+                        context_items.append(
+                            f'{key}: {json.dumps(value, indent=2)[:2000]}'
+                        )
+                elif isinstance(value, list):
+                    # Serialize lists
                     context_items.append(f'{key}: {json.dumps(value, indent=2)[:1000]}')
                 else:
                     context_items.append(f'{key}: {str(value)[:500]}')
@@ -83,17 +101,29 @@ Your task:
 3. Perform calculations accurately (mathematical operations, percentages, averages, etc.)
 4. Process and analyze data structures (lists, dictionaries, etc.)
 5. Format conversions (dates, units, etc.)
-6. Provide clear, step-by-step reasoning
-7. Return the final answer or result
+6. Provide clear, step-by-step reasoning with ALL intermediate steps visible
+7. Include the final answer at the end
 
-Be precise with numbers and calculations. Show your work when doing mathematical operations.
+CRITICAL: You must show ALL calculation steps, including:
+- Unit conversions (e.g., dividing by 1000 to convert to thousands)
+- Rounding operations
+- Intermediate calculations
+- Any transformations or processing steps
+
+Be precise with numbers and calculations. Show your complete work - do not skip steps or only provide the final answer.
 If the context contains data from previous steps, use that data in your calculations."""
 
         user_prompt = f"""Task: {task_description}{context_str}
 
 Solve this task step by step. Show your reasoning and calculations clearly.
 Extract and use any relevant data from the context provided.
-Return your final answer or result."""
+
+IMPORTANT: Your response must include:
+1. All step-by-step reasoning and calculations
+2. All intermediate steps (e.g., converting units, dividing by 1000, rounding, etc.)
+3. The final answer at the end
+
+Do NOT skip any calculation steps. Show your complete work, then provide the final answer."""
 
         try:
             self.logger.info(

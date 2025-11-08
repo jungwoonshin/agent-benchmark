@@ -1,7 +1,6 @@
-"""LLM services and reasoning engines."""
+"""LLM services."""
 
 from .llm_service import LLMService
-from .reasoning_engine import ReasoningEngine
 
-__all__ = ['LLMService', 'ReasoningEngine']
+__all__ = ['LLMService']
 
