@@ -88,6 +88,12 @@ When creating subtask descriptions, you MUST follow these universal principles t
    - DO NOT mention "to later determine" or "for later use" in ways that reference information not yet available
    - Instead, describe what THIS step retrieves, and let dependent steps describe how they use it
 
+6. **Unit and Format Preservation**:
+   - When the problem specifies answer units or format requirements, the final subtask description MUST preserve those requirements
+   - DO NOT convert to base units and then round - maintain the unit requirement from the question
+   - Pay attention to unit modifiers in the question and ensure the final answer maintains those units
+   - The description should explicitly state the expected unit format for the final answer
+
 **AVOIDING REDUNDANCY - UNIVERSAL PRINCIPLES**:
 
 Before creating your plan, analyze the problem to identify:
