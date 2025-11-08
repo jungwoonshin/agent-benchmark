@@ -66,7 +66,6 @@ CRITICAL REQUIREMENTS:
 - Remove filler words like "article", "submitted", "descriptors", "about", "related to"
 - Use dates in format: "August 11 2016" or "2016-08-11" or "August 2016"
 - Separate keywords with spaces, NOT commas or special formatting
-- **For paper/research exploration**: If the subtask involves finding academic papers, articles, preprints, or research documents, add "pdf" to prioritize PDF files (e.g., "arXiv AI regulation pdf")
 - Make queries DIFFERENT from the previous ones - try alternative keyword combinations, synonyms, or different phrasings
 - Focus on the core information needed to complete the subtask
 

@@ -404,54 +404,6 @@ class Executor:
         else:
             return self.tool_belt.llm_reasoning(task_description, context)
 
-    def _is_paper_exploration_needed(self, subtask: Subtask, problem: str) -> bool:
-        """
-        Detect if the subtask/problem requires paper exploration (academic papers, research documents).
-
-        Returns:
-            True if paper exploration is needed, False otherwise.
-        """
-        combined_text = f'{problem} {subtask.description}'.lower()
-
-        # Keywords that indicate paper/research exploration
-        paper_keywords = [
-            'paper',
-            'papers',
-            'article',
-            'articles',
-            'publication',
-            'publications',
-            'preprint',
-            'preprints',
-            'manuscript',
-            'research paper',
-            'academic paper',
-            'arxiv',
-            'pubmed',
-            'doi',
-            'scholar',
-            'academic',
-            'research document',
-            'journal article',
-            'conference paper',
-            'thesis',
-            'dissertation',
-            'scientific paper',
-            'peer-reviewed',
-            'citation',
-            'bibliography',
-        ]
-
-        # Check if any paper keywords are present
-        for keyword in paper_keywords:
-            if keyword in combined_text:
-                self.logger.info(
-                    f'Paper exploration detected: keyword "{keyword}" found in problem/subtask'
-                )
-                return True
-
-        return False
-
     def _normalize_search_queries(
         self, subtask: Subtask, parameters: Dict[str, Any]
     ) -> List[str]:
@@ -471,22 +423,6 @@ class Executor:
                     f'Subtask {subtask.id} missing search_queries in metadata. '
                     f'Using description as fallback query: "{fallback_query}"'
                 )
-
-        # Check if paper exploration is needed and modify queries to prioritize PDFs
-        problem = parameters.get('problem', '')
-        if self._is_paper_exploration_needed(subtask, problem):
-            self.logger.info(
-                f'Paper exploration detected for subtask {subtask.id}. '
-                f'Adding pdf to search queries to prioritize PDF files.'
-            )
-            # Add pdf to each query if not already present
-            modified_queries = []
-            for query in search_queries:
-                if ' pdf' not in query.lower() and not query.lower().endswith('pdf'):
-                    modified_queries.append(f'{query} pdf')
-                else:
-                    modified_queries.append(query)
-            search_queries = modified_queries
 
         # Ensure exactly 3 queries
         if len(search_queries) < 3:

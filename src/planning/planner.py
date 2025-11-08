@@ -58,6 +58,36 @@ Given a problem analysis and classification, create a concise execution plan wit
 
 CRITICAL: Create the MINIMUM number of subtasks necessary to solve the problem. Aim for 3-7 essential subtasks maximum.
 
+**CRITICAL: DATA FLOW AND DEPENDENCY CLARITY**
+
+When creating subtask descriptions, you MUST follow these universal principles to ensure logical information flow:
+
+1. **Separation of Retrieval vs. Usage**:
+   - Each subtask description must clearly distinguish between what information this subtask WILL RETRIEVE/FIND (its own output) versus what information it WILL USE (from dependencies)
+   - DO NOT mix these in a way that suggests information is available before it's retrieved
+   - For retrieval steps: Focus on what information will be retrieved from the source
+   - For dependent steps: Clearly state which step provides each piece of information used
+
+2. **Logical Information Flow**:
+   - A subtask description should ONLY reference information that will be available from its dependencies (explicitly listed in dependencies array) OR is part of the original problem statement
+   - DO NOT reference information that will be produced by other subtasks unless those subtasks are listed as dependencies
+   - If information from another step is needed, that step MUST be in the dependencies array
+
+3. **Clear Source Attribution**:
+   - When a subtask retrieves information from a source, clearly state what source provides it and what specific information to retrieve
+   - When a subtask uses information from another step, clearly state which step provides the information and what will be done with it
+   - Ensure each piece of information is attributed to its correct source or step
+
+4. **Dependency-Driven Descriptions**:
+   - If a subtask depends on other steps, its description must explicitly reference those steps and state what information will be used from each
+   - If a subtask has no dependencies, its description should focus on what it retrieves, not what others will use with it
+   - DO NOT create descriptions that reference information from steps that aren't listed as dependencies
+
+5. **Forward-Reference Prevention**:
+   - DO NOT describe what information will be used from future steps in a way that suggests it's available now
+   - DO NOT mention "to later determine" or "for later use" in ways that reference information not yet available
+   - Instead, describe what THIS step retrieves, and let dependent steps describe how they use it
+
 **AVOIDING REDUNDANCY - UNIVERSAL PRINCIPLES**:
 
 Before creating your plan, analyze the problem to identify:
@@ -291,6 +321,13 @@ Each subtask description must be COMPLETE and SELF-CONTAINED. It must include:
 4. Any constraints or requirements (date ranges, formats, sources mentioned in the problem)
 5. Expected output or criteria
 6. Incorporate any general requirements listed above (requirements will be assigned to specific steps after generation)
+
+**CRITICAL: DATA FLOW CLARITY IN DESCRIPTIONS**
+- For subtasks with NO dependencies: Focus on what information THIS step retrieves from its source. State the source clearly and what specific information will be retrieved. Do NOT reference information from other steps that haven't been retrieved yet.
+- For subtasks WITH dependencies: Clearly state which step provides each piece of information used, and what action will be performed with it. Each referenced step MUST be listed in the dependencies array.
+- DO NOT create descriptions that reference information from steps that aren't listed as dependencies.
+- DO NOT use forward references that suggest information is available before it's retrieved.
+- Ensure logical flow: retrieval steps describe what they retrieve; dependent steps describe what they use from dependencies.
 
 Incorporate relevant details from the problem, query analysis, and problem classification into EACH subtask description. The description should be detailed enough that an LLM can execute it without needing to see the full problem context.
 
