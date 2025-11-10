@@ -488,6 +488,12 @@ Criteria:
 - For aggregate/statistics: index/browse/archive/database pages are relevant even if the snippet lacks the exact number
 - For explicit requirements: Identify which entity/source each result is about, then verify that ALL requirements for that entity are satisfied based on the available information
 
+IMPORTANT DATE HANDLING: When evaluating dates (especially for arXiv papers):
+- DO NOT use arXiv ID formats (e.g., 2207.01510) to infer submission dates - the arXiv ID format does not reliably indicate the actual submission date
+- ONLY use explicit date information from snippets/abstracts, metadata, or explicitly stated submission dates
+- If a snippet mentions "submitted on [date]" or "originally submitted [date]", use that date
+- If no explicit date is mentioned in the snippet, do not infer dates from arXiv IDs or URLs
+
 Return JSON only with:
 {"results": [{"index": 1, "relevant": boolean, "reasoning": "1-2 sentences explaining why it is/isn't relevant", "confidence": 0.0-1.0, "explicit_requirements_satisfied": [list of requirement indices (1-based) that are satisfied, or empty array if no explicit requirements]}, ...]}
 

@@ -1,6 +1,7 @@
 """Image recognition tool for processing images from PDFs and browser navigation."""
 
 import logging
+import re
 from typing import Any, Dict, List, Optional, Union
 
 from ..models import Attachment
@@ -832,6 +833,7 @@ Source: {source_type} ({source_name})"""
         sections: List[Dict[str, Any]],
         problem: str,
         query_analysis: Dict[str, Any],
+        subtask_description: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Filter PDF sections by relevance to problem and query analysis using LLM.
@@ -840,6 +842,7 @@ Source: {source_type} ({source_name})"""
             sections: List of section dictionaries with title, page, level.
             problem: Problem description.
             query_analysis: Query analysis dictionary.
+            subtask_description: Optional subtask description to extract step number.
 
         Returns:
             List of relevant sections.
@@ -856,7 +859,38 @@ Source: {source_type} ({source_name})"""
                 ]
             )
 
+            # Extract step number from subtask_description if provided
+            step_num = None
+            if subtask_description:
+                step_match = re.search(
+                    r'step[_\s]*(\d+)', subtask_description, re.IGNORECASE
+                )
+                if step_match:
+                    try:
+                        step_num = int(step_match.group(1))
+                    except (ValueError, IndexError):
+                        pass
+
+            # Filter explicit_requirements by step number if step number is available
             explicit_requirements = query_analysis.get('explicit_requirements', [])
+            if step_num is not None and explicit_requirements:
+                # Filter to only requirements matching this step number
+                filtered_requirements = []
+                for req in explicit_requirements:
+                    # Check if requirement starts with "Step N:" where N matches step_num
+                    step_match = re.search(r'Step\s+(\d+):', req, re.IGNORECASE)
+                    if step_match:
+                        req_step_num = int(step_match.group(1))
+                        if req_step_num == step_num:
+                            # Remove the "Step N:" prefix for cleaner display
+                            req_text = re.sub(
+                                r'Step\s+\d+:\s*', '', req, flags=re.IGNORECASE
+                            ).strip()
+                            filtered_requirements.append(req_text)
+                    else:
+                        # If no step prefix, include it (backward compatibility)
+                        filtered_requirements.append(req)
+                explicit_requirements = filtered_requirements
 
             system_prompt = """You are an expert at analyzing document structure and determining relevance.
 Your task is to identify which sections of a PDF document are relevant to answering a specific question.
@@ -868,14 +902,17 @@ Consider:
 
 Return a JSON object with a "relevant_titles" key containing an array of relevant section titles."""
 
-            user_prompt = f"""Problem/Question: {problem}
+            # Build user prompt without problem, only include explicit_requirements if they match step
+            requirements_text = ''
+            if explicit_requirements:
+                requirements_text = (
+                    f'\nExplicit Requirements: {", ".join(explicit_requirements)}'
+                )
 
-Explicit Requirements: {', '.join(explicit_requirements) if explicit_requirements else 'None specified'}
+            user_prompt = f"""PDF Section Titles:
+{sections_text}{requirements_text}
 
-PDF Section Titles:
-{sections_text}
-
-Identify which section titles are relevant to answering the problem/question.
+Identify which section titles are relevant based on the explicit requirements.
 Return a JSON object with a "relevant_titles" key containing an array of relevant section titles (as strings).
 Example: {{"relevant_titles": ["Introduction", "Methodology", "Results"]}}"""
 

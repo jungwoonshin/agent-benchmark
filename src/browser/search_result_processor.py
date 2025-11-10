@@ -159,6 +159,12 @@ Your task:
 
 CRITICAL: Be selective - only include results that are actually relevant. It's better to include fewer highly relevant results than many marginally relevant ones.
 
+IMPORTANT DATE HANDLING: When evaluating dates (especially for arXiv papers):
+- DO NOT use arXiv ID formats (e.g., 2207.01510) to infer submission dates - the arXiv ID format does not reliably indicate the actual submission date
+- ONLY use explicit date information from snippets, metadata, or explicitly stated submission dates
+- If a snippet mentions "submitted on [date]" or "originally submitted [date]", use that date
+- If no explicit date is mentioned in the snippet, do not infer dates from arXiv IDs or URLs
+
 Return a JSON object with:
 - selected_indices: array of result indices (1-based) that are relevant, sorted by relevance (most relevant first)
 - scores: object mapping result index (as string, 1-based) to relevance score (0.0 to 1.0) for selected results
