@@ -486,7 +486,6 @@ class Browser:
             self.logger.error(f'Click failed: {e}', exc_info=True)
             return {'success': False, 'error': str(e)}
 
-
     def find_link(
         self,
         page_data: Dict[str, Any],
@@ -779,3 +778,224 @@ class Browser:
         except Exception as e:
             self.logger.error(f'Failed to take screenshot: {e}')
             return None
+
+    def detect_expandable_elements(
+        self, page_data: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """
+        Detect expandable/collapsible elements (buttons, toggles) on the page.
+
+        Args:
+            page_data: Dictionary containing 'soup' (BeautifulSoup) or 'content' (HTML string).
+
+        Returns:
+            List of dictionaries with element information (text, selector, type, etc.).
+        """
+        expandable_elements = []
+        if not page_data.get('soup'):
+            return expandable_elements
+
+        soup = page_data['soup']
+
+        # Common patterns for expandable elements:
+        # 1. Buttons with aria-expanded attribute
+        # 2. Buttons with "toggle", "expand", "show", "hide" in text/class/id
+        # 3. Elements with collapse/accordion classes
+        # 4. Wikipedia-style toggle buttons
+
+        # Find buttons with aria-expanded
+        for button in soup.find_all(
+            ['button', 'a', 'span', 'div'],
+            attrs={'aria-expanded': lambda x: x is not None},
+        ):
+            text = button.get_text(strip=True)
+            element_id = button.get('id', '')
+            classes = ' '.join(button.get('class', []))
+            aria_label = button.get('aria-label', '')
+            aria_expanded = button.get('aria-expanded', '')
+
+            if text or aria_label or element_id:
+                # Try to find a CSS selector
+                selector = None
+                if element_id:
+                    selector = f'#{element_id}'
+                elif classes:
+                    # Use first class as selector
+                    first_class = classes.split()[0] if classes else None
+                    if first_class:
+                        selector = f'.{first_class}'
+
+                expandable_elements.append(
+                    {
+                        'type': 'aria-expanded',
+                        'text': text or aria_label or element_id,
+                        'selector': selector,
+                        'id': element_id,
+                        'classes': classes,
+                        'aria-label': aria_label,
+                        'aria-expanded': aria_expanded,
+                        'tag': button.name,
+                    }
+                )
+
+        # Find buttons/links with toggle/expand/collapse keywords
+        toggle_keywords = [
+            'toggle',
+            'expand',
+            'collapse',
+            'show',
+            'hide',
+            'more',
+            'less',
+            'view',
+        ]
+
+        # Track elements we've already added to avoid duplicates
+        added_element_ids = set()
+        added_element_texts = set()
+
+        for keyword in toggle_keywords:
+            # Search in button text, aria-label, id, class
+            for element in soup.find_all(['button', 'a', 'span', 'div']):
+                text = element.get_text(strip=True).lower()
+                element_id = element.get('id', '').lower()
+                classes = ' '.join(element.get('class', [])).lower()
+                aria_label = element.get('aria-label', '').lower()
+
+                if (
+                    keyword in text
+                    or keyword in element_id
+                    or keyword in classes
+                    or keyword in aria_label
+                ):
+                    # Check if we already added this element
+                    elem_id = element.get('id', '')
+                    text_display = element.get_text(strip=True)
+                    text_key = text_display.lower()[:50]  # Use first 50 chars as key
+
+                    # Skip if we've already added this element
+                    if elem_id and elem_id in added_element_ids:
+                        continue
+                    if text_key and text_key in added_element_texts:
+                        continue
+
+                    selector = None
+                    if elem_id:
+                        selector = f'#{elem_id}'
+                    elif element.get('class'):
+                        first_class = element.get('class')[0]
+                        if first_class:
+                            selector = f'.{first_class}'
+
+                    expandable_elements.append(
+                        {
+                            'type': 'keyword-match',
+                            'text': text_display,
+                            'selector': selector,
+                            'id': elem_id,
+                            'classes': ' '.join(element.get('class', [])),
+                            'aria-label': element.get('aria-label', ''),
+                            'keyword': keyword,
+                            'tag': element.name,
+                        }
+                    )
+
+                    # Track added elements
+                    if elem_id:
+                        added_element_ids.add(elem_id)
+                    if text_key:
+                        added_element_texts.add(text_key)
+
+        # Limit to avoid too many elements
+        return expandable_elements[:30]
+
+    def toggle_expandable_element(
+        self,
+        element_info: Dict[str, Any],
+        wait_for_js: float = 2.0,
+    ) -> Dict[str, Any]:
+        """
+        Toggle an expandable element using Selenium.
+
+        Args:
+            element_info: Dictionary with element information (from detect_expandable_elements).
+            wait_for_js: Seconds to wait after clicking.
+
+        Returns:
+            Dictionary with success status and updated page data.
+        """
+        self._initialize_driver()
+        try:
+            element = None
+
+            # Try to find element by selector first
+            if element_info.get('selector'):
+                try:
+                    element = WebDriverWait(self.driver, 5).until(
+                        EC.presence_of_element_located(
+                            (By.CSS_SELECTOR, element_info['selector'])
+                        )
+                    )
+                except (TimeoutException, NoSuchElementException):
+                    pass
+
+            # Try by ID if selector didn't work
+            if not element and element_info.get('id'):
+                try:
+                    element = WebDriverWait(self.driver, 5).until(
+                        EC.presence_of_element_located((By.ID, element_info['id']))
+                    )
+                except (TimeoutException, NoSuchElementException):
+                    pass
+
+            # Try by link text as fallback
+            if not element and element_info.get('text'):
+                try:
+                    element = WebDriverWait(self.driver, 5).until(
+                        EC.presence_of_element_located(
+                            (By.PARTIAL_LINK_TEXT, element_info['text'][:50])
+                        )
+                    )
+                except (TimeoutException, NoSuchElementException):
+                    pass
+
+            if not element:
+                return {
+                    'success': False,
+                    'error': f'Element not found: {element_info.get("text", "unknown")}',
+                }
+
+            # Scroll element into view
+            self.driver.execute_script(
+                'arguments[0].scrollIntoView({behavior: "smooth", block: "center"});',
+                element,
+            )
+
+            # Wait a bit for scroll
+            import time
+
+            time.sleep(0.5)
+
+            # Click the element
+            element.click()
+            self.logger.info(
+                f'Toggled expandable element: {element_info.get("text", "unknown")}'
+            )
+
+            # Wait for page to update
+            WebDriverWait(self.driver, wait_for_js).until(
+                lambda d: d.execute_script('return document.readyState')
+                in ['interactive', 'complete']
+            )
+
+            # Get updated page content
+            return self._navigate_selenium(self.driver.current_url, wait_for_js=0)
+
+        except (TimeoutException, NoSuchElementException) as e:
+            return {
+                'success': False,
+                'error': f'Element not found or not clickable: {e}',
+            }
+        except Exception as e:
+            self.logger.error(f'Toggle failed: {e}', exc_info=True)
+            return {'success': False, 'error': str(e)}

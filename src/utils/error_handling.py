@@ -182,6 +182,14 @@ def classify_error(error: Exception) -> tuple[ErrorType, ErrorCategory, str]:
             f'Operation timed out: {str(error)}',
         )
 
+    # Transient errors (e.g., empty API responses that should be retried)
+    if 'transient error' in error_msg or 'usually temporary' in error_msg:
+        return (
+            ErrorType.TRANSIENT,
+            ErrorCategory.API,
+            f'Temporary API error (will retry): {str(error)}',
+        )
+
     # Default classification
     return (
         ErrorType.PERMANENT,

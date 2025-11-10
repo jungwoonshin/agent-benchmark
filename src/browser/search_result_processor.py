@@ -11,6 +11,7 @@ import html2text
 from ..llm import LLMService
 from ..models import Attachment, SearchResult
 from ..utils import extract_json_from_text
+from ..utils.arxiv_utils import get_arxiv_submission_date
 from .browser import Browser
 from .content_type_classifier import ContentTypeClassifier
 from .content_type_detector import ContentTypeDetector
@@ -134,7 +135,7 @@ class SearchResultProcessor:
                     f'\nExplicit Requirements: {", ".join(explicit_reqs)}'
                 )
 
-        # Format search results for LLM
+        # Format search results for LLM with submission_date for arXiv papers
         results_text = []
         for idx, result in enumerate(search_results, 1):
             snippet_preview = (
@@ -142,33 +143,44 @@ class SearchResultProcessor:
                 if len(result.snippet) > 300
                 else result.snippet
             )
-            results_text.append(
-                f'[{idx}] Title: {result.title}\nURL: {result.url}\nSnippet: {snippet_preview}'
-            )
 
-        system_prompt = """You are an expert at evaluating search results for relevance to a specific task.
-Given a subtask description and a list of search results (with title, URL, and snippet), determine which results are relevant enough to include.
+            # Get submission_date for arXiv papers using arxiv library
+            submission_date = get_arxiv_submission_date(result.url, self.logger)
+
+            # Build result text with submission_date on top if available
+            result_lines = []
+            if submission_date:
+                result_lines.append(f'Submission Date: {submission_date}')
+            result_lines.append(f'Title: {result.title}')
+            result_lines.append(f'URL: {result.url}')
+            result_lines.append(f'Snippet: {snippet_preview}')
+
+            results_text.append(f'[{idx}]\n' + '\n'.join(result_lines))
+
+        system_prompt = """You are an expert at identifying search result candidates for a specific task.
+Given a subtask description and a list of search results (with title, URL, and snippet), determine which results are promising enough to be considered as candidates for further processing.
 
 Your task:
 1. Analyze each search result based on its title, URL, and snippet
-2. Determine if each result is RELEVANT enough to potentially help complete the subtask
-3. Only include results that have a reasonable chance of containing useful information
-4. Exclude results that are clearly irrelevant, off-topic, or unlikely to help
-5. Rank the selected relevant results from most relevant to least relevant
-6. Assign a relevance score from 0.0 to 1.0 for each selected result
+2. Determine if each result is a good CANDIDATE - meaning it appears relevant enough to potentially contain useful information for the subtask
+3. Include results that show promise or potential relevance, even if not perfectly aligned
+4. Exclude only results that are clearly irrelevant, completely off-topic, or obviously unrelated
+5. Rank the selected candidates from most promising to least promising
+6. Assign a candidate score from 0.0 to 1.0 for each selected result (indicating how promising it is as a candidate)
 
-CRITICAL: Be selective - only include results that are actually relevant. It's better to include fewer highly relevant results than many marginally relevant ones.
+CRITICAL: Focus on candidate selection, not strict relevance. Include results that are promising enough to warrant further investigation. It's better to include a reasonable set of candidates than to be overly restrictive.
 
 IMPORTANT DATE HANDLING: When evaluating dates (especially for arXiv papers):
+- Use the Submission Date field if provided (this is the actual submission date from arXiv API)
 - DO NOT use arXiv ID formats (e.g., 2207.01510) to infer submission dates - the arXiv ID format does not reliably indicate the actual submission date
-- ONLY use explicit date information from snippets, metadata, or explicitly stated submission dates
+- ONLY use explicit date information from snippets, metadata, or the Submission Date field
 - If a snippet mentions "submitted on [date]" or "originally submitted [date]", use that date
-- If no explicit date is mentioned in the snippet, do not infer dates from arXiv IDs or URLs
+- If no explicit date is mentioned in the snippet and no Submission Date field is provided, do not infer dates from arXiv IDs or URLs
 
 Return a JSON object with:
-- selected_indices: array of result indices (1-based) that are relevant, sorted by relevance (most relevant first)
-- scores: object mapping result index (as string, 1-based) to relevance score (0.0 to 1.0) for selected results
-- reasoning: brief explanation of which results were selected and why (1-2 sentences)
+- selected_indices: array of result indices (1-based) that are good candidates, sorted by promise (most promising first)
+- scores: object mapping result index (as string, 1-based) to candidate score (0.0 to 1.0) for selected results
+- reasoning: brief explanation of which results were selected as candidates and why (1-2 sentences)
 
 IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
 
@@ -180,7 +192,7 @@ Subtask: {subtask_description}
 Search Results:
 {chr(10).join(results_text)}
 
-Select which search results are relevant enough to help complete this subtask. Return only the indices of relevant results, sorted from most relevant to least relevant. Exclude any results that are clearly irrelevant or unlikely to help."""
+Identify which search results are promising enough to be considered as candidates for further processing. Select results that appear relevant enough to potentially contain useful information for this subtask. Return only the indices of candidate results, sorted from most promising to least promising. Exclude only results that are clearly irrelevant, completely off-topic, or obviously unrelated."""
 
         try:
             response = self.llm_service.call_with_system_prompt(
@@ -1683,6 +1695,12 @@ Summarize this content, extracting key information relevant to solving the probl
                 else:
                     return None
 
+            # Step 1.5: Detect and toggle expandable elements if needed
+            if use_selenium and self.llm_service:
+                nav_result = self._toggle_relevant_expandable_elements(
+                    nav_result, subtask_description, problem, query_analysis
+                )
+
             # Step 2: Extract and process images from the page if visual LLM is available
             image_analysis = ''
             if (
@@ -1906,6 +1924,187 @@ Are these URL parameters appropriate for completing the subtask? If not, what sh
 
         # Default to text extraction
         return 'extract_text'
+
+    def _toggle_relevant_expandable_elements(
+        self,
+        nav_result: Dict[str, Any],
+        subtask_description: str,
+        problem: str,
+        query_analysis: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Detect expandable elements on the page and use LLM to determine which ones
+        should be toggled to reveal information relevant to the subtask.
+
+        Args:
+            nav_result: Navigation result dictionary.
+            subtask_description: Description of the subtask.
+            problem: Original problem description.
+            query_analysis: Optional query analysis results.
+
+        Returns:
+            Updated navigation result after toggling relevant elements.
+        """
+        try:
+            # Detect expandable elements
+            expandable_elements = self.browser.detect_expandable_elements(nav_result)
+
+            if not expandable_elements:
+                self.logger.debug('No expandable elements detected on page')
+                return nav_result
+
+            self.logger.info(
+                f'Detected {len(expandable_elements)} expandable element(s) on page'
+            )
+
+            # Use LLM to determine which elements to toggle
+            elements_to_toggle = self._determine_elements_to_toggle(
+                expandable_elements,
+                subtask_description,
+                problem,
+                query_analysis,
+            )
+
+            if not elements_to_toggle:
+                self.logger.debug(
+                    'LLM determined no expandable elements need to be toggled'
+                )
+                return nav_result
+
+            self.logger.info(
+                f'Toggling {len(elements_to_toggle)} expandable element(s) based on LLM analysis'
+            )
+
+            # Toggle each element
+            current_result = nav_result
+            for element_info in elements_to_toggle:
+                toggle_result = self.browser.toggle_expandable_element(element_info)
+                if toggle_result.get('success'):
+                    current_result = toggle_result
+                    self.logger.info(
+                        f'Successfully toggled element: {element_info.get("text", "unknown")}'
+                    )
+                else:
+                    error = toggle_result.get('error', 'Unknown error')
+                    self.logger.warning(
+                        f'Failed to toggle element "{element_info.get("text", "unknown")}": {error}'
+                    )
+
+            return current_result
+
+        except Exception as e:
+            self.logger.warning(
+                f'Failed to toggle expandable elements: {e}. Continuing with original page content.'
+            )
+            return nav_result
+
+    def _determine_elements_to_toggle(
+        self,
+        expandable_elements: List[Dict[str, Any]],
+        subtask_description: str,
+        problem: str,
+        query_analysis: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Use LLM to determine which expandable elements should be toggled
+        to reveal information relevant to the subtask.
+
+        Args:
+            expandable_elements: List of expandable element dictionaries.
+            subtask_description: Description of the subtask.
+            problem: Original problem description.
+            query_analysis: Optional query analysis results.
+
+        Returns:
+            List of element dictionaries that should be toggled.
+        """
+        if not expandable_elements:
+            return []
+
+        # Build context from query analysis
+        requirements_context = ''
+        if query_analysis:
+            explicit_reqs = query_analysis.get('explicit_requirements', [])
+            if explicit_reqs:
+                requirements_context += (
+                    f'\nExplicit Requirements: {", ".join(explicit_reqs)}'
+                )
+
+        # Format elements for LLM
+        elements_text = []
+        for idx, elem in enumerate(expandable_elements, 1):
+            elem_info = f"""Element {idx}:
+- Text: {elem.get('text', 'N/A')}
+- Type: {elem.get('type', 'N/A')}
+- ID: {elem.get('id', 'N/A')}
+- Classes: {elem.get('classes', 'N/A')}
+- Aria Label: {elem.get('aria-label', 'N/A')}
+- Aria Expanded: {elem.get('aria-expanded', 'N/A')}"""
+            elements_text.append(elem_info)
+
+        system_prompt = """You are an expert at analyzing web pages to determine which expandable/collapsible elements (buttons, toggles) need to be clicked to reveal information relevant to a specific task.
+
+Given a subtask description and a list of expandable elements on a web page, determine which elements should be toggled (clicked) to reveal hidden information that is needed to complete the subtask.
+
+Consider:
+- The subtask description and what information is being sought
+- The text, labels, and attributes of each expandable element
+- Whether clicking an element would reveal information relevant to the subtask
+- Elements that are currently collapsed (aria-expanded="false") and need to be expanded
+- Elements whose text/labels suggest they contain relevant information
+
+Return a JSON object with:
+- elements_to_toggle: array of element indices (1-based) that should be toggled, sorted by priority (most relevant first)
+- reasoning: brief explanation of which elements were selected and why (1-2 sentences)
+
+IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
+
+        user_prompt = f"""Problem: {problem}
+
+Subtask: {subtask_description}
+{requirements_context}
+
+Expandable Elements on Page:
+{chr(10).join(elements_text)}
+
+Which expandable elements should be toggled to reveal information needed for this subtask? Consider elements that might contain hidden information relevant to the subtask description."""
+
+        try:
+            response = self.llm_service.call_with_system_prompt(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=0.3,
+                response_format={'type': 'json_object'},
+            )
+
+            json_text = extract_json_from_text(response)
+            result_data = json.loads(json_text)
+
+            element_indices = result_data.get('elements_to_toggle', [])
+            reasoning = result_data.get('reasoning', 'No reasoning provided')
+
+            self.logger.info(
+                f'LLM selected {len(element_indices)} element(s) to toggle. Reasoning: {reasoning}'
+            )
+
+            # Convert 1-based indices to 0-based and get elements
+            elements_to_toggle = []
+            for idx in element_indices:
+                try:
+                    idx_int = int(idx) - 1  # Convert to 0-based
+                    if 0 <= idx_int < len(expandable_elements):
+                        elements_to_toggle.append(expandable_elements[idx_int])
+                except (ValueError, TypeError):
+                    continue
+
+            return elements_to_toggle
+
+        except Exception as e:
+            self.logger.warning(
+                f'Failed to determine elements to toggle using LLM: {e}. '
+                f'Not toggling any elements.'
+            )
+            return []
 
     def _format_web_page_content(self, content: str) -> str:
         """

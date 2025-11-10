@@ -5,6 +5,11 @@ import re
 from typing import Any, Dict, List, Optional, Union
 
 from ..models import Attachment
+from ..utils.arxiv_utils import (
+    extract_arxiv_id_from_text,
+    extract_arxiv_id_from_url,
+    get_arxiv_metadata,
+)
 
 
 class ImageRecognition:
@@ -983,7 +988,8 @@ Example: {{"relevant_titles": ["Introduction", "Methodology", "Results"]}}"""
         self, attachment: Attachment
     ) -> Optional[Dict[str, Any]]:
         """
-        Extract arXiv metadata (submission date, paper ID) from PDF content using LLM.
+        Extract arXiv metadata (submission date, paper ID) using arXiv API.
+        Extracts paper ID from URL or PDF content, then fetches metadata from arXiv API.
 
         Args:
             attachment: PDF attachment to extract metadata from.
@@ -997,153 +1003,82 @@ Example: {{"relevant_titles": ["Introduction", "Methodology", "Results"]}}"""
             - confidence: Confidence score (0.0-1.0)
             None if extraction fails.
         """
-        if not self.llm_service:
-            self.logger.warning(
-                'LLM service not available for arXiv metadata extraction'
+        paper_id = None
+
+        # Strategy 1: Extract paper ID from URL (most reliable)
+        if hasattr(attachment, 'metadata') and attachment.metadata:
+            source_url = attachment.metadata.get('source_url', '')
+            if source_url:
+                paper_id = extract_arxiv_id_from_url(source_url)
+                if paper_id:
+                    self.logger.debug(f'Extracted arXiv ID from URL: {paper_id}')
+
+        # Strategy 2: Extract paper ID from PDF text if not found in URL
+        if not paper_id:
+            try:
+                import fitz  # type: ignore # PyMuPDF
+            except ImportError:
+                fitz = None
+
+            if fitz:
+                try:
+                    pdf_document = fitz.open(stream=attachment.data, filetype='pdf')
+                    if len(pdf_document) > 0:
+                        # Extract text from first page (where arXiv ID is typically found)
+                        first_page_text = pdf_document[0].get_text()
+                        paper_id = extract_arxiv_id_from_text(first_page_text)
+                        pdf_document.close()
+                        if paper_id:
+                            self.logger.debug(
+                                f'Extracted arXiv ID from PDF text: {paper_id}'
+                            )
+                except Exception as e:
+                    self.logger.debug(f'Failed to extract arXiv ID from PDF text: {e}')
+
+        # If we have a paper_id, fetch metadata from arXiv API
+        if paper_id:
+            try:
+                metadata = get_arxiv_metadata(paper_id, self.logger)
+                if metadata:
+                    # Return in the expected format (only include expected keys)
+                    result = {
+                        'paper_id': metadata.get('paper_id'),
+                        'submission_date': metadata.get('submission_date'),
+                        'submission_date_text': metadata.get('submission_date_text'),
+                        'submission_month': metadata.get('submission_month'),
+                        'confidence': metadata.get('confidence', 1.0),
+                    }
+
+                    self.logger.info(
+                        f'Extracted arXiv metadata from API - Date: {result["submission_date"]}, '
+                        f'Paper ID: {result["paper_id"]}, Confidence: {result["confidence"]:.2f}'
+                    )
+                    return result
+                else:
+                    self.logger.warning(
+                        f'arXiv API returned no metadata for paper ID: {paper_id}'
+                    )
+            except Exception as e:
+                self.logger.warning(
+                    f'Failed to fetch metadata from arXiv API for {paper_id}: {e}',
+                    exc_info=True,
+                )
+
+            # Fallback: return paper_id if we found one, even if API call failed
+            self.logger.info(
+                f'Found arXiv paper ID {paper_id} but could not fetch metadata from API'
             )
-            return None
-
-        try:
-            import json
-            import re
-
-            import fitz  # type: ignore # PyMuPDF
-        except ImportError as e:
-            self.logger.warning(f'Required library not available: {e}')
-            return None
-
-        try:
-            # Extract paper ID from URL if available
-            paper_id = None
-            if hasattr(attachment, 'metadata') and attachment.metadata:
-                source_url = attachment.metadata.get('source_url', '')
-                if source_url:
-                    arxiv_match = re.search(
-                        r'arxiv\.org/(?:abs|pdf)/([\d.]+)', source_url, re.IGNORECASE
-                    )
-                    if arxiv_match:
-                        paper_id = re.sub(r'v\d+$', '', arxiv_match.group(1))
-
-            # Extract text from first page and PDF metadata
-            pdf_document = fitz.open(stream=attachment.data, filetype='pdf')
-            if len(pdf_document) == 0:
-                pdf_document.close()
-                return None
-
-            # Extract text from first 3 pages to increase chances of finding submission date
-            # Submission dates are often on the first page but sometimes on page 2 or 3
-            pages_text = []
-            max_pages_to_check = min(1, len(pdf_document))
-            for page_num in range(max_pages_to_check):
-                page_text = pdf_document[page_num].get_text().strip()
-                if page_text:
-                    pages_text.append(f'--- Page {page_num + 1} ---\n{page_text}')
-
-            combined_text = '\n\n'.join(pages_text)
-            pdf_metadata = pdf_document.metadata
-            pdf_document.close()
-
-            if not combined_text:
-                self.logger.warning('No text found in PDF pages')
-                return None
-
-            # Extract paper ID month from paper_id if available (format: YYMM.XXXXX)
-            # This can help infer submission month even if not explicitly stated
-            inferred_month = None
-            if paper_id:
-                # arXiv paper IDs: YYMM.XXXXX where YYMM is year-month
-                # e.g., 1608.03637 -> August 2016
-                month_match = re.match(r'(\d{2})(\d{2})\.', paper_id)
-                if month_match:
-                    year_part = month_match.group(1)
-                    month_part = month_match.group(2)
-                    # Convert YY to YYYY (assuming 20XX for years 00-99)
-                    full_year = (
-                        f'20{year_part}' if int(year_part) < 50 else f'19{year_part}'
-                    )
-                    inferred_month = f'{full_year}-{month_part}'
-                    self.logger.debug(
-                        f'Inferred submission month from paper ID {paper_id}: {inferred_month}'
-                    )
-
-            # Use LLM to extract all metadata from text
-            system_prompt = """Extract arXiv paper metadata from PDF content. Look carefully for:
-- Paper ID (if not provided)
-- Original submission date (may differ from paper ID month)
-- Submission date patterns: "Submitted on [date]", "Originally submitted [date]", "Submitted [date]", "Submission date: [date]", etc.
-- arXiv header format: "arXiv:YYYY.MMDDvN  [category]  D MMM YYYY" (e.g., "arXiv:2207.01510v1  [cs.CY]  8 Jun 2022")
-  In this format, the submission date appears at the end: "8 Jun 2022" (day, abbreviated month, year)
-- Look in headers, footers, and metadata sections
-- Dates may be in various formats: "August 11, 2016", "2016-08-11", "11 Aug 2016", "8 Jun 2022", etc.
-
-IMPORTANT: The submission date is often found near the top or bottom of the first page, in small text, or in a metadata section. Look carefully for any date-related text. Pay special attention to arXiv header lines that follow the pattern "arXiv:XXXX.XXXXXvN  [category]  D MMM YYYY" where the date at the end is the submission date.
-
-Return JSON with:
-- paper_id: arXiv paper ID (if found in text, otherwise use provided value)
-- submission_date: Date in YYYY-MM-DD format (null if not found)
-- submission_date_text: Raw submission date text from PDF (exact text as it appears)
-- submission_month: Month in YYYY-MM format (null if not found)
-- confidence: 0.0-1.0 confidence score (higher if submission date found, lower if only paper ID found)"""
-
-            user_prompt = f"""Extract metadata from this arXiv PDF content (pages 1-{max_pages_to_check}):
-
-{combined_text}
-
-PDF Creation Date: {pdf_metadata.get('creationDate', 'N/A')}
-PDF Modification Date: {pdf_metadata.get('modDate', 'N/A')}
-Paper ID from URL: {paper_id if paper_id else 'Not available'}
-Inferred submission month from paper ID: {inferred_month if inferred_month else 'Not available (paper ID format: YYMM.XXXXX)'}
-
-Extract all available metadata. Pay special attention to any date information, especially near the top or bottom of pages."""
-
-            response = self.llm_service.call_with_system_prompt(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                temperature=0.0,
-                response_format={'type': 'json_object'},
-            )
-
-            from ..utils.json_utils import extract_json_from_text
-
-            json_text = extract_json_from_text(response)
-            metadata = json.loads(json_text)
-
-            result = {
-                'paper_id': metadata.get('paper_id') or paper_id,
-                'submission_date': metadata.get('submission_date'),
-                'submission_date_text': metadata.get('submission_date_text'),
-                'submission_month': metadata.get('submission_month'),
-                'confidence': metadata.get('confidence', 0.0),
+            return {
+                'paper_id': paper_id,
+                'submission_date': None,
+                'submission_date_text': None,
+                'submission_month': None,
+                'confidence': 0.3,  # Low confidence - only paper ID, no date
             }
 
-            # Fallback: If no submission month found but we can infer from paper ID, use it
-            if not result['submission_month'] and inferred_month:
-                result['submission_month'] = inferred_month
-                self.logger.info(
-                    f'No explicit submission month found in PDF, using inferred month from paper ID: {inferred_month}'
-                )
-                # If confidence is low, increase it slightly since we have inferred month
-                if result['confidence'] < 0.5:
-                    result['confidence'] = 0.6
-
-            if result['submission_date']:
-                self.logger.info(
-                    f'Extracted arXiv metadata - Date: {result["submission_date"]}, '
-                    f'Paper ID: {result["paper_id"]}, Confidence: {result["confidence"]:.2f}'
-                )
-            elif result['submission_month']:
-                self.logger.info(
-                    f'Extracted arXiv metadata - Month: {result["submission_month"]}, '
-                    f'Paper ID: {result["paper_id"]}, Confidence: {result["confidence"]:.2f}'
-                )
-
-            return result
-
-        except Exception as e:
-            self.logger.warning(
-                f'Failed to extract arXiv metadata from PDF: {e}', exc_info=True
-            )
-            return None
+        # No paper ID found
+        self.logger.debug('No arXiv paper ID found in URL or PDF content')
+        return None
 
     def extract_arxiv_metadata_from_pdf_no_llm(
         self, attachment: Attachment

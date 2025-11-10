@@ -108,7 +108,7 @@ Return your analysis as a JSON object with these keys:
 - answer_format: string describing expected format
 - cross_references: list of strings describing cross-references
 - has_terminology_ambiguity: boolean (true if the answer might have multiple valid forms due to terminology)
-- terminology_context: string describing the domain/context where terminology matters (e.g., "programming", "typography", "mathematics", "linguistics", "general", or empty if not applicable)
+- terminology_context: string describing the domain/context where terminology matters 
 
 Be thorough and precise. Assign requirements to the correct step numbers based on the provided subtasks.
 

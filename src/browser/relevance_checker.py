@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from ..utils import extract_json_from_text
@@ -160,14 +161,48 @@ def build_content_info(
     return content_info
 
 
-def build_explicit_requirements_check(query_analysis: Optional[Dict[str, Any]]) -> str:
-    """Build explicit requirements check section."""
+def build_explicit_requirements_check(
+    query_analysis: Optional[Dict[str, Any]], step_num: Optional[int] = None
+) -> str:
+    """Build explicit requirements check section.
+
+    Args:
+        query_analysis: Optional query analysis results.
+        step_num: Optional step number to filter requirements. If provided, only
+                  requirements matching this step number will be included.
+
+    Returns:
+        String with explicit requirements check section, or empty string if no
+        matching requirements found.
+    """
     explicit_reqs = (
         query_analysis.get('explicit_requirements', []) if query_analysis else []
     )
 
     if not explicit_reqs:
         return ''
+
+    # Filter requirements by step number if step number is provided
+    if step_num is not None:
+        filtered_reqs = []
+        for req in explicit_reqs:
+            req_str = str(req)
+            # Check if requirement matches this step number
+            req_step_match = re.search(r'step[_\s]*(\d+)[:\s]', req_str, re.IGNORECASE)
+            if req_step_match:
+                try:
+                    req_step_num = int(req_step_match.group(1))
+                    if req_step_num == step_num:
+                        filtered_reqs.append(req)
+                except (ValueError, IndexError):
+                    # If we can't parse step number, don't include it
+                    pass
+            # If requirement doesn't have step tag, don't include it
+            # (only include step-tagged requirements when filtering by step)
+
+        explicit_reqs = filtered_reqs
+        if not explicit_reqs:
+            return ''
 
     check = '\n\nCRITICAL: Explicit Requirements Check:\n'
     check += 'The following explicit requirements are provided:\n'
@@ -197,7 +232,6 @@ Criteria:
 - Source appears trustworthy and offers actionable information
 - Use the full content provided to verify if the result actually contains the information needed
 - For PDFs: If image analysis from visual LLM is provided, use it to understand figures, charts, diagrams, and visual information that may be critical for relevance
-- For aggregate/statistics: index/browse/archive/database pages are relevant even if the snippet lacks the exact number (e.g., "archive", "browse", "articles?year=", "articles?date=")
 - For date checks: use dates only from the content_info provided, and treat dates within ±1 month of the required date as acceptable
 - Do not use dates from the title/snippet/url/id to determine relevance
 - Section titles help indicate what topics are covered in the page/document
@@ -210,7 +244,6 @@ If explicit requirements exist, your reasoning MUST explicitly state which requi
 
 
 def build_user_prompt(
-    problem: str,
     subtask_description: str,
     requirements_context: str,
     explicit_reqs_check: str,
@@ -223,9 +256,7 @@ def build_user_prompt(
     # We ensure it's always placed before content_info
     metadata_section = arxiv_metadata_info if arxiv_metadata_info else ''
 
-    return f"""Problem: {problem}
-
-Subtask: {subtask_description}
+    return f"""Subtask: {subtask_description}
 {requirements_context}{explicit_reqs_check}
 
 Search Result:
@@ -296,11 +327,13 @@ def extract_arxiv_metadata_safely(
             )
             return None
 
-        # Ensure LLM service is set for metadata extraction
-        if not tool_belt.image_recognition.llm_service:
-            tool_belt.image_recognition.set_llm_service(llm_service)
+        # Note: extract_arxiv_metadata_from_pdf now uses arxiv library, not LLM
+        # LLM service is no longer required for arXiv metadata extraction
+        # (but may still be needed for other image_recognition features)
 
-        logger.debug('Attempting to extract arXiv metadata from PDF attachment')
+        logger.debug(
+            'Attempting to extract arXiv metadata from PDF attachment using arxiv library'
+        )
         metadata = tool_belt.image_recognition.extract_arxiv_metadata_from_pdf(
             attachment
         )
@@ -372,6 +405,17 @@ class RelevanceChecker:
                 f'has_section_titles={section_titles is not None and len(section_titles) > 0 if section_titles else False}'
             )
 
+            # Extract step number from subtask_description (look for "step_1", "step_2", etc.)
+            step_num = None
+            step_match = re.search(
+                r'step[_\s]*(\d+)', subtask_description, re.IGNORECASE
+            )
+            if step_match:
+                try:
+                    step_num = int(step_match.group(1))
+                except (ValueError, IndexError):
+                    pass
+
             # Extract arXiv metadata safely
             metadata = extract_arxiv_metadata_safely(
                 self.tool_belt, self.llm_service, attachment, content_type, self.logger
@@ -385,7 +429,9 @@ class RelevanceChecker:
             arxiv_metadata_info = build_arxiv_metadata_info(
                 metadata, content_type, self.logger
             )
-            explicit_reqs_check = build_explicit_requirements_check(query_analysis)
+            explicit_reqs_check = build_explicit_requirements_check(
+                query_analysis, step_num
+            )
 
             # Log if arxiv metadata will be included
             if arxiv_metadata_info:
@@ -397,7 +443,6 @@ class RelevanceChecker:
             # Build prompts
             system_prompt = get_system_prompt()
             user_prompt = build_user_prompt(
-                problem,
                 subtask_description,
                 requirements_context,
                 explicit_reqs_check,

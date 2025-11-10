@@ -139,7 +139,7 @@ TOOL SELECTION GUIDELINES:
     - Navigate to web pages using browser automation
     - Download files and extract content
   * Search handles ALL scenarios: archives, databases, websites, files, documents
-  * **For archives with date requirements** (e.g., "arXiv papers from June 2022"): Still use search - the SearchResultProcessor will navigate to the archive and use advanced search features automatically
+  * **For archives with date requirements**: Still use search - the SearchResultProcessor will navigate to the archive and use advanced search features automatically
   * **The search tool now includes intelligent result processing** - it's not just finding URLs, it processes them too
   * **CRITICAL**: When you need to find PDFs or extract information from PDFs, use search with specific queries. The system will automatically download PDFs and extract text content.
   
@@ -190,7 +190,7 @@ PRIORITIZATION RULES:
    - Navigating to web pages to extract content
    - Downloading files and extracting text
    - Handling archives, databases, and complex websites
-4. **For archives and databases**: Search query should be keyword-only format (e.g., "arXiv AI regulation June 2022"), and the system will navigate to the archive and extract automatically
+4. **For archives and databases**: Search query should be keyword-only format, and the system will navigate to the archive and extract automatically
 5. **For PDF processing**: Use search to find and download PDFs, then use read_attachment to extract information.
 6. **Use LLM reasoning** for computation, data processing, and analysis tasks AFTER the necessary information has been retrieved.
 
@@ -211,7 +211,7 @@ Return a JSON object with:
     * Any constraints, formats, or requirements (e.g., date ranges, specific sources, output format)
     * CRITICAL: The description must be complete enough that an LLM can process it WITHOUT needing the full problem context
     * Include relevant details from the problem: specific dates, entities, requirements, formats mentioned in the problem
-    * For search tasks: specify what information to find (e.g., "Find arXiv papers about X submitted in Y month")
+    * For search tasks: specify what information to find
     * For llm_reasoning tasks: specify what calculation/analysis to perform and what data to use
     * For read_attachment tasks: specify what information to extract from which file
   - tool: which tool to use (llm_reasoning, search, read_attachment, analyze_media)
@@ -226,14 +226,16 @@ Return a JSON object with:
     * FORMAT RULES (apply to each of the 3 queries):
       - Use ONLY keywords and essential terms - NO verbs, NO descriptive phrases, NO unnecessary words
       - Keep it SHORT: 3-8 keywords maximum (typically 5-6 words)
-      - Remove filler words like "article", "submitted", "descriptors", "about", "related to"
-      - Use dates in format: "August 11 2016" or "2016-08-11" or "August 2016"
+      - Remove filler words
       - Separate keywords with spaces, NOT commas or special formatting
-      - **For paper/research exploration**: If the subtask involves finding academic papers, articles, preprints, or research documents, add "pdf" to prioritize PDF files (e.g., "arXiv AI regulation pdf")
+      - **For paper/research exploration**: If the subtask involves finding academic papers, articles, preprints, or research documents, add "pdf" to prioritize PDF files
     * KEYWORD SELECTION:
       - Include: Domain/source (arXiv, Nature, etc.), topic keywords, dates, location (if relevant)
       - Use different keyword combinations or phrasings for each query
-      - DO NOT BE TOO SPECIFIC - THE SEARCH TOOL WILL NAVIGATE TO THE SOURCE AND EXTRACT THE INFORMATION AUTOMATICALLY
+      - Use general, broad keywords rather than overly specific terms
+      - Avoid specific measurement or quantification terms that narrow the search too much
+      - Focus on core concepts, entities, and topics rather than specific attributes or metrics
+      - The search tool will navigate to the source and extract the information automatically, so queries should be general enough to find relevant sources
   - dependencies: list of subtask IDs that must complete first (empty array [] if none)
   - parallelizable: boolean indicating if this can run in parallel with others
 
@@ -254,7 +256,7 @@ IMPORTANT: Return your response as valid JSON only, without any markdown formatt
                 )
             retry_context += 'Create an IMPROVED plan that addresses these issues. CRITICAL REQUIREMENTS:\n'
             retry_context += "1. Each subtask description must be COMPLETE and SELF-CONTAINED, including what to do, why it's needed, what specific information/data to find/process, constraints, and expected output.\n"
-            retry_context += "2. Each subtask with tool='search' MUST include a search_queries array with exactly 3 different search queries in KEYWORD-ONLY format (3-8 keywords each, no verbs or descriptive phrases), ordered by complexity: simple (minimal keywords), normal (standard terms), complex (additional qualifiers). Example: ['arXiv Physics Society August 11 2016', 'arXiv Physics Society 2016', 'Physics Society arXiv August'] NOT ['arXiv Physics and Society article submitted August 11 2016']. Remove words like 'article', 'submitted', 'descriptors', 'about'. The search tool will automatically navigate and extract from archives.\n"
+            retry_context += "2. Each subtask with tool='search' MUST include a search_queries array with exactly 3 different search queries in KEYWORD-ONLY format (3-8 keywords each, no verbs or descriptive phrases), ordered by complexity: simple (minimal keywords), normal (standard terms), complex (additional qualifiers). Use general, broad keywords rather than overly specific terms. Avoid specific measurement or quantification terms that narrow the search too much. Focus on core concepts, entities, and topics. Remove words like 'article', 'submitted', 'descriptors', 'about'. The search tool will automatically navigate and extract from archives.\n"
 
         # Extract step classifications if available
         step_classifications_info = ''

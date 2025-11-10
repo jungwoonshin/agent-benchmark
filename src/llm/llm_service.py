@@ -214,16 +214,19 @@ class LLMService:
 
         return self._make_api_call(messages, temperature, max_tokens, None)
 
-    def _make_api_call(
-        self,
-        messages: List[Dict[str, str]],
-        temperature: float,
-        max_tokens: Optional[int],
-        response_format: Optional[Dict[str, str]],
-    ) -> str:
-        """Make a single attempt to call the OpenAI API."""
-        self.logger.info(f'Making API call with model: {self.model}')
-        model_config = self.MODEL_CONFIG.get(self.model, {})
+    def _prepare_messages_for_model(
+        self, messages: List[Dict[str, str]], model_config: Dict[str, any]
+    ) -> List[Dict[str, str]]:
+        """
+        Prepare messages for the model, handling special cases like reasoning models.
+
+        Args:
+            messages: Original message list.
+            model_config: Model configuration dictionary.
+
+        Returns:
+            Prepared message list.
+        """
         is_reasoning_model = model_config.get('is_reasoning_model', False)
 
         # For reasoning models, ensure only user messages (no system messages)
@@ -235,11 +238,35 @@ class LLMService:
                     combined_content.append(f'Instructions: {msg.get("content", "")}')
                 else:
                     combined_content.append(msg.get('content', ''))
-            messages = [{'role': 'user', 'content': '\n\n'.join(combined_content)}]
+            consolidated = [{'role': 'user', 'content': '\n\n'.join(combined_content)}]
             self.logger.info(
                 f'Consolidated {len(messages)} messages for reasoning model'
             )
+            return consolidated
 
+        return messages
+
+    def _build_api_kwargs(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_tokens: Optional[int],
+        response_format: Optional[Dict[str, str]],
+        model_config: Dict[str, any],
+    ) -> Dict[str, any]:
+        """
+        Build kwargs dictionary for API call.
+
+        Args:
+            messages: Message list.
+            temperature: Sampling temperature.
+            max_tokens: Maximum tokens in response.
+            response_format: Optional response format.
+            model_config: Model configuration dictionary.
+
+        Returns:
+            Dictionary of API call parameters.
+        """
         kwargs = {
             'model': self.model,
             'messages': messages,
@@ -257,10 +284,170 @@ class LLMService:
         if response_format:
             kwargs['response_format'] = response_format
 
+        return kwargs
+
+    def _format_usage_info(self, usage_info: Optional[any]) -> str:
+        """
+        Format usage information for logging.
+
+        Args:
+            usage_info: Usage information object from API response.
+
+        Returns:
+            Formatted usage string.
+        """
+        if usage_info:
+            return (
+                f'prompt_tokens={usage_info.prompt_tokens}, '
+                f'completion_tokens={usage_info.completion_tokens}, '
+                f'total_tokens={usage_info.total_tokens}'
+            )
+        return 'N/A'
+
+    def _validate_api_response(self, response: any) -> None:
+        """
+        Validate that API response has the expected structure.
+
+        Args:
+            response: API response object.
+
+        Raises:
+            ValueError: If response structure is invalid.
+        """
+        if not response or not response.choices:
+            self.logger.error(
+                f'API response has no choices. Response type: {type(response)}, '
+                f'Response: {response}'
+            )
+            raise ValueError('API response has no choices')
+
+    def _handle_empty_content(
+        self,
+        content: Optional[str],
+        choice: any,
+        response: any,
+        max_tokens: Optional[int],
+    ) -> None:
+        """
+        Handle empty content from API response with appropriate error handling.
+
+        Args:
+            content: Response content (may be None or empty).
+            choice: First choice from response.
+            response: Full API response object.
+            max_tokens: Maximum tokens setting.
+
+        Raises:
+            ValueError: For permanent errors (length limit, content filter).
+            Exception: For transient errors (empty response with stop reason).
+        """
+        # Check if content is valid (not None and not empty)
+        if content is not None and isinstance(content, str) and content.strip():
+            return  # Content is valid, no need to handle
+
+        finish_reason = getattr(choice, 'finish_reason', 'unknown')
+        usage_info = getattr(response, 'usage', None)
+        usage_str = self._format_usage_info(usage_info)
+
+        self.logger.warning(
+            f'API returned empty content. Model: {self.model}, '
+            f'finish_reason: {finish_reason}, '
+            f'response_id: {getattr(response, "id", "N/A")}, '
+            f'usage: {usage_str}, '
+            f'content_type: {type(content)}, '
+            f'content_value: {repr(content)}'
+        )
+
+        # Handle different finish reasons
+        if finish_reason == 'length':
+            self.logger.error(
+                'Response was truncated due to token limit. '
+                f'Consider increasing max_tokens (current: {max_tokens})'
+            )
+            raise ValueError(
+                f'Response truncated: max_tokens={max_tokens} may be too low. '
+                f'finish_reason=length, usage={usage_str}'
+            )
+        elif finish_reason == 'content_filter':
+            self.logger.error(
+                'Response was filtered by content filter. '
+                'The prompt may have triggered safety filters.'
+            )
+            raise ValueError(
+                'Response filtered by content filter. finish_reason=content_filter'
+            )
+        elif finish_reason == 'stop':
+            self.logger.warning(
+                'Response finished with stop reason but content is empty. '
+                'This may indicate a model issue. Retrying...'
+            )
+            raise Exception(
+                f'Empty response from API (transient error). '
+                f'finish_reason=stop, model={self.model}. '
+                f'This is usually temporary and will be retried.'
+            )
+        else:
+            # Unknown finish reason with empty content - treat as transient
+            self.logger.warning(
+                f'Empty response with finish_reason={finish_reason}. '
+                'Treating as transient error and retrying...'
+            )
+            raise Exception(
+                f'Empty response from API (transient error). '
+                f'finish_reason={finish_reason}, model={self.model}. '
+                f'This is usually temporary and will be retried.'
+            )
+
+    def _extract_response_content(
+        self, response: any, max_tokens: Optional[int]
+    ) -> str:
+        """
+        Extract and validate content from API response.
+
+        Args:
+            response: API response object.
+            max_tokens: Maximum tokens setting (for error messages).
+
+        Returns:
+            Response content as string.
+
+        Raises:
+            ValueError: For permanent errors.
+            Exception: For transient errors.
+        """
+        self._validate_api_response(response)
+
+        choice = response.choices[0]
+        content = choice.message.content
+
+        self._handle_empty_content(content, choice, response, max_tokens)
+
+        return content
+
+    def _make_api_call(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_tokens: Optional[int],
+        response_format: Optional[Dict[str, str]],
+    ) -> str:
+        """Make a single attempt to call the OpenAI API."""
+        self.logger.info(f'Making API call with model: {self.model}')
+        model_config = self.MODEL_CONFIG.get(self.model, {})
+
+        # Prepare messages for the model
+        messages = self._prepare_messages_for_model(messages, model_config)
+
+        # Build API call parameters
+        kwargs = self._build_api_kwargs(
+            messages, temperature, max_tokens, response_format, model_config
+        )
+
         def api_call_fn():
+            """Execute the API call and return content."""
             client = self._get_client_for_model(self.model)
             response = client.chat.completions.create(**kwargs)
-            return response.choices[0].message.content
+            return self._extract_response_content(response, max_tokens)
 
         return retry_with_backoff(
             api_call_fn,
@@ -405,7 +592,7 @@ class LLMService:
             Exception: If the call fails after all retries, with improved error message.
         """
         vision_model = model or self.visual_model
-        
+
         # Count images in the request
         image_count = 0
         text_length = 0
@@ -419,7 +606,7 @@ class LLMService:
                             text_length += len(item.get('text', ''))
             elif isinstance(msg.get('content'), str):
                 text_length += len(msg['content'])
-        
+
         self.logger.info(
             f'[Visual LLM] Calling vision model: {vision_model}, '
             f'messages: {len(messages)}, images: {image_count}, '

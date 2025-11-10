@@ -58,7 +58,7 @@ Classify the given problem into one or more of these types:
 
 IMPORTANT CLASSIFICATION GUIDELINES:
 - **Information Retrieval** should be PRIMARY when:
-  * The problem requires specific counts, statistics, or data from a known source (e.g., "articles published by Nature", "USGS occurrence records")
+  * The problem requires specific counts, statistics, or data from a known source
   * The problem mentions a specific database, archive, or official website by name
   * The answer requires navigating to a website to extract structured data
   * Search alone is insufficient - direct website navigation is needed

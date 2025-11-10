@@ -135,8 +135,8 @@ IMPORTANT: Return your response as valid JSON only, without any markdown formatt
   - **DEPENDENCY RESULTS**: If this subtask has dependencies, the results from dependency subtasks will be automatically added to the context. For llm_reasoning, describe in the task_description which dependency results to use (e.g., "Use data from step_1 and step_2 to calculate...").
   - **SEARCH RESULTS**: When task_description references search results from dependencies, describe what information to extract from them clearly.
 For search: {"query": "search query", "num_results": 5}
-  - Generate specific, detailed search queries that include key terms, dates, and requirements
-  - Example: Instead of "AI papers", use "arXiv AI regulation papers submitted June 2022"
+  - Generate search queries using general, broad keywords that include key terms, dates, and requirements
+  - Use core concepts, entities, and topics rather than overly specific measurement or quantification terms
 For browser_navigate: {"url": "https://...", "action": "click_link|extract_text|find_table|search_text|extract_count|extract_statistics", "link_text": "...", "selector": "...", "extraction_query": "..."}
   - url (REQUIRED): Must be a valid URL with scheme (e.g., "https://www.example.com"). This is MANDATORY - you MUST provide a valid URL.
   - action (optional):

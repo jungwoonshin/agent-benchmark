@@ -3,6 +3,12 @@
 import logging
 import sys
 
+from .arxiv_utils import (
+    extract_arxiv_id_from_text,
+    extract_arxiv_id_from_url,
+    get_arxiv_metadata,
+    get_arxiv_submission_date,
+)
 from .error_handling import (
     CircuitBreaker,
     ErrorCategory,
@@ -27,6 +33,10 @@ def setup_logging():
 
 
 __all__ = [
+    'extract_arxiv_id_from_text',
+    'extract_arxiv_id_from_url',
+    'get_arxiv_metadata',
+    'get_arxiv_submission_date',
     'extract_json_from_text',
     'safe_json_loads',
     'classify_error',
@@ -36,4 +46,3 @@ __all__ = [
     'ErrorCategory',
     'setup_logging',
 ]
-

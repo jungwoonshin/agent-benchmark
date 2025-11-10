@@ -68,7 +68,9 @@ CRITICAL REQUIREMENTS:
 - Use dates in format: "August 11 2016" or "2016-08-11" or "August 2016"
 - Separate keywords with spaces, NOT commas or special formatting
 - Make queries DIFFERENT from the previous ones - try alternative keyword combinations, synonyms, or different phrasings
-- Focus on the core information needed to complete the subtask
+- Use general, broad keywords rather than overly specific terms
+- Avoid specific measurement or quantification terms that narrow the search too much
+- Focus on core concepts, entities, and topics rather than specific attributes or metrics
 
 Return a JSON object with:
 - search_queries: array of exactly 3 different search queries in keyword-only format, ordered from simple to complex

@@ -177,7 +177,9 @@ Be lenient on process quality - focus on answer correctness."""
             return {
                 'is_correct': validation_data.get('is_correct', False),
                 'reason': validation_data.get('reason', 'No reason provided'),
-                'incorrect_subtask_ids': validation_data.get('incorrect_subtask_ids', []),
+                'incorrect_subtask_ids': validation_data.get(
+                    'incorrect_subtask_ids', []
+                ),
             }
 
         except Exception as e:
