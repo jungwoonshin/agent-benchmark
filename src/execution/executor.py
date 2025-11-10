@@ -149,7 +149,7 @@ class Executor:
             'code_interpreter',
             'read_attachment',
             'analyze_media',
-        ]
+        ] and not tool_name.endswith('_api')
 
         if should_search_first and tool_name != 'search':
             search_queries = self._get_search_queries_from_metadata(subtask)
@@ -740,6 +740,64 @@ class Executor:
         attachment = attachments[parameters.get('attachment_index', 0)]
         analysis_type = parameters.get('analysis_type', 'auto')
         return self.tool_belt.analyze_media(attachment, analysis_type)
+    
+    def _execute_api_tool(
+        self,
+        tool_name: str,
+        parameters: Dict[str, Any],
+    ) -> Any:
+        """
+        Execute an API tool.
+        
+        Args:
+            tool_name: Name of the API tool (e.g., 'github_api', 'wikipedia_api')
+            parameters: Parameters for the API call, must include 'api_name' and 'method'
+        
+        Returns:
+            API response
+        """
+        # Extract API name from tool name (remove '_api' suffix)
+        api_name = tool_name.replace('_api', '')
+        
+        # Get method from parameters
+        method = parameters.get('method')
+        if not method:
+            error_msg = f'API tool {tool_name} requires "method" parameter. Received parameters: {json.dumps(parameters, default=str)}'
+            self.logger.error(error_msg)
+            return {
+                'success': False,
+                'error': error_msg,
+                'parameters_received': parameters,
+            }
+        
+        # Remove method from parameters before passing to API
+        api_params = {k: v for k, v in parameters.items() if k != 'method'}
+        
+        try:
+            result = self.tool_belt.call_api(api_name, method, **api_params)
+            if result is None:
+                return {
+                    'success': False,
+                    'error': f'API call {api_name}.{method} returned None',
+                    'api_name': api_name,
+                    'method': method,
+                }
+            return {
+                'success': True,
+                'api_name': api_name,
+                'method': method,
+                'data': result,
+            }
+        except Exception as e:
+            error_msg = f'API call {api_name}.{method} failed: {str(e)}'
+            self.logger.error(error_msg, exc_info=True)
+            return {
+                'success': False,
+                'error': error_msg,
+                'api_name': api_name,
+                'method': method,
+                'exception_type': type(e).__name__,
+            }
 
     def _format_and_store_result(
         self, subtask: Subtask, result: Any, state_before: Dict[str, Any]
@@ -937,6 +995,8 @@ class Executor:
                 )
             elif tool_name == 'analyze_media':
                 result = self._execute_analyze_media(parameters, attachments)
+            elif tool_name.endswith('_api'):
+                result = self._execute_api_tool(tool_name, parameters)
             else:
                 result = f'Error: Unknown tool {tool_name}'
 

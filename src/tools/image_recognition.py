@@ -985,14 +985,20 @@ Example: {{"relevant_titles": ["Introduction", "Methodology", "Results"]}}"""
             return []  # Return empty list if filtering fails - no fallback to all sections
 
     def extract_arxiv_metadata_from_pdf(
-        self, attachment: Attachment
+        self, 
+        attachment: Attachment,
+        tool_belt: Optional[Any] = None,
+        download_pdf: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """
         Extract arXiv metadata (submission date, paper ID) using arXiv API.
-        Extracts paper ID from URL or PDF content, then fetches metadata from arXiv API.
+        Extracts paper ID from URL or PDF content, then fetches full metadata from arXiv API.
+        Optionally downloads PDF content if not already present.
 
         Args:
             attachment: PDF attachment to extract metadata from.
+            tool_belt: Optional ToolBelt instance for downloading PDFs if needed.
+            download_pdf: If True, download PDF from arXiv if paper_id is found and PDF not already present.
 
         Returns:
             Dictionary with keys:
@@ -1000,6 +1006,17 @@ Example: {{"relevant_titles": ["Introduction", "Methodology", "Results"]}}"""
             - submission_date: Original submission date (YYYY-MM-DD format if found)
             - submission_date_text: Raw submission date text from PDF
             - submission_month: Month of submission (YYYY-MM format if found)
+            - updated_date: Last updated date (YYYY-MM-DD format if found)
+            - updated_date_text: Human-readable updated date
+            - title: Paper title
+            - authors: List of authors
+            - categories: List of categories
+            - primary_category: Primary category
+            - summary: Paper abstract
+            - comment: Comments (if available)
+            - journal_ref: Journal reference (if available)
+            - doi: DOI (if available)
+            - pdf_url: URL to PDF
             - confidence: Confidence score (0.0-1.0)
             None if extraction fails.
         """
@@ -1035,23 +1052,47 @@ Example: {{"relevant_titles": ["Introduction", "Methodology", "Results"]}}"""
                 except Exception as e:
                     self.logger.debug(f'Failed to extract arXiv ID from PDF text: {e}')
 
-        # If we have a paper_id, fetch metadata from arXiv API
+        # If we have a paper_id, fetch full metadata from arXiv API
         if paper_id:
             try:
-                metadata = get_arxiv_metadata(paper_id, self.logger)
+                # Download PDF if requested and tool_belt is available
+                metadata = get_arxiv_metadata(
+                    paper_id, 
+                    self.logger, 
+                    download_pdf=download_pdf,
+                    tool_belt=tool_belt,
+                )
                 if metadata:
-                    # Return in the expected format (only include expected keys)
+                    # Include all metadata fields for relevance checking
                     result = {
                         'paper_id': metadata.get('paper_id'),
+                        'entry_id': metadata.get('entry_id'),
                         'submission_date': metadata.get('submission_date'),
                         'submission_date_text': metadata.get('submission_date_text'),
                         'submission_month': metadata.get('submission_month'),
+                        'updated_date': metadata.get('updated_date'),
+                        'updated_date_text': metadata.get('updated_date_text'),
+                        'title': metadata.get('title'),
+                        'authors': metadata.get('authors'),
+                        'categories': metadata.get('categories'),
+                        'primary_category': metadata.get('primary_category'),
+                        'summary': metadata.get('summary'),
+                        'comment': metadata.get('comment'),
+                        'journal_ref': metadata.get('journal_ref'),
+                        'doi': metadata.get('doi'),
+                        'pdf_url': metadata.get('pdf_url'),
                         'confidence': metadata.get('confidence', 1.0),
                     }
+                    
+                    # Include PDF attachment if downloaded
+                    if 'pdf_attachment' in metadata:
+                        result['pdf_attachment'] = metadata['pdf_attachment']
 
                     self.logger.info(
-                        f'Extracted arXiv metadata from API - Date: {result["submission_date"]}, '
-                        f'Paper ID: {result["paper_id"]}, Confidence: {result["confidence"]:.2f}'
+                        f'Extracted full arXiv metadata from API - Date: {result["submission_date"]}, '
+                        f'Updated: {result.get("updated_date")}, '
+                        f'Paper ID: {result["paper_id"]}, '
+                        f'Title: {result.get("title", "N/A")[:50]}...'
                     )
                     return result
                 else:

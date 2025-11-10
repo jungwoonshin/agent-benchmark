@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import stat
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from urllib.parse import urljoin
@@ -18,6 +19,8 @@ import requests
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    ElementNotInteractableException,
     NoSuchElementException,
     TimeoutException,
     WebDriverException,
@@ -909,6 +912,120 @@ class Browser:
         # Limit to avoid too many elements
         return expandable_elements[:30]
 
+    def _dismiss_popups_and_banners(self) -> bool:
+        """
+        Attempt to dismiss cookie consent banners and other popup dialogs.
+
+        Returns:
+            True if any popup was dismissed, False otherwise.
+        """
+        if not self.driver:
+            return False
+
+        dismissed = False
+
+        # Common selectors for cookie consent banners and popups
+        popup_selectors = [
+            # Cookie consent banners
+            'dialog[data-cc-banner]',
+            'dialog.cc-banner',
+            '[data-cc-banner]',
+            '.cc-banner',
+            # Generic popup/dialog patterns
+            'dialog[open]',
+            '.modal[style*="display: block"]',
+            '.popup[style*="display: block"]',
+            # Common accept/close buttons
+            'button[data-cc-action="accept"]',
+            'button[data-cc-action="dismiss"]',
+            'button.cc-banner__button--accept',
+            'button.cc-banner__button--dismiss',
+            '[aria-label*="accept" i]',
+            '[aria-label*="dismiss" i]',
+            '[aria-label*="close" i]',
+        ]
+
+        # XPath selectors for text-based matching (used separately)
+        xpath_selectors = [
+            '//button[contains(text(), "Accept")]',
+            '//button[contains(text(), "Dismiss")]',
+            '//button[contains(text(), "Close")]',
+            '//button[contains(translate(text(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "accept")]',
+        ]
+
+        try:
+            # Try to find and close cookie consent banners
+            for selector in popup_selectors[:4]:  # Focus on dialog elements first
+                try:
+                    popup = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    if popup.is_displayed():
+                        # Try to find accept/dismiss button within the popup
+                        accept_buttons = popup.find_elements(
+                            By.CSS_SELECTOR,
+                            'button[data-cc-action="accept"], '
+                            'button[data-cc-action="dismiss"], '
+                            'button.cc-banner__button--accept, '
+                            'button.cc-banner__button--dismiss, '
+                            '[aria-label*="accept" i], '
+                            '[aria-label*="dismiss" i]',
+                        )
+
+                        if accept_buttons:
+                            # Click the first accept/dismiss button
+                            self.driver.execute_script(
+                                'arguments[0].click();', accept_buttons[0]
+                            )
+                            dismissed = True
+                            self.logger.info('Dismissed cookie consent banner')
+                            time.sleep(0.5)  # Wait for popup to close
+                            break
+                        else:
+                            # Try to close the dialog directly via JavaScript
+                            self.driver.execute_script(
+                                'arguments[0].removeAttribute("open"); '
+                                'arguments[0].style.display = "none";',
+                                popup,
+                            )
+                            dismissed = True
+                            self.logger.info('Closed popup dialog via JavaScript')
+                            time.sleep(0.5)
+                            break
+                except (NoSuchElementException, ElementNotInteractableException):
+                    continue
+
+            # Also try to find standalone accept buttons using CSS selectors
+            if not dismissed:
+                for selector in popup_selectors[4:]:
+                    try:
+                        button = self.driver.find_element(By.CSS_SELECTOR, selector)
+                        if button.is_displayed():
+                            self.driver.execute_script('arguments[0].click();', button)
+                            dismissed = True
+                            self.logger.info('Clicked popup dismiss button')
+                            time.sleep(0.5)
+                            break
+                    except (NoSuchElementException, ElementNotInteractableException):
+                        continue
+
+            # Try XPath selectors for text-based button matching
+            if not dismissed:
+                for xpath in xpath_selectors:
+                    try:
+                        button = self.driver.find_element(By.XPATH, xpath)
+                        if button.is_displayed():
+                            self.driver.execute_script('arguments[0].click();', button)
+                            dismissed = True
+                            self.logger.info('Clicked popup dismiss button via XPath')
+                            time.sleep(0.5)
+                            break
+                    except (NoSuchElementException, ElementNotInteractableException):
+                        continue
+
+        except Exception as e:
+            self.logger.debug(f'Error dismissing popups: {e}')
+
+        return dismissed
+
     def toggle_expandable_element(
         self,
         element_info: Dict[str, Any],
@@ -965,6 +1082,9 @@ class Browser:
                     'error': f'Element not found: {element_info.get("text", "unknown")}',
                 }
 
+            # Dismiss any popups/banners that might intercept clicks
+            self._dismiss_popups_and_banners()
+
             # Scroll element into view
             self.driver.execute_script(
                 'arguments[0].scrollIntoView({behavior: "smooth", block: "center"});',
@@ -972,15 +1092,45 @@ class Browser:
             )
 
             # Wait a bit for scroll
-            import time
-
             time.sleep(0.5)
 
-            # Click the element
-            element.click()
-            self.logger.info(
-                f'Toggled expandable element: {element_info.get("text", "unknown")}'
-            )
+            # Try to click the element with error handling
+            try:
+                element.click()
+            except (
+                ElementClickInterceptedException,
+                ElementNotInteractableException,
+            ) as e:
+                # If click is intercepted, try dismissing popups again
+                self.logger.warning(
+                    f'Click intercepted, attempting to dismiss popups: {e}'
+                )
+                self._dismiss_popups_and_banners()
+                time.sleep(0.5)
+
+                # Try JavaScript click as fallback
+                try:
+                    self.driver.execute_script('arguments[0].click();', element)
+                    self.logger.info('Used JavaScript click as fallback')
+                except Exception:
+                    # If JavaScript click also fails, try scrolling more and retry
+                    self.driver.execute_script(
+                        'window.scrollTo(0, arguments[0].offsetTop - 200);', element
+                    )
+                    time.sleep(0.5)
+                    try:
+                        self.driver.execute_script('arguments[0].click();', element)
+                        self.logger.info(
+                            'Used JavaScript click after scroll adjustment'
+                        )
+                    except Exception as final_error:
+                        raise ElementClickInterceptedException(
+                            f'Failed to click element after multiple attempts: {final_error}'
+                        )
+            else:
+                self.logger.info(
+                    f'Toggled expandable element: {element_info.get("text", "unknown")}'
+                )
 
             # Wait for page to update
             WebDriverWait(self.driver, wait_for_js).until(
@@ -995,6 +1145,11 @@ class Browser:
             return {
                 'success': False,
                 'error': f'Element not found or not clickable: {e}',
+            }
+        except (ElementClickInterceptedException, ElementNotInteractableException) as e:
+            return {
+                'success': False,
+                'error': f'Element click intercepted or not interactable: {e}',
             }
         except Exception as e:
             self.logger.error(f'Toggle failed: {e}', exc_info=True)

@@ -6,17 +6,18 @@ import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
-import html2text
-
 from ..llm import LLMService
 from ..models import Attachment, SearchResult
 from ..utils import extract_json_from_text
-from ..utils.arxiv_utils import get_arxiv_submission_date
+from .api_formatter import APIFormatter
 from .browser import Browser
+from .content_formatter import ContentFormatter
+from .content_summarizer import ContentSummarizer
 from .content_type_classifier import ContentTypeClassifier
 from .content_type_detector import ContentTypeDetector
 from .file_type_navigator import FileTypeNavigator
 from .relevance_checker import RelevanceChecker
+from .relevance_ranker import RelevanceRanker
 
 if TYPE_CHECKING:
     from src.tools import ToolBelt
@@ -55,43 +56,15 @@ class SearchResultProcessor:
         self.content_type_classifier = ContentTypeClassifier(llm_service, logger)
         self.content_type_detector = ContentTypeDetector(llm_service, logger)
         self.file_type_navigator = FileTypeNavigator(browser, logger, llm_service)
+        # Initialize helper modules
+        self.api_formatter = APIFormatter(tool_belt, logger)
+        self.content_formatter = ContentFormatter(logger)
+        self.content_summarizer = ContentSummarizer(llm_service, logger)
+        self.relevance_ranker = RelevanceRanker(llm_service, logger)
 
     def _format_text_for_logging(self, text: str) -> str:
-        """
-        Format text for logging by showing first 2 sentences and total length.
-
-        Args:
-            text: Text content to format.
-
-        Returns:
-            Formatted string with first 2 sentences and length info.
-        """
-        if not text:
-            return '[Empty text]'
-
-        # Split into sentences (simple approach: split on period, exclamation, question mark)
-        sentences = re.split(r'([.!?]+)', text)
-
-        # Reconstruct sentences with punctuation
-        reconstructed = []
-        for i in range(0, len(sentences) - 1, 2):
-            if i + 1 < len(sentences):
-                sentence = sentences[i] + sentences[i + 1]
-                if sentence.strip():
-                    reconstructed.append(sentence.strip())
-
-        # Get first 2 sentences
-        if len(reconstructed) >= 2:
-            preview = ' '.join(reconstructed[:2])
-        elif len(reconstructed) == 1:
-            preview = reconstructed[0]
-        else:
-            # Fallback: first 200 chars if no sentence breaks found
-            preview = text[:200].strip()
-
-        # Add length info
-        total_length = len(text)
-        return f'{preview}... [Length: {total_length} chars]'
+        """Format text for logging (delegates to ContentFormatter)."""
+        return self.content_formatter.format_text_for_logging(text)
 
     def _rank_search_results_by_relevance(
         self,
@@ -100,165 +73,10 @@ class SearchResultProcessor:
         problem: str,
         query_analysis: Optional[Dict[str, Any]] = None,
     ) -> List[SearchResult]:
-        """
-        Use LLM to select and rank relevant search results (based on title, snippet, URL only).
-        This is done BEFORE downloading/navigating to save time and resources.
-        The LLM decides which results are relevant enough to include, not just ranks all of them.
-
-        Args:
-            search_results: List of SearchResult objects to filter and rank.
-            subtask_description: Description of the subtask being executed.
-            problem: Original problem description.
-            query_analysis: Optional query analysis results.
-
-        Returns:
-            List of SearchResult objects that are relevant, sorted by relevance (most relevant first).
-            Only includes results that the LLM determined are relevant enough.
-        """
-        if not search_results:
-            return []
-
-        if len(search_results) == 1:
-            # For single result, include it (let full processing decide relevance)
-            return search_results
-
-        self.logger.info(
-            f'Using LLM to select relevant search results from {len(search_results)} total results...'
+        """Rank search results by relevance (delegates to RelevanceRanker)."""
+        return self.relevance_ranker.rank_by_relevance(
+            search_results, subtask_description, problem, query_analysis
         )
-
-        # Build context from query analysis
-        requirements_context = ''
-        if query_analysis:
-            explicit_reqs = query_analysis.get('explicit_requirements', [])
-            if explicit_reqs:
-                requirements_context += (
-                    f'\nExplicit Requirements: {", ".join(explicit_reqs)}'
-                )
-
-        # Format search results for LLM with submission_date for arXiv papers
-        results_text = []
-        for idx, result in enumerate(search_results, 1):
-            snippet_preview = (
-                result.snippet[:300] + '...'
-                if len(result.snippet) > 300
-                else result.snippet
-            )
-
-            # Get submission_date for arXiv papers using arxiv library
-            submission_date = get_arxiv_submission_date(result.url, self.logger)
-
-            # Build result text with submission_date on top if available
-            result_lines = []
-            if submission_date:
-                result_lines.append(f'Submission Date: {submission_date}')
-            result_lines.append(f'Title: {result.title}')
-            result_lines.append(f'URL: {result.url}')
-            result_lines.append(f'Snippet: {snippet_preview}')
-
-            results_text.append(f'[{idx}]\n' + '\n'.join(result_lines))
-
-        system_prompt = """You are an expert at identifying search result candidates for a specific task.
-Given a subtask description and a list of search results (with title, URL, and snippet), determine which results are promising enough to be considered as candidates for further processing.
-
-Your task:
-1. Analyze each search result based on its title, URL, and snippet
-2. Determine if each result is a good CANDIDATE - meaning it appears relevant enough to potentially contain useful information for the subtask
-3. Include results that show promise or potential relevance, even if not perfectly aligned
-4. Exclude only results that are clearly irrelevant, completely off-topic, or obviously unrelated
-5. Rank the selected candidates from most promising to least promising
-6. Assign a candidate score from 0.0 to 1.0 for each selected result (indicating how promising it is as a candidate)
-
-CRITICAL: Focus on candidate selection, not strict relevance. Include results that are promising enough to warrant further investigation. It's better to include a reasonable set of candidates than to be overly restrictive.
-
-IMPORTANT DATE HANDLING: When evaluating dates (especially for arXiv papers):
-- Use the Submission Date field if provided (this is the actual submission date from arXiv API)
-- DO NOT use arXiv ID formats (e.g., 2207.01510) to infer submission dates - the arXiv ID format does not reliably indicate the actual submission date
-- ONLY use explicit date information from snippets, metadata, or the Submission Date field
-- If a snippet mentions "submitted on [date]" or "originally submitted [date]", use that date
-- If no explicit date is mentioned in the snippet and no Submission Date field is provided, do not infer dates from arXiv IDs or URLs
-
-Return a JSON object with:
-- selected_indices: array of result indices (1-based) that are good candidates, sorted by promise (most promising first)
-- scores: object mapping result index (as string, 1-based) to candidate score (0.0 to 1.0) for selected results
-- reasoning: brief explanation of which results were selected as candidates and why (1-2 sentences)
-
-IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
-
-        user_prompt = f"""Problem: {problem}
-
-Subtask: {subtask_description}
-{requirements_context}
-
-Search Results:
-{chr(10).join(results_text)}
-
-Identify which search results are promising enough to be considered as candidates for further processing. Select results that appear relevant enough to potentially contain useful information for this subtask. Return only the indices of candidate results, sorted from most promising to least promising. Exclude only results that are clearly irrelevant, completely off-topic, or obviously unrelated."""
-
-        try:
-            response = self.llm_service.call_with_system_prompt(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                temperature=0.3,  # Lower temperature for consistent selection
-                response_format={'type': 'json_object'},
-            )
-
-            json_text = extract_json_from_text(response)
-            result_data = json.loads(json_text)
-
-            selected_indices = result_data.get('selected_indices', [])
-            scores = result_data.get('scores', {})
-            reasoning = result_data.get('reasoning', 'No reasoning provided')
-
-            self.logger.info(
-                f'LLM selection complete. Selected {len(selected_indices)} relevant result(s) out of {len(search_results)} total. Reasoning: {reasoning}'
-            )
-
-            # Validate selected_indices
-            if not selected_indices:
-                self.logger.warning(
-                    'LLM did not select any relevant results. Using first result as fallback.'
-                )
-                # Fallback: return first result to avoid empty list
-                return [search_results[0]] if search_results else []
-
-            # Convert 1-based indices to 0-based and validate
-            valid_indices = []
-            for idx in selected_indices:
-                try:
-                    idx_int = int(idx) - 1  # Convert to 0-based
-                    if 0 <= idx_int < len(search_results):
-                        valid_indices.append(idx_int)
-                except (ValueError, TypeError):
-                    continue
-
-            if not valid_indices:
-                self.logger.warning(
-                    'No valid indices found in LLM response. Using first result as fallback.'
-                )
-                return [search_results[0]] if search_results else []
-
-            # Get selected results in order (already sorted by relevance)
-            selected_results = [search_results[i] for i in valid_indices]
-
-            # Update relevance scores if provided
-            for idx, result in enumerate(selected_results):
-                original_idx = valid_indices[idx]
-                score_key = str(original_idx + 1)  # 1-based for score lookup
-                if score_key in scores:
-                    result.relevance_score = float(scores[score_key])
-
-            self.logger.info(
-                f'Selected {len(selected_results)} relevant search result(s). Top result: {selected_results[0].title[:50]}...'
-            )
-
-            return selected_results
-
-        except Exception as e:
-            self.logger.warning(
-                f'Failed to select relevant search results using LLM: {e}. Using first {min(3, len(search_results))} results as fallback.'
-            )
-            # Fallback: return first few results
-            return search_results[: min(3, len(search_results))]
 
     def process_search_results(
         self,
@@ -334,7 +152,7 @@ Identify which search results are promising enough to be considered as candidate
         self.logger.info('\n'.join(search_results_summary))
 
         # Step 1: Use LLM to select relevant search results (before processing)
-        selected_results = self._rank_search_results_by_relevance(
+        selected_results = self.relevance_ranker.rank_by_relevance(
             search_results, subtask_description, problem, query_analysis
         )
 
@@ -417,7 +235,7 @@ Identify which search results are promising enough to be considered as candidate
 
         # Step 5: Extract and structure content - summarize using LLM
         if content_parts:
-            content_summary = self._summarize_content_with_llm(
+            content_summary = self.content_summarizer.summarize_multiple_results(
                 content_parts, problem, subtask_description, query_analysis
             )
         else:
@@ -573,97 +391,10 @@ Does this subtask require visual analysis (image recognition, screenshot analysi
         query_analysis: Optional[Dict[str, Any]] = None,
         content_type: str = 'general',
     ) -> str:
-        """
-        Summarize a single search result's content with subtask_description and problem context.
-
-        Args:
-            content: Full content to summarize.
-            subtask_description: Description of the subtask.
-            problem: Original problem description.
-            query_analysis: Optional query analysis results.
-            content_type: Type of content ('web_page', 'pdf', 'file', 'general').
-
-        Returns:
-            Summarized content string.
-        """
-        if not content or len(content.strip()) < 50:
-            return content
-
-        # Build context from query analysis
-        requirements_context = ''
-        if query_analysis:
-            explicit_reqs = query_analysis.get('explicit_requirements', [])
-            answer_format = query_analysis.get('answer_format', '')
-
-            if explicit_reqs:
-                requirements_context += (
-                    f'\nExplicit Requirements: {", ".join(explicit_reqs)}'
-                )
-            if answer_format:
-                requirements_context += f'\nAnswer Format: {answer_format}'
-
-        system_prompt = """You are an expert at summarizing and structuring search result content.
-Given a search result from a web page or file, create a focused summary that extracts key information relevant to the problem and subtask.
-
-Your task:
-1. Extract and highlight information that directly addresses the problem requirements and subtask description
-2. Preserve important facts, numbers, dates, and specific details
-3. Structure the summary logically and clearly
-4. Focus on actionable information that helps solve the problem and complete the subtask
-5. Remove redundant or irrelevant information
-6. Maintain context about where information came from (web pages vs files)
-
-Return a well-structured summary that:
-- Preserves critical details and facts
-- Is organized and easy to understand
-- Focuses on relevance to the problem and subtask description
-- Includes source indicators when relevant"""
-
-        # Limit content length to avoid token limits
-        max_content_length = 12000
-        content_to_summarize = content
-        if len(content) > max_content_length:
-            content_to_summarize = (
-                content[:max_content_length]
-                + '\n\n[... Content truncated for summarization ...]'
-            )
-            self.logger.debug(
-                f'Content truncated from {len(content)} to {max_content_length} chars for summarization'
-            )
-
-        user_prompt = f"""Main Problem: {problem}
-
-Current Subtask: {subtask_description}
-{requirements_context}
-
-Search Result Content ({content_type}):
-{content_to_summarize}
-
-Summarize this content, extracting key information relevant to solving the problem and completing the subtask. Focus on facts, numbers, dates, and specific details that are directly useful for the subtask description."""
-
-        try:
-            self.logger.info(
-                f'Summarizing {content_type} content ({len(content)} chars) with subtask and problem context'
-            )
-
-            summary = self.llm_service.call_with_system_prompt(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                temperature=0.3,  # Lower temperature for consistent summarization
-                max_tokens=8192,  # Reasonable token limit
-            )
-
-            self.logger.info(
-                f'Content summarized: {len(summary)} chars (from {len(content)} chars)'
-            )
-
-            return summary
-
-        except Exception as e:
-            self.logger.warning(
-                f'Failed to summarize content: {e}. Using original content.'
-            )
-            return content
+        """Summarize single result content (delegates to ContentSummarizer)."""
+        return self.content_summarizer.summarize_single_result(
+            content, subtask_description, problem, query_analysis, content_type
+        )
 
     def _process_single_result(
         self,
@@ -706,7 +437,22 @@ Summarize this content, extracting key information relevant to solving the probl
         )
         self.logger.info(f'Required content type for subtask: {required_content_type}')
 
-        # Step 2: Download/navigate FIRST to get full content (before checking relevance)
+        # Step 2: Try API first before downloading/navigating
+        api_result = None
+        try:
+            api_result = self.tool_belt.try_api_for_search_result(
+                result.url, problem, subtask_description
+            )
+            if api_result:
+                self.logger.info(
+                    f'Successfully retrieved data from {api_result["api_name"]} API for {result.url}'
+                )
+        except Exception as e:
+            self.logger.debug(
+                f'API check failed for {result.url}: {e}. Proceeding with normal download/navigation.'
+            )
+
+        # Step 3: Download/navigate FIRST to get full content (before checking relevance)
         # Check and adjust URL parameters if needed
         adjusted_url = self._check_and_adjust_url_parameters(
             result.url, subtask_description, problem, query_analysis
@@ -715,14 +461,51 @@ Summarize this content, extracting key information relevant to solving the probl
             self.logger.info(f'URL parameters adjusted: {result.url} -> {adjusted_url}')
             result.url = adjusted_url
 
-        # Download/navigate to get full content
-        is_file, file_type = self._classify_result_type(result)
+        # Initialize variables
+        is_file = False
+        file_type = None
         full_content = None
         extracted_data = None
         section_titles = None
         content_type = None
 
-        if is_file:
+        # If API was successful, format API data and use it instead of downloading/navigating
+        if api_result:
+            api_data = api_result.get('data')
+            api_name = api_result.get('api_name')
+
+            # Format API data into content format
+            formatted_content = self.api_formatter.format(
+                api_data, api_name, result.url
+            )
+            if formatted_content:
+                full_content = formatted_content
+                content_type = 'api_data'
+                extracted_data = {
+                    'type': 'api_data',
+                    'api_name': api_name,
+                    'url': result.url,
+                    'content': formatted_content,
+                    'raw_data': api_data,
+                }
+                section_titles = None
+                # Skip download/navigation since we have API data
+                is_file = False
+                file_type = None
+            else:
+                # API data formatting failed, fall back to normal processing
+                self.logger.warning(
+                    f'Failed to format API data from {api_name}. Falling back to normal processing.'
+                )
+                api_result = None
+
+        # If API was not used or failed, proceed with normal download/navigation
+        if not api_result:
+            # Download/navigate to get full content
+            is_file, file_type = self._classify_result_type(result)
+
+        # Process file download/navigation only if API was not used
+        if not api_result and is_file:
             self.logger.info(
                 f'Result {result_info} is a file (type: {file_type}). Downloading to extract content...'
             )
@@ -847,7 +630,8 @@ Summarize this content, extracting key information relevant to solving the probl
                     f'Failed to download/extract content from {result.url}: {e}'
                 )
                 return None
-        else:
+        elif not api_result:
+            # Only process web pages if API was not used
             self.logger.info(
                 f'Result {result_info} is a web page. Navigating to extract content...'
             )
@@ -867,12 +651,16 @@ Summarize this content, extracting key information relevant to solving the probl
                         # Get full content and ensure it's formatted with html2text
                         raw_content = page_result.get('content', '')
                         # Format with html2text to get full formatted content
-                        full_content = self._format_web_page_content(raw_content)
+                        full_content = self.content_formatter.format_web_page_content(
+                            raw_content
+                        )
                         # Update the content in page_result with formatted version
                         page_result['content'] = full_content
                     else:
                         # String content - format with html2text
-                        full_content = self._format_web_page_content(page_result)
+                        full_content = self.content_formatter.format_web_page_content(
+                            page_result
+                        )
                         # Convert to dict format for consistency
                         page_result = {
                             'content': full_content,
@@ -1106,7 +894,7 @@ Summarize this content, extracting key information relevant to solving the probl
         )
 
         # Step 4: Summarize the full content with subtask_description and problem context
-        summarized_content = self._summarize_single_result_content(
+        summarized_content = self.content_summarizer.summarize_single_result(
             full_content,
             subtask_description,
             problem,
@@ -2106,76 +1894,24 @@ Which expandable elements should be toggled to reveal information needed for thi
             )
             return []
 
+    def _format_api_data(
+        self,
+        api_data: Any,
+        api_name: str,
+        url: str,
+    ) -> Optional[str]:
+        """Format API data (delegates to APIFormatter)."""
+        return self.api_formatter.format(api_data, api_name, url)
+
     def _format_web_page_content(self, content: str) -> str:
-        """
-        Format web page content using html2text for better readability.
-
-        Args:
-            content: Content string (may be HTML, markdown, or plain text).
-
-        Returns:
-            Formatted content string in markdown format.
-        """
-        if not content:
-            return content
-
-        # If content looks like HTML (contains HTML tags), convert it
-        if re.search(r'<[a-z][\s\S]*>', content, re.IGNORECASE):
-            try:
-                # Configure html2text converter for good formatting
-                h = html2text.HTML2Text()
-                h.ignore_links = False
-                h.ignore_images = False
-                h.body_width = 0  # Don't wrap lines
-                h.unicode_snob = True  # Use unicode characters
-                h.skip_internal_links = False
-                h.inline_links = True  # Put links inline
-                h.escape_snob = True  # Don't escape special characters unnecessarily
-
-                # Convert HTML to markdown
-                formatted = h.handle(content)
-                return formatted.strip()
-            except Exception as e:
-                self.logger.warning(
-                    f'Failed to format content with html2text: {e}. Using original content.'
-                )
-                return content
-
-        # If content is already markdown or plain text, return as-is
-        return content
+        """Format web page content (delegates to ContentFormatter)."""
+        return self.content_formatter.format_web_page_content(content)
 
     def _extract_navigation_content(self, nav_result: Dict[str, Any]) -> str:
-        """
-        Extract meaningful content from browser navigation result.
-
-        Args:
-            nav_result: Result dictionary from browser_navigate.
-
-        Returns:
-            Formatted text content.
-        """
-        content_parts = []
-
-        # Extract URL
-        if nav_result.get('url'):
-            content_parts.append(f'URL: {nav_result["url"]}')
-
-        # Extract main text content
-        text_content = self.browser.extract_text(nav_result)
-        if text_content:
-            # For logging purposes, show first 2 sentences with length
-            content_parts.append(
-                f'Content: {self._format_text_for_logging(text_content)}'
-            )
-
-        # Extract structured data if available
-        table_data = self.browser.find_table(nav_result)
-        if table_data:
-            content_parts.append(
-                f'Table Data: {json.dumps(table_data, indent=2)[:1000]}'
-            )
-
-        return '\n\n'.join(content_parts) if content_parts else '[No content extracted]'
+        """Extract meaningful content from browser navigation result (delegates to ContentFormatter)."""
+        return self.content_formatter.extract_navigation_content(
+            nav_result, self.browser
+        )
 
     def _summarize_content_with_llm(
         self,
@@ -2184,133 +1920,7 @@ Which expandable elements should be toggled to reveal information needed for thi
         subtask_description: str,
         query_analysis: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """
-        Summarize search result content using LLM while considering main problem and query analysis.
-        Processes each content part individually for better focus and accuracy.
-
-        Args:
-            content_parts: List of content strings from processed search results.
-            problem: Original problem description.
-            subtask_description: Description of the subtask being executed.
-            query_analysis: Optional query analysis results.
-
-        Returns:
-            Summarized content string.
-        """
-        if not content_parts:
-            return ''
-
-        # Build context from query analysis (once, reused for all parts)
-        requirements_context = ''
-        if query_analysis:
-            explicit_reqs = query_analysis.get('explicit_requirements', [])
-            answer_format = query_analysis.get('answer_format', '')
-            dependencies = query_analysis.get('dependencies', [])
-
-            if explicit_reqs:
-                requirements_context += (
-                    f'\nExplicit Requirements: {", ".join(explicit_reqs)}'
-                )
-            if dependencies:
-                requirements_context += (
-                    f'\nInformation Dependencies: {", ".join(dependencies)}'
-                )
-            if answer_format:
-                requirements_context += f'\nAnswer Format: {answer_format}'
-
-        system_prompt = """You are an expert at summarizing and structuring search result content.
-Given a single search result from a web page or file, create a focused summary that extracts key information relevant to the problem and subtask.
-
-Your task:
-1. Extract and highlight information that directly addresses the problem requirements
-2. Preserve important facts, numbers, dates, and specific details
-3. Structure the summary logically and clearly
-4. Focus on actionable information that helps solve the problem
-5. Remove redundant or irrelevant information
-6. Maintain context about where information came from (web pages vs files)
-
-Return a well-structured summary that:
-- Preserves critical details and facts
-- Is organized and easy to understand
-- Focuses on relevance to the problem and subtask
-- Includes source indicators when relevant"""
-
-        summarized_parts = []
-        total_length = sum(len(part) for part in content_parts)
-
-        self.logger.info(
-            f'Summarizing {len(content_parts)} content parts individually '
-            f'({total_length} chars total) using LLM'
+        """Summarize content with LLM (delegates to ContentSummarizer)."""
+        return self.content_summarizer.summarize_multiple_results(
+            content_parts, problem, subtask_description, query_analysis
         )
-
-        # Process each content part individually
-        for idx, content_part in enumerate(content_parts):
-            try:
-                # Skip LLM call for very short content parts
-                if len(content_part) < 200:
-                    self.logger.debug(
-                        f'Part {idx + 1}/{len(content_parts)} is too short ({len(content_part)} chars), '
-                        f'skipping LLM summarization'
-                    )
-                    summarized_parts.append(content_part)
-                    continue
-
-                # Limit individual content length to avoid token limits
-                max_content_length = 8000
-                content_to_summarize = content_part
-                if len(content_part) > max_content_length:
-                    content_to_summarize = (
-                        content_part[:max_content_length]
-                        + '\n\n[... Content truncated for summarization ...]'
-                    )
-                    self.logger.debug(
-                        f'Part {idx + 1}/{len(content_parts)} truncated from {len(content_part)} '
-                        f'to {max_content_length} chars'
-                    )
-
-                user_prompt = f"""Main Problem: {problem}
-
-Current Subtask: {subtask_description}
-{requirements_context}
-
-Search Result Content (Part {idx + 1} of {len(content_parts)}):
-{content_to_summarize}
-
-Summarize this content, extracting key information relevant to solving the problem and completing the subtask. Focus on facts, numbers, dates, and specific details that are directly useful."""
-
-                self.logger.debug(
-                    f'Summarizing part {idx + 1}/{len(content_parts)} '
-                    f'({len(content_part)} chars)'
-                )
-
-                summary = self.llm_service.call_with_system_prompt(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    temperature=0.3,  # Lower temperature for consistent summarization
-                    max_tokens=8192,  # Reasonable token limit per part
-                )
-
-                summarized_parts.append(summary)
-                self.logger.debug(
-                    f'Part {idx + 1}/{len(content_parts)} summarized: '
-                    f'{len(summary)} chars (from {len(content_part)} chars)'
-                )
-
-            except Exception as e:
-                self.logger.warning(
-                    f'Failed to summarize content part {idx + 1}/{len(content_parts)}: {e}. '
-                    f'Using original content for this part.'
-                )
-                # Fallback to original content if summarization fails for this part
-                summarized_parts.append(content_part)
-
-        # Combine all summarized parts
-        final_summary = '\n\n---\n\n'.join(summarized_parts)
-        final_length = len(final_summary)
-
-        self.logger.info(
-            f'Content summarization complete: '
-            f'{final_length} chars (from {total_length} chars total)'
-        )
-
-        return final_summary

@@ -76,20 +76,40 @@ def build_arxiv_metadata_info(
     logger.info(
         f'Extracted arXiv metadata: paper_id={metadata.get("paper_id")}, '
         f'submission_date={metadata.get("submission_date")}, '
+        f'updated_date={metadata.get("updated_date")}, '
         f'submission_month={metadata.get("submission_month")}'
     )
 
+    # Paper ID
     if metadata.get('paper_id'):
         info += f'- Paper ID: {metadata["paper_id"]}\n'
+    
+    # Entry ID
+    if metadata.get('entry_id'):
+        info += f'- Entry ID: {metadata["entry_id"]}\n'
 
-    # Always show submission date section, even if empty
-    # This ensures submission dates appear before content_info
+    # Title
+    if metadata.get('title'):
+        info += f'- Title: {metadata["title"]}\n'
+
+    # Authors
+    authors = metadata.get('authors')
+    if authors and isinstance(authors, list) and len(authors) > 0:
+        authors_str = ', '.join(authors[:5])  # Show first 5 authors
+        if len(authors) > 5:
+            authors_str += f' (and {len(authors) - 5} more)'
+        info += f'- Authors: {authors_str}\n'
+
+    # Submission date (published date)
     submission_date = metadata.get('submission_date')
     submission_month = metadata.get('submission_month')
     submission_date_text = metadata.get('submission_date_text')
 
     if submission_date:
-        info += f'- Submission Date: {submission_date}\n'
+        info += f'- Submission Date: {submission_date}'
+        if submission_date_text:
+            info += f' ({submission_date_text})'
+        info += '\n'
     elif submission_month:
         info += f'- Submission Month: {submission_month}\n'
     elif submission_date_text:
@@ -100,6 +120,48 @@ def build_arxiv_metadata_info(
         logger.warning(
             'arXiv metadata extracted but no submission date information found'
         )
+
+    # Updated date
+    updated_date = metadata.get('updated_date')
+    updated_date_text = metadata.get('updated_date_text')
+    if updated_date:
+        info += f'- Updated Date: {updated_date}'
+        if updated_date_text:
+            info += f' ({updated_date_text})'
+        info += '\n'
+
+    # Categories
+    categories = metadata.get('categories')
+    if categories and isinstance(categories, list) and len(categories) > 0:
+        info += f'- Categories: {", ".join(categories)}\n'
+    
+    # Primary category
+    if metadata.get('primary_category'):
+        info += f'- Primary Category: {metadata["primary_category"]}\n'
+
+    # Summary/Abstract
+    if metadata.get('summary'):
+        summary = metadata['summary']
+        # Truncate if too long
+        if len(summary) > 500:
+            summary = summary[:500] + '...'
+        info += f'- Abstract: {summary}\n'
+
+    # Journal reference
+    if metadata.get('journal_ref'):
+        info += f'- Journal Reference: {metadata["journal_ref"]}\n'
+
+    # DOI
+    if metadata.get('doi'):
+        info += f'- DOI: {metadata["doi"]}\n'
+
+    # Comment
+    if metadata.get('comment'):
+        info += f'- Comment: {metadata["comment"]}\n'
+
+    # PDF URL
+    if metadata.get('pdf_url'):
+        info += f'- PDF URL: {metadata["pdf_url"]}\n'
 
     return info
 
@@ -334,8 +396,11 @@ def extract_arxiv_metadata_safely(
         logger.debug(
             'Attempting to extract arXiv metadata from PDF attachment using arxiv library'
         )
+        # Download PDF and fetch full metadata when checking relevance
         metadata = tool_belt.image_recognition.extract_arxiv_metadata_from_pdf(
-            attachment
+            attachment,
+            tool_belt=tool_belt,
+            download_pdf=True,  # Download full PDF content for relevance checking
         )
 
         if metadata:

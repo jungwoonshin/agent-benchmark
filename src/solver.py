@@ -2,10 +2,12 @@
 
 import logging
 import os
+import uuid
 from dataclasses import dataclass
 from typing import List, Optional
 
 from dotenv import load_dotenv
+from langfuse import observe, propagate_attributes
 
 from .core import Agent
 from .models import Attachment
@@ -74,9 +76,14 @@ class GAIASolver:
         # Create tool registry
         self.tool_registry = ToolRegistry(tool_belt)
 
+        # Session-based cache: maps question to session_id
+        # Same question in same session will reuse the same session_id
+        self._question_to_session_id: dict[str, str] = {}
+
         tool_count = len(self.tool_registry.list_tool_names())
         self.logger.info(f'GAIASolver initialized with {tool_count} tools')
 
+    @observe()
     def solve(
         self, question: str, attachments: Optional[List[Attachment]] = None
     ) -> SolverAnswer:
@@ -90,14 +97,34 @@ class GAIASolver:
         Returns:
             SolverAnswer object with answer, confidence, and sources.
         """
-        self.logger.info(f'Starting to solve question: {question[:100]}...')
+        # Check if we've seen this question before in this session
+        # Same question in same session will reuse the same session_id
+        question_key = question.strip()
+        is_reusing = question_key in self._question_to_session_id
+
+        if is_reusing:
+            # Reuse existing session_id
+            session_id = self._question_to_session_id[question_key]
+            self.logger.info(
+                f'Reusing session_id for same question: {session_id} '
+                f'[question: {question[:100]}...]'
+            )
+        else:
+            # Create new session_id for this question
+            session_id = str(uuid.uuid4())
+            self._question_to_session_id[question_key] = session_id
+            self.logger.info(
+                f'Created new session_id for question: {session_id} '
+                f'[question: {question[:100]}...]'
+            )
 
         try:
-            # Call agent.solve()
-            final_answer = self.agent.solve(question, attachments)
-
-            # Extract confidence and sources from state manager
-            state_summary = self.agent.state_manager.get_state_summary()
+            # Propagate session_id to all child observations
+            # All nested @observe() decorated functions will automatically inherit session_id
+            with propagate_attributes(session_id=session_id):
+                # Call agent.solve() - all nested observations will inherit session_id
+                # The session_id will be automatically propagated to all @observe() decorated methods
+                final_answer = self.agent.solve(question, attachments)
 
             # Get confidence - default based on answer quality
             confidence = (
@@ -131,14 +158,19 @@ class GAIASolver:
                     unique_sources.append(source)
             sources = unique_sources
 
-            self.logger.info(f'Answer: {final_answer if final_answer else "None"}...')
-            self.logger.info(f'Confidence: {confidence:.2f}')
-            self.logger.info(f'Sources: {len(sources)}')
+            self.logger.info(
+                f'Answer: {final_answer if final_answer else "None"}... [session_id: {session_id}]'
+            )
+            self.logger.info(f'Confidence: {confidence:.2f} [session_id: {session_id}]')
+            self.logger.info(f'Sources: {len(sources)} [session_id: {session_id}]')
 
             return SolverAnswer(
                 answer=final_answer or '', confidence=confidence, sources=sources
             )
 
         except Exception as e:
-            self.logger.error(f'Error solving question: {e}', exc_info=True)
+            self.logger.error(
+                f'Error solving question: {e} [session_id: {session_id}]', exc_info=True
+            )
+
             return SolverAnswer(answer=f'Error: {str(e)}', confidence=0.0, sources=[])

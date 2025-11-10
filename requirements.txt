@@ -15,4 +15,5 @@ rapidfuzz>=3.0.0
 mwclient>=0.10.0
 arxiv>=2.1.0
 habanero>=1.0.0
+langfuse>=2.0.0
 

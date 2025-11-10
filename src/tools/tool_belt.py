@@ -4,6 +4,7 @@ import logging
 from typing import Any, Dict, List, Optional, Union
 
 from ..models import Attachment, SearchResult
+from .api_tool import APITool
 from .browser_tool import BrowserTool
 from .context_extractor import ContextExtractor
 from .file_handler import FileHandler
@@ -28,6 +29,7 @@ class ToolBelt:
         self.file_handler = None
         self.browser_tool = None
         self.image_recognition = None
+        self.api_tool = None
 
     def set_logger(self, logger: logging.Logger):
         """Receives and sets the logger from the Agent."""
@@ -51,6 +53,7 @@ class ToolBelt:
             llm_service=self.llm_service,
             image_recognition=self.image_recognition,
         )
+        self.api_tool = APITool(logger)
 
         # Set image recognition in LLM reasoning tool
         self.llm_reasoning_tool.set_image_recognition(self.image_recognition)
@@ -305,3 +308,48 @@ class ToolBelt:
             max_retries,
             capture_screenshot,
         )
+    
+    # API methods
+    def try_api_for_search_result(
+        self,
+        search_result_url: str,
+        problem: str,
+        subtask_description: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Try to use an API for a search result instead of web scraping.
+        
+        Args:
+            search_result_url: URL from search result
+            problem: Problem description
+            subtask_description: Subtask description
+        
+        Returns:
+            API response if API was used, None otherwise
+        """
+        if not self.api_tool:
+            raise ValueError('ToolBelt not initialized. Call set_logger() first.')
+        return self.api_tool.try_api_for_search_result(
+            search_result_url, problem, subtask_description
+        )
+    
+    def call_api(
+        self,
+        api_name: str,
+        method: str,
+        **kwargs,
+    ) -> Any:
+        """
+        Call an external API directly.
+        
+        Args:
+            api_name: Name of API (github, wikipedia, youtube, twitter, reddit, arxiv, wayback, google_maps, usgs, census)
+            method: Method name to call
+            **kwargs: Arguments for the method
+        
+        Returns:
+            API response
+        """
+        if not self.api_tool:
+            raise ValueError('ToolBelt not initialized. Call set_logger() first.')
+        return self.api_tool.call_api(api_name, method, **kwargs)

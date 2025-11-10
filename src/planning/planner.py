@@ -131,14 +131,28 @@ Then apply these rules:
 - Focus on the core workflow: what information to gather → how to process it → how to synthesize the answer
 
 TOOL SELECTION GUIDELINES:
-- **search**: ALWAYS PREFERRED as the primary tool for information gathering:
+- **API TOOLS - USE WHEN AVAILABLE**: When a problem requires accessing data from a specific API-supported service, use the appropriate API tool instead of search:
+  * **wikipedia_api**: ALWAYS use when you need to access Wikipedia pages, especially when:
+    - The problem specifies a specific year/version (e.g., "2022 version", "as of 2022")
+    - You need a specific revision of a Wikipedia page
+    - You need to search Wikipedia or get revision history
+    - Use get_page with revision_id or date filters for historical versions
+  * **github_api**: Use when you need GitHub repository data, issues, commits, or file contents
+  * **youtube_api**: Use when you need YouTube video information or to search videos
+  * **twitter_api**: Use when you need Twitter/X user tweets
+  * **reddit_api**: Use when you need Reddit posts or user content
+  * **arxiv_api**: Use when you need arXiv paper metadata
+  * **wayback_api**: Use when you need archived web pages from Wayback Machine
+  * **google_maps_api**: Use when you need Google Maps place details or Street View images
+
+- **search**: Use for general information gathering when no specific API tool is available:
   * Use search to find information sources, URLs, and initial results
   * After search, the system will automatically:
     - Check relevance of each result using LLM
     - Classify results as web pages or files
     - Navigate to web pages using browser automation
     - Download files and extract content
-  * Search handles ALL scenarios: archives, databases, websites, files, documents
+  * Search handles scenarios where no direct API is available: general websites, files, documents
   * **For archives with date requirements**: Still use search - the SearchResultProcessor will navigate to the archive and use advanced search features automatically
   * **The search tool now includes intelligent result processing** - it's not just finding URLs, it processes them too
   * **CRITICAL**: When you need to find PDFs or extract information from PDFs, use search with specific queries. The system will automatically download PDFs and extract text content.
@@ -214,10 +228,71 @@ Return a JSON object with:
     * For search tasks: specify what information to find
     * For llm_reasoning tasks: specify what calculation/analysis to perform and what data to use
     * For read_attachment tasks: specify what information to extract from which file
-  - tool: which tool to use (llm_reasoning, search, read_attachment, analyze_media)
+    * **For API tools**: MUST include all parameters and conditions from the problem (dates, years, versions, filters, etc.) so they can be extracted and included in the API call parameters
+  - tool: which tool to use (llm_reasoning, search, read_attachment, analyze_media, github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, arxiv_api, wayback_api, google_maps_api)
     * search: Use for ALL information gathering (web pages, archives, databases, files, PDFs). The system will automatically download and extract content from PDFs.
     * llm_reasoning: Use for computation, data processing, analysis, and reasoning tasks. This replaces code_interpreter with LLM-based problem solving.
     * read_attachment: Use to read files that were already provided or downloaded. This automatically extracts text from PDFs - no code needed.
+    
+    **CRITICAL FOR ALL API TOOLS**: When using any API tool, you MUST include in the subtask description ALL relevant parameters and conditions that are mentioned in the problem:
+    - Dates, years, or time ranges (e.g., "2022 version", "as of 2022", "between 2020-2022")
+    - Specific versions, revisions, or timestamps
+    - Filters, states, labels, or other qualifiers
+    - Language, location, or other contextual requirements
+    - Any constraints or requirements that affect which data should be retrieved
+    
+    The parameter determination system will extract these from the description and include them in the API call. Be explicit and complete - include all conditions from the problem statement.
+    
+    * github_api: Use when you need to access GitHub data (repositories, issues, commits, repository contents).
+      - Methods and parameters:
+        * search_issues: repo (required, format: "owner/repo"), state (optional, default: "all", options: "open", "closed", "all"), labels (optional, list of strings), sort (optional, default: "created", options: "created", "updated", "comments"), order (optional, default: "asc", options: "asc", "desc"), per_page (optional, default: 100, max: 100)
+        * get_issue: repo (required, format: "owner/repo"), issue_number (required, integer)
+        * get_repository_commit: repo (required, format: "owner/repo"), ref (required, commit SHA string)
+        * get_repository_contents: repo (required, format: "owner/repo"), path (optional, default: "", file/directory path), ref (optional, branch/tag name)
+    
+    * wikipedia_api: Use when you need to access Wikipedia pages or search Wikipedia.
+      - Methods and parameters:
+        * get_page: title (required, page title string), revision_id (optional, integer for specific revision)
+        * search_pages: query (required, search terms), limit (optional, default: 10)
+        * get_page_revisions: title (required, page title string), start_date (optional, format: "YYYY-MM-DD"), end_date (optional, format: "YYYY-MM-DD"), limit (optional, default: 500)
+      - **CRITICAL**: When the problem specifies a year/version (e.g., "2022 version", "as of 2022"), you MUST include the year requirement in the subtask description. The system will use get_page_revisions with date filters (start_date="2022-01-01", end_date="2022-12-31") to find revisions from that year, then use get_page with the appropriate revision_id.
+    
+    * youtube_api: Use when you need to access YouTube video information or search videos.
+      - Methods and parameters:
+        * get_video_info: video_id (required, YouTube video ID string)
+        * search_videos: query (required, search terms), max_results (optional, default: 10, max: 50)
+    
+    * twitter_api: Use when you need to access Twitter/X user tweets.
+      - Methods and parameters:
+        * get_user_tweets: username (required, Twitter username without @), max_results (optional, default: 10, max: 100), start_time (optional, format: "YYYY-MM-DDTHH:MM:SSZ"), end_time (optional, format: "YYYY-MM-DDTHH:MM:SSZ")
+      - **Include time ranges in the description if specified in the problem.**
+    
+    * reddit_api: Use when you need to access Reddit posts or user content.
+      - Methods and parameters:
+        * get_user_posts: username (required, Reddit username), limit (optional, default: 25, max: 100)
+        * search_posts: subreddit (required, subreddit name without r/), query (required, search terms), limit (optional, default: 25, max: 100), sort (optional, default: "relevance", options: "relevance", "hot", "top", "new")
+    
+    * arxiv_api: Use when you need to access arXiv paper metadata.
+      - Methods and parameters:
+        * get_metadata: paper_id (required, format: "YYMM.NNNNN" or "archive/category/YYMMNNN"), download_pdf (optional, boolean, default: false)
+    
+    * wayback_api: Use when you need to access archived web pages from Wayback Machine.
+      - Methods and parameters:
+        * get_archived_url: url (required, original URL string), timestamp (optional, format: "YYYYMMDD" for specific date)
+      - **Include the timestamp/date requirement in the description if specified.**
+    
+    * google_maps_api: Use when you need to access Google Maps place details or Street View images.
+      - Methods and parameters:
+        * get_place_details: place_id (required, Google Places place ID string)
+        * get_street_view_image: location (required, address or coordinates string), size (optional, default: "600x400", format: "WIDTHxHEIGHT"), heading (optional, integer 0-360), pitch (optional, integer -90 to 90), fov (optional, integer, default: 90)
+  - parameters: (REQUIRED for API tools, optional for other tools) - Dictionary containing tool-specific parameters with actual values.
+    * **For API tools (github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, arxiv_api, wayback_api, google_maps_api)**: This field is MANDATORY and must include:
+      - "method": The API method name (e.g., "get_page", "search_issues", "get_video_info")
+      - All required parameters for that method with actual values extracted from the problem
+      - All optional parameters that are relevant based on the problem conditions (dates, filters, etc.)
+      - Example for wikipedia_api with year requirement: {"method": "get_page_revisions", "title": "Mercedes Sosa", "start_date": "2022-01-01", "end_date": "2022-12-31", "limit": 1}
+      - Example for github_api: {"method": "get_issue", "repo": "owner/repo", "issue_number": 123}
+    * For other tools: This field is optional and will be determined automatically if not provided.
   - search_queries: (ONLY for 'search' tool) - Array of exactly 3 different search queries with varying complexity levels. OMIT this field entirely for non-search tools.
     * COMPLEXITY LEVELS (apply to the 3 queries in order):
       - First query: Simple - use minimal essential keywords only
@@ -257,6 +332,7 @@ IMPORTANT: Return your response as valid JSON only, without any markdown formatt
             retry_context += 'Create an IMPROVED plan that addresses these issues. CRITICAL REQUIREMENTS:\n'
             retry_context += "1. Each subtask description must be COMPLETE and SELF-CONTAINED, including what to do, why it's needed, what specific information/data to find/process, constraints, and expected output.\n"
             retry_context += "2. Each subtask with tool='search' MUST include a search_queries array with exactly 3 different search queries in KEYWORD-ONLY format (3-8 keywords each, no verbs or descriptive phrases), ordered by complexity: simple (minimal keywords), normal (standard terms), complex (additional qualifiers). Use general, broad keywords rather than overly specific terms. Avoid specific measurement or quantification terms that narrow the search too much. Focus on core concepts, entities, and topics. Remove words like 'article', 'submitted', 'descriptors', 'about'. The search tool will automatically navigate and extract from archives.\n"
+            retry_context += '3. Each subtask with an API tool (github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, arxiv_api, wayback_api, google_maps_api) MUST include a \'parameters\' field with a dictionary containing: \'method\' (the API method name) and all required/optional parameters with actual values extracted from the problem. For example, for wikipedia_api with year requirement: {"method": "get_page_revisions", "title": "Page Title", "start_date": "2022-01-01", "end_date": "2022-12-31", "limit": 1}.\n'
 
         # Extract step classifications if available
         step_classifications_info = ''
@@ -406,10 +482,26 @@ FINAL REMINDER:
                         f'Using first 3.'
                     )
 
+                # Extract parameters
+                parameters = task_data.get('parameters', {})
+
+                # Validate API tools have parameters with method
+                if tool_type.endswith('_api'):
+                    if not parameters:
+                        self.logger.warning(
+                            f'Subtask {task_data.get("id", f"step_{i}")} uses API tool {tool_type} but missing parameters. '
+                            f'Parameters will need to be determined during execution.'
+                        )
+                    elif 'method' not in parameters:
+                        self.logger.warning(
+                            f'Subtask {task_data.get("id", f"step_{i}")} uses API tool {tool_type} but parameters missing "method" field. '
+                            f'Parameters: {parameters}'
+                        )
+
                 subtask.metadata = {
                     'tool': task_data.get('tool', 'unknown'),
                     'parallelizable': task_data.get('parallelizable', False),
-                    'parameters': task_data.get('parameters', {}),
+                    'parameters': parameters,
                     'search_queries': search_queries,  # Store LLM-generated search queries (array of 3)
                 }
                 subtasks.append(subtask)

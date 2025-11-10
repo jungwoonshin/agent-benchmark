@@ -387,6 +387,15 @@ Analyze these search results and extract:
             sources_used = analysis_data.get('sources_used', [])
             additional_information = analysis_data.get('additional_information', '')
 
+            # Convert to strings to handle cases where LLM returns numbers or other types
+            answer = str(answer) if answer is not None else ''
+            reasoning = str(reasoning) if reasoning is not None else ''
+            additional_information = (
+                str(additional_information)
+                if additional_information is not None
+                else ''
+            )
+
             self.logger.info(
                 f'LLM analysis complete: answer length={len(answer)}, confidence={confidence:.2f}, '
                 f'additional_info length={len(additional_information)}'

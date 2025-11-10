@@ -157,7 +157,37 @@ For browser_navigate: {"url": "https://...", "action": "click_link|extract_text|
 CRITICAL: For browser_navigate, the "url" field is REQUIRED and must be a valid URL with scheme (http:// or https://). If the subtask doesn't specify a URL directly, you must infer or construct a reasonable URL based on the subtask description (e.g., if it mentions "Nature articles 2020", use "https://www.nature.com/nature/articles?year=2020").
 
 For read_attachment: {"attachment_index": 0, "options": {...}}
-For analyze_media: {"attachment_index": 0, "analysis_type": "auto"}"""
+For analyze_media: {"attachment_index": 0, "analysis_type": "auto"}
+For API tools (github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, arxiv_api, wayback_api, google_maps_api):
+  - REQUIRED: {"method": "method_name", ...method_specific_parameters}
+  - github_api methods:
+    * search_issues: {"method": "search_issues", "repo": "owner/repo" (required), "state": "all|open|closed" (optional, default: "all"), "labels": ["label1"] (optional, list), "sort": "created|updated|comments" (optional, default: "created"), "order": "asc|desc" (optional, default: "asc"), "per_page": 100 (optional, default: 100, max: 100)}
+    * get_issue: {"method": "get_issue", "repo": "owner/repo" (required), "issue_number": 123 (required, integer)}
+    * get_repository_commit: {"method": "get_repository_commit", "repo": "owner/repo" (required), "ref": "commit_sha" (required, string)}
+    * get_repository_contents: {"method": "get_repository_contents", "repo": "owner/repo" (required), "path": "file/path" (optional, default: ""), "ref": "branch_name" (optional, string)}
+  - wikipedia_api methods:
+    * get_page: {"method": "get_page", "title": "Page Title" (required, string), "revision_id": 123 (optional, integer)}
+      - **CRITICAL**: If the subtask description mentions a specific year/version (e.g., "2022 version", "as of 2022"), you MUST first use get_page_revisions to find the revision_id from that year, OR use get_page_revisions with date filters to get revisions from that year
+      - For year-specific requirements: Use get_page_revisions with start_date and end_date to find revisions from the specified year, then use the revision_id with get_page
+    * search_pages: {"method": "search_pages", "query": "search terms" (required), "limit": 10 (optional, default: 10)}
+    * get_page_revisions: {"method": "get_page_revisions", "title": "Page Title" (required), "start_date": "YYYY-MM-DD" (optional), "end_date": "YYYY-MM-DD" (optional), "limit": 500 (optional, default: 500)}
+      - Use this to find revisions from a specific year when the problem requires a historical version
+      - For "2022 version": Use start_date="2022-01-01", end_date="2022-12-31" to get revisions from 2022
+  - youtube_api methods:
+    * get_video_info: {"method": "get_video_info", "video_id": "video_id" (required, string)}
+    * search_videos: {"method": "search_videos", "query": "search terms" (required), "max_results": 10 (optional, default: 10, max: 50)}
+  - twitter_api methods:
+    * get_user_tweets: {"method": "get_user_tweets", "username": "username" (required, without @), "max_results": 10 (optional, default: 10, max: 100), "start_time": "YYYY-MM-DDTHH:MM:SSZ" (optional), "end_time": "YYYY-MM-DDTHH:MM:SSZ" (optional)}
+  - reddit_api methods:
+    * get_user_posts: {"method": "get_user_posts", "username": "username" (required), "limit": 25 (optional, default: 25, max: 100)}
+    * search_posts: {"method": "search_posts", "subreddit": "subreddit_name" (required, without r/), "query": "search terms" (required), "limit": 25 (optional, default: 25, max: 100), "sort": "relevance|hot|top|new" (optional, default: "relevance")}
+  - arxiv_api methods:
+    * get_metadata: {"method": "get_metadata", "paper_id": "YYMM.NNNNN" or "archive/category/YYMMNNN" (required), "download_pdf": false (optional, boolean, default: false)}
+  - wayback_api methods:
+    * get_archived_url: {"method": "get_archived_url", "url": "https://example.com" (required), "timestamp": "YYYYMMDD" (optional, string)}
+  - google_maps_api methods:
+    * get_place_details: {"method": "get_place_details", "place_id": "place_id" (required, string)}
+    * get_street_view_image: {"method": "get_street_view_image", "location": "address or coordinates" (required), "size": "600x400" (optional, default: "600x400", format: "WIDTHxHEIGHT"), "heading": 0 (optional, integer 0-360), "pitch": 0 (optional, integer -90 to 90), "fov": 90 (optional, integer, default: 90)}"""
 
     attachment_info = ''
     if attachments:
@@ -210,7 +240,14 @@ Tool: {subtask.metadata.get('tool', 'unknown')}{search_query_info}{attachment_in
 
 Determine the appropriate tool parameters.
 IMPORTANT: If the tool is 'search' and search_queries are provided above, the system will automatically try all of them. You do not need to specify them in parameters.
-If the tool is 'llm_reasoning' and dependencies are listed above, describe in the task_description which dependency results to use."""
+If the tool is 'llm_reasoning' and dependencies are listed above, describe in the task_description which dependency results to use.
+If the tool is an API tool (ends with '_api'), you MUST include the "method" parameter and all required parameters for that method. Extract the API name, method, and parameters from the subtask description.
+
+**SPECIAL HANDLING FOR wikipedia_api WITH YEAR REQUIREMENTS**:
+- If the subtask description mentions a specific year/version (e.g., "2022 version", "as of 2022", "English Wikipedia (2022 version)"), you have two options:
+  1. Use get_page_revisions first with date filters (start_date="2022-01-01", end_date="2022-12-31") to find revisions from that year, then use get_page with the revision_id
+  2. OR use get_page_revisions with date filters to get all revisions from that year - the system can then select the appropriate revision
+- Always include the year requirement in your parameters (either as date filters for get_page_revisions, or as revision_id for get_page if you can determine it)"""
 
     try:
         response = llm_service.call_with_system_prompt(
