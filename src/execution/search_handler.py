@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from ..models import Attachment
@@ -245,16 +246,56 @@ Return as JSON with "resources" key containing an array of resource objects."""
             Dictionary with LLM analysis result as the primary content.
         """
         try:
-            # Build context from query analysis
+            # Extract step number from subtask_description (look for "step_1", "step_2", etc.)
+            step_num = None
+            step_match = re.search(
+                r'step[_\s]*(\d+)', subtask_description, re.IGNORECASE
+            )
+            if step_match:
+                try:
+                    step_num = int(step_match.group(1))
+                except (ValueError, IndexError):
+                    pass
+
+            # Build context from query analysis, filtering by step number if available
             requirements_context = ''
             if query_analysis:
                 explicit_reqs = query_analysis.get('explicit_requirements', [])
                 answer_format = query_analysis.get('answer_format', '')
 
                 if explicit_reqs:
-                    requirements_context += (
-                        f'\nExplicit Requirements: {", ".join(explicit_reqs)}'
-                    )
+                    # Filter requirements by step number if step number is available
+                    if step_num is not None:
+                        # Filter to only requirements matching this step number
+                        # Requirements are tagged as "Step N: requirement" or "step N: requirement"
+                        filtered_reqs = []
+                        for req in explicit_reqs:
+                            req_str = str(req)
+                            # Check if requirement matches this step number
+                            req_step_match = re.search(
+                                r'step[_\s]*(\d+)[:\s]', req_str, re.IGNORECASE
+                            )
+                            if req_step_match:
+                                try:
+                                    req_step_num = int(req_step_match.group(1))
+                                    if req_step_num == step_num:
+                                        filtered_reqs.append(req)
+                                except (ValueError, IndexError):
+                                    # If we can't parse step number, include it (fallback)
+                                    filtered_reqs.append(req)
+                            else:
+                                # If requirement doesn't have step tag, don't include it
+                                # (only include step-tagged requirements)
+                                pass
+                        if filtered_reqs:
+                            requirements_context += (
+                                f'\nExplicit Requirements: {", ".join(filtered_reqs)}'
+                            )
+                    else:
+                        # If no step number found, include all requirements (backward compatibility)
+                        requirements_context += (
+                            f'\nExplicit Requirements: {", ".join(explicit_reqs)}'
+                        )
                 if answer_format:
                     requirements_context += f'\nAnswer Format: {answer_format}'
 
@@ -283,36 +324,33 @@ Return as JSON with "resources" key containing an array of resource objects."""
 
 Given:
 1. A subtask description that needs to be completed
-2. An overall problem/question that the subtask is part of
-3. Processed search results (content from web pages and files)
-4. Problem requirements
+2. Processed search results (content from web pages and files)
+3. Requirements for the subtask
 
 Your task:
 - Analyze the search results and extract TWO types of information:
   1. Information directly related to the SUBTASK DESCRIPTION - this should go in the "answer" field
-  2. Information related to the OVERALL PROBLEM but not directly answering the subtask - this should go in "additional_information"
+  2. Information that is relevant but not directly answering the subtask - this should go in "additional_information"
 
 CRITICAL DISTINCTION:
 - "answer" (content): Must contain information that DIRECTLY addresses what the subtask_description is asking for. This is the primary answer to the specific subtask.
-- "additional_information": Should contain information that is relevant to the overall problem/question but does NOT directly answer the subtask. This includes:
-  * Contextual information about the problem domain
+- "additional_information": Should contain information that is relevant but does NOT directly answer the subtask. This includes:
+  * Contextual information about the domain
   * Related concepts or background information
   * Image analysis results
   * Information that might be useful for other subtasks or the final answer synthesis
-  * Any findings that relate to the problem but not specifically to this subtask
+  * Any findings that relate to the task but not specifically to this subtask
 
 Return a JSON object with:
 - answer: The answer or information that DIRECTLY addresses the subtask description (string). This should focus ONLY on what the subtask is asking for.
 - reasoning: Brief explanation of how you arrived at this answer (string)
 - confidence: Confidence level from 0.0 to 1.0 (float)
 - sources_used: List of source titles/URLs that were most relevant for the answer (array of strings)
-- additional_information: Information relevant to the overall problem/question but NOT directly answering the subtask. If no such information is available, use an empty string. (string)
+- additional_information: Information relevant but NOT directly answering the subtask. If no such information is available, use an empty string. (string)
 
 IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
 
-            user_prompt = f"""Overall Problem/Question: {problem}
-
-Subtask Description: {subtask_description}
+            user_prompt = f"""Subtask Description: {subtask_description}
 {requirements_context}
 
 Processed Search Results:
@@ -323,7 +361,7 @@ Materials Found ({len(materials)} total):
 
 Analyze these search results and extract:
 1. Answer to the SUBTASK DESCRIPTION (put in "answer" field) - information that directly addresses what the subtask is asking for
-2. Information related to the OVERALL PROBLEM but not directly answering the subtask (put in "additional_information" field) - contextual information, related concepts, or findings relevant to the problem but not this specific subtask"""
+2. Information that is relevant but not directly answering the subtask (put in "additional_information" field) - contextual information, related concepts, or findings relevant but not this specific subtask"""
 
             self.logger.info(
                 f'Analyzing search results with LLM for subtask: {subtask_description[:100]}...'

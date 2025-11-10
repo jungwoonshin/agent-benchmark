@@ -20,7 +20,7 @@ def setup_logging():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler('logs/log.txt', mode='a'),
+            logging.FileHandler('logs/log.txt', mode='w'),
         ],
     )
     return logging.getLogger('agent_system')

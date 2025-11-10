@@ -188,7 +188,7 @@ def main():
         validation_file,
         num_cases=10,
         # indexes=[2,3,4,5,6,7],  # [2, 3, 5, 6, 7]
-    )
+    )[:4]
     print(f'Loaded {len(cases)} cases')
 
     # Test each case

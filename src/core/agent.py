@@ -313,7 +313,10 @@ class Agent:
                 plan,
             )
 
-            if validation_result['is_correct']:
+            # Safely get is_correct with default to False if key is missing
+            is_correct = validation_result.get('is_correct', False)
+            
+            if is_correct:
                 self.logger.info('Answer validation passed. Answer is correct.')
                 self.logger.info('Problem solved. Returning answer.')
                 return final_answer

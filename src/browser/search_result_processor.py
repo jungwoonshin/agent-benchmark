@@ -92,6 +92,156 @@ class SearchResultProcessor:
         total_length = len(text)
         return f'{preview}... [Length: {total_length} chars]'
 
+    def _rank_search_results_by_relevance(
+        self,
+        search_results: List[SearchResult],
+        subtask_description: str,
+        problem: str,
+        query_analysis: Optional[Dict[str, Any]] = None,
+    ) -> List[SearchResult]:
+        """
+        Use LLM to select and rank relevant search results (based on title, snippet, URL only).
+        This is done BEFORE downloading/navigating to save time and resources.
+        The LLM decides which results are relevant enough to include, not just ranks all of them.
+
+        Args:
+            search_results: List of SearchResult objects to filter and rank.
+            subtask_description: Description of the subtask being executed.
+            problem: Original problem description.
+            query_analysis: Optional query analysis results.
+
+        Returns:
+            List of SearchResult objects that are relevant, sorted by relevance (most relevant first).
+            Only includes results that the LLM determined are relevant enough.
+        """
+        if not search_results:
+            return []
+
+        if len(search_results) == 1:
+            # For single result, include it (let full processing decide relevance)
+            return search_results
+
+        self.logger.info(
+            f'Using LLM to select relevant search results from {len(search_results)} total results...'
+        )
+
+        # Build context from query analysis
+        requirements_context = ''
+        if query_analysis:
+            explicit_reqs = query_analysis.get('explicit_requirements', [])
+            if explicit_reqs:
+                requirements_context += (
+                    f'\nExplicit Requirements: {", ".join(explicit_reqs)}'
+                )
+
+        # Format search results for LLM
+        results_text = []
+        for idx, result in enumerate(search_results, 1):
+            snippet_preview = (
+                result.snippet[:300] + '...'
+                if len(result.snippet) > 300
+                else result.snippet
+            )
+            results_text.append(
+                f'[{idx}] Title: {result.title}\nURL: {result.url}\nSnippet: {snippet_preview}'
+            )
+
+        system_prompt = """You are an expert at evaluating search results for relevance to a specific task.
+Given a subtask description and a list of search results (with title, URL, and snippet), determine which results are relevant enough to include.
+
+Your task:
+1. Analyze each search result based on its title, URL, and snippet
+2. Determine if each result is RELEVANT enough to potentially help complete the subtask
+3. Only include results that have a reasonable chance of containing useful information
+4. Exclude results that are clearly irrelevant, off-topic, or unlikely to help
+5. Rank the selected relevant results from most relevant to least relevant
+6. Assign a relevance score from 0.0 to 1.0 for each selected result
+
+CRITICAL: Be selective - only include results that are actually relevant. It's better to include fewer highly relevant results than many marginally relevant ones.
+
+Return a JSON object with:
+- selected_indices: array of result indices (1-based) that are relevant, sorted by relevance (most relevant first)
+- scores: object mapping result index (as string, 1-based) to relevance score (0.0 to 1.0) for selected results
+- reasoning: brief explanation of which results were selected and why (1-2 sentences)
+
+IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
+
+        user_prompt = f"""Problem: {problem}
+
+Subtask: {subtask_description}
+{requirements_context}
+
+Search Results:
+{chr(10).join(results_text)}
+
+Select which search results are relevant enough to help complete this subtask. Return only the indices of relevant results, sorted from most relevant to least relevant. Exclude any results that are clearly irrelevant or unlikely to help."""
+
+        try:
+            response = self.llm_service.call_with_system_prompt(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=0.3,  # Lower temperature for consistent selection
+                response_format={'type': 'json_object'},
+            )
+
+            json_text = extract_json_from_text(response)
+            result_data = json.loads(json_text)
+
+            selected_indices = result_data.get('selected_indices', [])
+            scores = result_data.get('scores', {})
+            reasoning = result_data.get('reasoning', 'No reasoning provided')
+
+            self.logger.info(
+                f'LLM selection complete. Selected {len(selected_indices)} relevant result(s) out of {len(search_results)} total. Reasoning: {reasoning}'
+            )
+
+            # Validate selected_indices
+            if not selected_indices:
+                self.logger.warning(
+                    'LLM did not select any relevant results. Using first result as fallback.'
+                )
+                # Fallback: return first result to avoid empty list
+                return [search_results[0]] if search_results else []
+
+            # Convert 1-based indices to 0-based and validate
+            valid_indices = []
+            for idx in selected_indices:
+                try:
+                    idx_int = int(idx) - 1  # Convert to 0-based
+                    if 0 <= idx_int < len(search_results):
+                        valid_indices.append(idx_int)
+                except (ValueError, TypeError):
+                    continue
+
+            if not valid_indices:
+                self.logger.warning(
+                    'No valid indices found in LLM response. Using first result as fallback.'
+                )
+                return [search_results[0]] if search_results else []
+
+            # Get selected results in order (already sorted by relevance)
+            selected_results = [search_results[i] for i in valid_indices]
+
+            # Update relevance scores if provided
+            for idx, result in enumerate(selected_results):
+                original_idx = valid_indices[idx]
+                score_key = str(original_idx + 1)  # 1-based for score lookup
+                if score_key in scores:
+                    result.relevance_score = float(scores[score_key])
+
+            self.logger.info(
+                f'Selected {len(selected_results)} relevant search result(s). Top result: {selected_results[0].title[:50]}...'
+            )
+
+            return selected_results
+
+        except Exception as e:
+            self.logger.warning(
+                f'Failed to select relevant search results using LLM: {e}. Using first {min(3, len(search_results))} results as fallback.'
+            )
+            # Fallback: return first few results
+            return search_results[: min(3, len(search_results))]
+
     def process_search_results(
         self,
         search_results: List[SearchResult],
@@ -102,13 +252,17 @@ class SearchResultProcessor:
         max_results_to_process: int = 5,
     ) -> Dict[str, Any]:
         """
-        Process search results by checking relevance one by one until a match is found.
+        Process search results by first selecting relevant ones using LLM, then processing only the selected results.
 
-        Processes search results sequentially:
-        1. For each result: download/navigate to get full content
-        2. Check relevance using LLM with full content
-        3. If relevant: extract and structure content, then STOP (break loop)
-        4. If not relevant: continue to next result
+        New workflow:
+        1. Use LLM to select which search results are relevant (based on title, snippet, URL only)
+           - LLM filters out irrelevant results entirely
+           - Returns only relevant results, sorted by relevance (most relevant first)
+        2. Process only the selected relevant results (up to max_results_to_process)
+        3. For each result: download/navigate to get full content
+        4. Check relevance using LLM with full content
+        5. If relevant: extract and structure content, then STOP (break loop)
+        6. If not relevant: continue to next result
 
         Stops processing as soon as the first relevant result is found.
 
@@ -161,9 +315,17 @@ class SearchResultProcessor:
 
         self.logger.info('\n'.join(search_results_summary))
 
+        # Step 1: Use LLM to select relevant search results (before processing)
+        selected_results = self._rank_search_results_by_relevance(
+            search_results, subtask_description, problem, query_analysis
+        )
+
+        # Step 2: Process only the selected relevant results (up to max_results_to_process)
+        results_to_process = selected_results[:max_results_to_process]
+
         self.logger.info(
-            f'Processing {min(len(search_results), max_results_to_process)} search results '
-            f'for subtask: {subtask_description}'
+            f'Processing {len(results_to_process)} selected relevant search result(s) '
+            f'(selected from {len(search_results)} total) for subtask: {subtask_description}'
         )
 
         processed_count = 0
@@ -172,12 +334,12 @@ class SearchResultProcessor:
         downloaded_files = []
         content_parts = []
 
-        # Process results one by one, stopping at the first relevant match
-        for idx, result in enumerate(search_results[:max_results_to_process]):
+        # Process selected relevant results one by one, stopping at the first relevant match
+        for idx, result in enumerate(results_to_process):
             processed_count += 1
 
             self.logger.info(
-                f'Checking relevance of result [{idx + 1}/{min(len(search_results), max_results_to_process)}]: {result.title}'
+                f'Processing selected relevant result [{idx + 1}/{len(results_to_process)}]: {result.title}'
             )
 
             processed_result = self._process_single_result(
@@ -187,7 +349,7 @@ class SearchResultProcessor:
                 query_analysis,
                 attachments,
                 idx,
-                len(search_results),
+                len(results_to_process),
             )
 
             if processed_result:
@@ -226,8 +388,8 @@ class SearchResultProcessor:
                 # Terminate immediately after finding first relevant result - move to next step
                 # Skip remaining search results
                 self.logger.info(
-                    f'Terminating early: Found relevant result after processing {processed_count} result(s). '
-                    f'Skipping remaining {len(search_results) - processed_count} result(s).'
+                    f'Terminating early: Found relevant result after processing {processed_count} selected result(s). '
+                    f'Skipping remaining {len(results_to_process) - processed_count} selected result(s).'
                 )
                 break
             else:
@@ -282,18 +444,58 @@ class SearchResultProcessor:
             True if visual analysis is required, False otherwise.
         """
         try:
-            # Build context from query analysis
+            # Extract step number from subtask_description (look for "step_1", "step_2", etc.)
+            step_num = None
+            step_match = re.search(
+                r'step[_\s]*(\d+)', subtask_description, re.IGNORECASE
+            )
+            if step_match:
+                try:
+                    step_num = int(step_match.group(1))
+                except (ValueError, IndexError):
+                    pass
+
+            # Build context from query analysis, filtering by step number if available
             requirements_context = ''
             if query_analysis:
                 explicit_reqs = query_analysis.get('explicit_requirements', [])
                 if explicit_reqs:
-                    requirements_context += (
-                        f'\nExplicit Requirements: {", ".join(explicit_reqs)}'
-                    )
+                    # Filter requirements by step number if step number is available
+                    if step_num is not None:
+                        # Filter to only requirements matching this step number
+                        # Requirements are tagged as "Step N: requirement" or "step N: requirement"
+                        filtered_reqs = []
+                        for req in explicit_reqs:
+                            req_str = str(req)
+                            # Check if requirement matches this step number
+                            req_step_match = re.search(
+                                r'step[_\s]*(\d+)[:\s]', req_str, re.IGNORECASE
+                            )
+                            if req_step_match:
+                                try:
+                                    req_step_num = int(req_step_match.group(1))
+                                    if req_step_num == step_num:
+                                        filtered_reqs.append(req)
+                                except (ValueError, IndexError):
+                                    # If we can't parse step number, include it (fallback)
+                                    filtered_reqs.append(req)
+                            else:
+                                # If requirement doesn't have step tag, don't include it
+                                # (only include step-tagged requirements)
+                                pass
+                        if filtered_reqs:
+                            requirements_context += (
+                                f'\nExplicit Requirements: {", ".join(filtered_reqs)}'
+                            )
+                    else:
+                        # If no step number found, include all requirements (backward compatibility)
+                        requirements_context += (
+                            f'\nExplicit Requirements: {", ".join(explicit_reqs)}'
+                        )
 
             system_prompt = """You are an expert at analyzing subtasks to determine if they require visual analysis (image recognition, screenshot analysis, or visual content processing).
 
-Consider both the problem context and the subtask description when making your determination.
+Consider the subtask description and requirements when making your determination.
 
 A subtask requires visual analysis if it:
 - Explicitly mentions analyzing images, screenshots, photos, diagrams, charts, graphs, or visual content
@@ -301,7 +503,7 @@ A subtask requires visual analysis if it:
 - Requires understanding visual layouts, UI elements, or visual patterns
 - Mentions visual inspection, image processing, or visual data extraction
 - Asks about visual characteristics, colors, shapes, or visual relationships
-- The problem context indicates that visual information (figures, charts, diagrams) is needed to answer the question
+- The requirements indicate that visual information (figures, charts, diagrams) is needed to answer the question
 
 A subtask does NOT require visual analysis if it:
 - Only asks for text-based information extraction
@@ -315,12 +517,10 @@ Return a JSON object with:
 
 IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
 
-            user_prompt = f"""Problem: {problem}
-
-Subtask: {subtask_description}
+            user_prompt = f"""Subtask: {subtask_description}
 {requirements_context}
 
-Does this problem context or subtask require visual analysis (image recognition, screenshot analysis, or visual content processing)?"""
+Does this subtask require visual analysis (image recognition, screenshot analysis, or visual content processing)?"""
 
             response = self.llm_service.call_with_system_prompt(
                 system_prompt=system_prompt,

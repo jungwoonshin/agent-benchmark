@@ -207,9 +207,21 @@ class FileTypeNavigator:
 
             # Strategy 2: Fallback to pattern-based detection for common file types
             if desired_file_type.lower() == 'pdf':
-                return self.find_and_navigate_to_pdf(
-                    current_url, page_content, page_title
-                )
+                # Use pattern-based PDF detection directly to avoid recursion
+                pdf_links = self._find_direct_pdf_links(soup, current_url)
+                if pdf_links:
+                    self.logger.info(f'Found {len(pdf_links)} direct PDF link(s)')
+                    file_url = pdf_links[0]
+                    self.logger.info(f'Navigating to PDF: {file_url}')
+                    return self.browser.navigate(url=file_url, use_selenium=True)
+                
+                # Try finding PDF download buttons
+                download_links = self._find_pdf_download_buttons(soup, current_url)
+                if download_links:
+                    self.logger.info(f'Found {len(download_links)} PDF download button(s)')
+                    file_url = download_links[0]
+                    self.logger.info(f'Navigating to PDF: {file_url}')
+                    return self.browser.navigate(url=file_url, use_selenium=True)
 
             # Strategy 3: Try direct file extension matching
             direct_links = self._find_direct_file_links(

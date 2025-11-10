@@ -173,7 +173,12 @@ Be lenient on process quality - focus on answer correctness."""
                     'incorrect_subtask_ids': [],
                 }
 
-            return validation_data
+            # Ensure all required keys are present with defaults
+            return {
+                'is_correct': validation_data.get('is_correct', False),
+                'reason': validation_data.get('reason', 'No reason provided'),
+                'incorrect_subtask_ids': validation_data.get('incorrect_subtask_ids', []),
+            }
 
         except Exception as e:
             self.logger.error(f'Error during answer validation: {e}', exc_info=True)
