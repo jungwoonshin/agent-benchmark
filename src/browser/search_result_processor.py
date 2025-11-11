@@ -2,7 +2,6 @@
 
 import json
 import logging
-import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
@@ -10,6 +9,7 @@ from ..llm import LLMService
 from ..models import Attachment, SearchResult
 from ..utils import extract_json_from_text
 from .api_formatter import APIFormatter
+from .authority_assessor import AuthorityAssessor
 from .browser import Browser
 from .content_formatter import ContentFormatter
 from .content_summarizer import ContentSummarizer
@@ -18,6 +18,9 @@ from .content_type_detector import ContentTypeDetector
 from .file_type_navigator import FileTypeNavigator
 from .relevance_checker import RelevanceChecker
 from .relevance_ranker import RelevanceRanker
+from .result_content_extractor import ResultContentExtractor
+from .result_formatter import ResultFormatter
+from .result_visual_processor import ResultVisualProcessor
 
 if TYPE_CHECKING:
     from src.tools import ToolBelt
@@ -61,6 +64,22 @@ class SearchResultProcessor:
         self.content_formatter = ContentFormatter(logger)
         self.content_summarizer = ContentSummarizer(llm_service, logger)
         self.relevance_ranker = RelevanceRanker(llm_service, logger)
+        # Initialize refactored modules
+        self.content_extractor = ResultContentExtractor(
+            tool_belt,
+            browser,
+            self.api_formatter,
+            self.content_formatter,
+            self.content_type_classifier,
+            self.content_type_detector,
+            self.file_type_navigator,
+            logger,
+        )
+        self.visual_processor = ResultVisualProcessor(
+            llm_service, tool_belt, browser, logger
+        )
+        self.result_formatter = ResultFormatter()
+        self.authority_assessor = AuthorityAssessor(logger)
 
     def _format_text_for_logging(self, text: str) -> str:
         """Format text for logging (delegates to ContentFormatter)."""
@@ -131,6 +150,31 @@ class SearchResultProcessor:
         if attachments is None:
             attachments = []
 
+        # Filter out Hugging Face GAIA-Subset-Benchmark dataset URL from search results
+        filtered_results = [
+            result
+            for result in search_results
+            if 'huggingface.co/datasets/Intelligent-Internet/GAIA-Subset-Benchmark'
+            not in result.url
+        ]
+        if len(filtered_results) < len(search_results):
+            removed_count = len(search_results) - len(filtered_results)
+            self.logger.info(
+                f'Filtered out {removed_count} search result(s) containing Hugging Face GAIA-Subset-Benchmark URL'
+            )
+            search_results = filtered_results
+
+        # If all results were filtered out, return early
+        if not search_results:
+            self.logger.info('No search results to process after filtering')
+            return {
+                'processed_count': 0,
+                'relevant_count': 0,
+                'web_pages': [],
+                'downloaded_files': [],
+                'content_summary': '',
+            }
+
         # Log full list of search results in a pretty format
         search_results_summary = [
             f'{"=" * 80}',
@@ -155,6 +199,36 @@ class SearchResultProcessor:
         selected_results = self.relevance_ranker.rank_by_relevance(
             search_results, subtask_description, problem, query_analysis
         )
+
+        # Step 1.5: Further prioritize by authority if multiple results are similar
+        if len(selected_results) > 1:
+            # Extract authority signals for all selected results
+            authority_signals_list = [
+                self.authority_assessor.extract_authority_signals(r)
+                for r in selected_results
+            ]
+
+            # Create pairs of (result, authority_signals)
+            result_authority_pairs = list(zip(selected_results, authority_signals_list))
+
+            # Sort by authority score (descending), then by existing relevance
+            result_authority_pairs.sort(
+                key=lambda x: (
+                    -x[1]['authority_score'],  # Higher authority first
+                    -x[0].relevance_score,  # Then by relevance
+                )
+            )
+
+            selected_results = [r for r, _ in result_authority_pairs]
+            top_authority_score = (
+                result_authority_pairs[0][1]['authority_score']
+                if result_authority_pairs
+                else 0.0
+            )
+            self.logger.info(
+                f'Reordered {len(selected_results)} results by authority score. '
+                f'Top result authority: {top_authority_score:.2f}'
+            )
 
         # Step 2: Process only the selected relevant results (up to max_results_to_process)
         results_to_process = selected_results[:max_results_to_process]
@@ -262,127 +336,6 @@ class SearchResultProcessor:
 
         return result_summary
 
-    def _requires_visual_analysis(
-        self,
-        subtask_description: str,
-        problem: str,
-        query_analysis: Optional[Dict[str, Any]] = None,
-    ) -> bool:
-        """
-        Determine if the subtask requires visual analysis using LLM.
-
-        Args:
-            subtask_description: Description of the subtask.
-            problem: Original problem description.
-            query_analysis: Optional query analysis results.
-
-        Returns:
-            True if visual analysis is required, False otherwise.
-        """
-        try:
-            # Extract step number from subtask_description (look for "step_1", "step_2", etc.)
-            step_num = None
-            step_match = re.search(
-                r'step[_\s]*(\d+)', subtask_description, re.IGNORECASE
-            )
-            if step_match:
-                try:
-                    step_num = int(step_match.group(1))
-                except (ValueError, IndexError):
-                    pass
-
-            # Build context from query analysis, filtering by step number if available
-            requirements_context = ''
-            if query_analysis:
-                explicit_reqs = query_analysis.get('explicit_requirements', [])
-                if explicit_reqs:
-                    # Filter requirements by step number if step number is available
-                    if step_num is not None:
-                        # Filter to only requirements matching this step number
-                        # Requirements are tagged as "Step N: requirement" or "step N: requirement"
-                        filtered_reqs = []
-                        for req in explicit_reqs:
-                            req_str = str(req)
-                            # Check if requirement matches this step number
-                            req_step_match = re.search(
-                                r'step[_\s]*(\d+)[:\s]', req_str, re.IGNORECASE
-                            )
-                            if req_step_match:
-                                try:
-                                    req_step_num = int(req_step_match.group(1))
-                                    if req_step_num == step_num:
-                                        filtered_reqs.append(req)
-                                except (ValueError, IndexError):
-                                    # If we can't parse step number, include it (fallback)
-                                    filtered_reqs.append(req)
-                            else:
-                                # If requirement doesn't have step tag, don't include it
-                                # (only include step-tagged requirements)
-                                pass
-                        if filtered_reqs:
-                            requirements_context += (
-                                f'\nExplicit Requirements: {", ".join(filtered_reqs)}'
-                            )
-                    else:
-                        # If no step number found, include all requirements (backward compatibility)
-                        requirements_context += (
-                            f'\nExplicit Requirements: {", ".join(explicit_reqs)}'
-                        )
-
-            system_prompt = """You are an expert at analyzing subtasks to determine if they require visual analysis (image recognition, screenshot analysis, or visual content processing).
-
-Consider the subtask description and requirements when making your determination.
-
-A subtask requires visual analysis if it:
-- Explicitly mentions analyzing images, screenshots, photos, diagrams, charts, graphs, or visual content
-- Asks to identify, recognize, or extract information from visual elements
-- Requires understanding visual layouts, UI elements, or visual patterns
-- Mentions visual inspection, image processing, or visual data extraction
-- Asks about visual characteristics, colors, shapes, or visual relationships
-- The requirements indicate that visual information (figures, charts, diagrams) is needed to answer the question
-
-A subtask does NOT require visual analysis if it:
-- Only asks for text-based information extraction
-- Only requires reading text content from web pages or documents
-- Only asks for calculations or data processing without visual input
-- Is about searching, navigating, or downloading without visual analysis needs
-
-Return a JSON object with:
-- requires_visual: boolean indicating if visual analysis is needed
-- reasoning: brief explanation (1-2 sentences) of why or why not
-
-IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
-
-            user_prompt = f"""Subtask: {subtask_description}
-{requirements_context}
-
-Does this subtask require visual analysis (image recognition, screenshot analysis, or visual content processing)?"""
-
-            response = self.llm_service.call_with_system_prompt(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                temperature=0.3,
-                response_format={'type': 'json_object'},
-            )
-
-            json_text = extract_json_from_text(response)
-            result_data = json.loads(json_text)
-
-            requires_visual = result_data.get('requires_visual', False)
-            reasoning = result_data.get('reasoning', 'No reasoning provided')
-
-            self.logger.debug(
-                f'Visual analysis requirement check: {requires_visual}. Reasoning: {reasoning}'
-            )
-
-            return requires_visual
-
-        except Exception as e:
-            self.logger.warning(
-                f'Failed to determine visual analysis requirement using LLM: {e}. Defaulting to False.'
-            )
-            return False
-
     def _summarize_single_result_content(
         self,
         content: str,
@@ -437,23 +390,7 @@ Does this subtask require visual analysis (image recognition, screenshot analysi
         )
         self.logger.info(f'Required content type for subtask: {required_content_type}')
 
-        # Step 2: Try API first before downloading/navigating
-        api_result = None
-        try:
-            api_result = self.tool_belt.try_api_for_search_result(
-                result.url, problem, subtask_description
-            )
-            if api_result:
-                self.logger.info(
-                    f'Successfully retrieved data from {api_result["api_name"]} API for {result.url}'
-                )
-        except Exception as e:
-            self.logger.debug(
-                f'API check failed for {result.url}: {e}. Proceeding with normal download/navigation.'
-            )
-
-        # Step 3: Download/navigate FIRST to get full content (before checking relevance)
-        # Check and adjust URL parameters if needed
+        # Step 2: Check and adjust URL parameters if needed
         adjusted_url = self._check_and_adjust_url_parameters(
             result.url, subtask_description, problem, query_analysis
         )
@@ -461,420 +398,83 @@ Does this subtask require visual analysis (image recognition, screenshot analysi
             self.logger.info(f'URL parameters adjusted: {result.url} -> {adjusted_url}')
             result.url = adjusted_url
 
-        # Initialize variables
-        is_file = False
-        file_type = None
-        full_content = None
-        extracted_data = None
-        section_titles = None
-        content_type = None
+        # Step 3: Try API extraction first
+        api_result = self.content_extractor.try_api_extraction(
+            result.url, problem, subtask_description
+        )
 
-        # If API was successful, format API data and use it instead of downloading/navigating
+        # Step 4: Extract content (API, file, or web page)
+        extraction_result = None
         if api_result:
-            api_data = api_result.get('data')
-            api_name = api_result.get('api_name')
-
-            # Format API data into content format
-            # Pass problem/query_analysis so PDFs can return structured data with image_analysis
-            formatted_content = self.api_formatter.format(
-                api_data, api_name, result.url, problem, query_analysis
+            formatted_api = self.content_extractor.format_api_result(
+                api_result, result.url, problem, query_analysis
             )
-            if formatted_content:
-                full_content = formatted_content
-                content_type = 'api_data'
-                extracted_data = {
-                    'type': 'api_data',
-                    'api_name': api_name,
-                    'url': result.url,
-                    'content': formatted_content,
-                    'raw_data': api_data,
-                    'image_analysis': api_data.get(
-                        '_image_analysis', ''
-                    ),  # Include image analysis if available
-                }
-                section_titles = None
-                # Skip download/navigation since we have API data
-                is_file = False
-                file_type = None
+            if formatted_api:
+                extraction_result = formatted_api
             else:
-                # API data formatting failed, fall back to normal processing
                 self.logger.warning(
-                    f'Failed to format API data from {api_name}. Falling back to normal processing.'
+                    'Failed to format API data. Falling back to normal processing.'
                 )
-                api_result = None
 
-        # If API was not used or failed, proceed with normal download/navigation
-        if not api_result:
-            # Download/navigate to get full content
-            is_file, file_type = self._classify_result_type(result)
-
-        # Process file download/navigation only if API was not used
-        if not api_result and is_file:
-            self.logger.info(
-                f'Result {result_info} is a file (type: {file_type}). Downloading to extract content...'
+        if not extraction_result:
+            # Check if visual analysis is needed for file processing
+            requires_visual = self.visual_processor.requires_visual_analysis(
+                subtask_description, problem, query_analysis
             )
-            try:
-                attachment = self.tool_belt.download_file_from_url(result.url)
-                if attachment:
-                    attachments.append(attachment)
 
-                    # For PDFs, check if visual analysis is needed, then extract images and do visual analysis BEFORE relevance check
-                    image_analysis_for_relevance = ''
-                    if file_type == 'pdf':
-                        # First check if visual analysis is actually needed
-                        requires_visual = self._requires_visual_analysis(
-                            subtask_description, problem, query_analysis
-                        )
+            # Classify result type (using internal method from content extractor)
+            is_file, file_type = self.content_extractor._classify_result_type(result)
 
-                        if requires_visual:
-                            self.logger.info(
-                                'PDF detected and visual analysis is required. Extracting images and performing visual analysis before relevance check...'
-                            )
-                            try:
-                                # Extract file content with image processing enabled to get visual analysis
-                                file_content_with_images = self._extract_file_content(
-                                    attachment,
-                                    problem,
-                                    query_analysis,
-                                    skip_image_processing=False,
-                                )
-
-                                if (
-                                    isinstance(file_content_with_images, dict)
-                                    and file_content_with_images.get('type') == 'pdf'
-                                ):
-                                    # Get image analysis from the extracted data
-                                    image_analysis_for_relevance = (
-                                        file_content_with_images.get(
-                                            'image_analysis', ''
-                                        )
-                                    )
-                                    if image_analysis_for_relevance:
-                                        self.logger.info(
-                                            f'Visual analysis completed: {len(image_analysis_for_relevance)} characters extracted'
-                                        )
-                                    # Use the extracted data
-                                    file_content = file_content_with_images
-                                else:
-                                    # Fallback: extract without images if structured extraction failed
-                                    file_content = self._extract_file_content(
-                                        attachment,
-                                        problem,
-                                        query_analysis,
-                                        skip_image_processing=True,
-                                    )
-                            except Exception as e:
-                                self.logger.warning(
-                                    f'Failed to extract images for visual analysis: {e}. Proceeding without visual analysis.'
-                                )
-                                # Fallback to extraction without images
-                                file_content = self._extract_file_content(
-                                    attachment,
-                                    problem,
-                                    query_analysis,
-                                    skip_image_processing=True,
-                                )
-                        else:
-                            self.logger.info(
-                                'PDF detected but visual analysis not required. Extracting content without image processing...'
-                            )
-                            # Visual analysis not needed, extract without images
-                            file_content = self._extract_file_content(
-                                attachment,
-                                problem,
-                                query_analysis,
-                                skip_image_processing=True,
-                            )
-                    else:
-                        # For non-PDF files, extract normally
-                        file_content = self._extract_file_content(
-                            attachment,
-                            problem,
-                            query_analysis,
-                            skip_image_processing=True,
-                        )
-
-                    # Determine content_type: prefer dict with type='pdf', fallback to file_type
-                    if (
-                        isinstance(file_content, dict)
-                        and file_content.get('type') == 'pdf'
-                    ):
-                        content_type = 'pdf'
-                        full_content = file_content.get('full_text', '')
-                        sections = file_content.get('sections', [])
-                        section_titles = [
-                            s.get('title', '') for s in sections if s.get('title')
-                        ]
-                        extracted_data = file_content
-                        # Store image analysis in extracted_data for later use
-                        if image_analysis_for_relevance:
-                            extracted_data['image_analysis'] = (
-                                image_analysis_for_relevance
-                            )
-                    else:
-                        # If file_type indicates PDF but extraction returned string,
-                        # still set content_type to 'pdf' for proper metadata extraction
-                        if file_type == 'pdf':
-                            content_type = 'pdf'
-                            self.logger.debug(
-                                'PDF detected by file_type but extraction returned string. '
-                                'Setting content_type to "pdf" for metadata extraction.'
-                            )
-                        else:
-                            content_type = 'file'
-
-                        full_content = (
-                            file_content
-                            if isinstance(file_content, str)
-                            else str(file_content)
-                        )
-                        extracted_data = file_content
-            except Exception as e:
-                self.logger.warning(
-                    f'Failed to download/extract content from {result.url}: {e}'
+            if is_file:
+                extraction_result = self.content_extractor.extract_file_content(
+                    result,
+                    result_info,
+                    attachments,
+                    problem,
+                    query_analysis,
+                    subtask_description,
+                    requires_visual,
+                    self._extract_file_content,
                 )
-                return None
-        elif not api_result:
-            # Only process web pages if API was not used
-            self.logger.info(
-                f'Result {result_info} is a web page. Navigating to extract content...'
-            )
-            try:
-                # Navigate to get raw HTML first for content type detection
-                nav_result = self.browser.navigate(url=result.url, use_selenium=True)
-                raw_html_content = (
-                    nav_result.get('content', '') if nav_result.get('success') else ''
+            else:
+                extraction_result = self.content_extractor.extract_web_page_content(
+                    result,
+                    result_info,
+                    subtask_description,
+                    problem,
+                    query_analysis,
+                    required_content_type,
+                    self._handle_web_page_result,
+                    self._extract_web_page_sections,
+                    self._extract_file_content,
+                    attachments,
                 )
 
-                page_result = self._handle_web_page_result(
-                    result, subtask_description, problem, query_analysis
-                )
-                if page_result:
-                    content_type = 'web_page'
-                    if isinstance(page_result, dict):
-                        # Get full content and ensure it's formatted with html2text
-                        raw_content = page_result.get('content', '')
-                        # Format with html2text to get full formatted content
-                        full_content = self.content_formatter.format_web_page_content(
-                            raw_content
-                        )
-                        # Update the content in page_result with formatted version
-                        page_result['content'] = full_content
-                    else:
-                        # String content - format with html2text
-                        full_content = self.content_formatter.format_web_page_content(
-                            page_result
-                        )
-                        # Convert to dict format for consistency
-                        page_result = {
-                            'content': full_content,
-                            'image_analysis': '',
-                        }
-                    # Extract section titles from web page
-                    section_titles = self._extract_web_page_sections(result.url)
-                    extracted_data = page_result
-
-                    # Step 3: Detect actual content type and navigate to PDF if needed
-                    if required_content_type == 'pdf' and content_type == 'web_page':
-                        self.logger.info(
-                            'PDF required but web page retrieved. Attempting to find and navigate to PDF...'
-                        )
-                        # Detect what we actually got using raw HTML
-                        detected_type = self.content_type_detector.detect_content_type(
-                            url=result.url,
-                            page_content=raw_html_content,
-                            page_title=result.title,
-                            is_file_download=False,
-                        )
-
-                        if detected_type != 'pdf':
-                            # Try to find and navigate to PDF using raw HTML
-                            # Use the general method with context for better detection
-                            nav_result = (
-                                self.file_type_navigator.find_and_navigate_to_file(
-                                    current_url=result.url,
-                                    page_content=raw_html_content,
-                                    desired_file_type='pdf',
-                                    page_title=result.title,
-                                    subtask_description=subtask_description,
-                                    problem=problem,
-                                )
-                            )
-
-                            if nav_result and nav_result.get('success'):
-                                # Check if the result indicates a direct file download
-                                if nav_result.get('is_file_download'):
-                                    # LLM found a direct file URL - download it
-                                    pdf_url = nav_result.get(
-                                        'file_url'
-                                    ) or nav_result.get('url')
-                                    self.logger.info(
-                                        f'LLM found direct PDF file URL: {pdf_url}. Downloading...'
-                                    )
-                                    try:
-                                        attachment = (
-                                            self.tool_belt.download_file_from_url(
-                                                pdf_url
-                                            )
-                                        )
-                                        if attachment:
-                                            # Ensure metadata includes source_url for metadata extraction
-                                            if (
-                                                not hasattr(attachment, 'metadata')
-                                                or not attachment.metadata
-                                            ):
-                                                attachment.metadata = {}
-                                            attachment.metadata['source_url'] = pdf_url
-                                            attachments.append(attachment)
-                                            # Mark as file so attachment is used for relevance checking
-                                            is_file = True
-                                            # Extract PDF content
-                                            file_content = self._extract_file_content(
-                                                attachment,
-                                                problem,
-                                                query_analysis,
-                                                skip_image_processing=True,
-                                            )
-                                            if (
-                                                isinstance(file_content, dict)
-                                                and file_content.get('type') == 'pdf'
-                                            ):
-                                                content_type = 'pdf'
-                                                full_content = file_content.get(
-                                                    'full_text', ''
-                                                )
-                                                sections = file_content.get(
-                                                    'sections', []
-                                                )
-                                                section_titles = [
-                                                    s.get('title', '')
-                                                    for s in sections
-                                                    if s.get('title')
-                                                ]
-                                                extracted_data = file_content
-                                            else:
-                                                self.logger.warning(
-                                                    'Downloaded PDF but extraction failed. Using web page content.'
-                                                )
-                                        else:
-                                            self.logger.warning(
-                                                'Failed to download PDF from target URL. Using web page content.'
-                                            )
-                                    except Exception as e:
-                                        self.logger.warning(
-                                            f'Error downloading PDF from target URL: {e}. Using web page content.'
-                                        )
-                                else:
-                                    # Successfully navigated to PDF page
-                                    self.logger.info(
-                                        f'Successfully navigated to PDF from web page: {nav_result.get("url", "unknown")}'
-                                    )
-                                    # Try to download the PDF
-                                    pdf_url = nav_result.get('url', result.url)
-                                    try:
-                                        attachment = (
-                                            self.tool_belt.download_file_from_url(
-                                                pdf_url
-                                            )
-                                        )
-                                        if attachment:
-                                            # Ensure metadata includes source_url for metadata extraction
-                                            if (
-                                                not hasattr(attachment, 'metadata')
-                                                or not attachment.metadata
-                                            ):
-                                                attachment.metadata = {}
-                                            attachment.metadata['source_url'] = pdf_url
-                                            attachments.append(attachment)
-                                            # Mark as file so attachment is used for relevance checking
-                                            is_file = True
-                                            # Extract PDF content
-                                            file_content = self._extract_file_content(
-                                                attachment,
-                                                problem,
-                                                query_analysis,
-                                                skip_image_processing=True,
-                                            )
-                                            if (
-                                                isinstance(file_content, dict)
-                                                and file_content.get('type') == 'pdf'
-                                            ):
-                                                content_type = 'pdf'
-                                                full_content = file_content.get(
-                                                    'full_text', ''
-                                                )
-                                                sections = file_content.get(
-                                                    'sections', []
-                                                )
-                                                section_titles = [
-                                                    s.get('title', '')
-                                                    for s in sections
-                                                    if s.get('title')
-                                                ]
-                                                extracted_data = file_content
-                                            else:
-                                                self.logger.warning(
-                                                    'Navigated to PDF but extraction failed. Using web page content.'
-                                                )
-                                        else:
-                                            self.logger.warning(
-                                                'Navigated to PDF but download failed. Using web page content.'
-                                            )
-                                    except Exception as e:
-                                        self.logger.warning(
-                                            f'Error downloading PDF after navigation: {e}. Using web page content.'
-                                        )
-                            else:
-                                self.logger.info(
-                                    'Could not find PDF download link on page. Using web page content.'
-                                )
-                        else:
-                            self.logger.info(
-                                'Page appears to be a PDF viewer. Content type already correct.'
-                            )
-
-            except Exception as e:
-                self.logger.warning(
-                    f'Failed to navigate/extract content from {result.url}: {e}'
-                )
-                return None
-
-        if not extracted_data or not full_content:
+        if not extraction_result:
             self.logger.warning(f'No content extracted from result {result_info}')
             return None
 
-        # Step 3: Determine relevance using full content
-        # Get the attachment if it was downloaded
+        # Extract variables from extraction result
+        is_file = extraction_result.get('is_file', False)
+        file_type = extraction_result.get('file_type')
+        full_content = extraction_result.get('full_content')
+        extracted_data = extraction_result.get('extracted_data')
+        section_titles = extraction_result.get('section_titles')
+        content_type = extraction_result.get('content_type')
+
+        # Step 5: Determine relevance using full content
         attachment_for_relevance = None
         if is_file and attachments:
-            # Get the most recently added attachment (should be the one we just downloaded)
             attachment_for_relevance = attachments[-1] if attachments else None
-            self.logger.debug(
-                f'Attachment for relevance check: {attachment_for_relevance is not None}, '
-                f'attachments list length: {len(attachments) if attachments else 0}'
-            )
-        else:
-            self.logger.debug(
-                f'No attachment for relevance check: is_file={is_file}, '
-                f'has_attachments={attachments is not None and len(attachments) > 0 if attachments else False}'
-            )
 
-        # Get image analysis if it was extracted before relevance check (for PDFs and API data)
         image_analysis_for_relevance = ''
         if isinstance(extracted_data, dict):
-            # Check both PDF files and API data (which may contain PDF content with images)
             if extracted_data.get('type') in ('pdf', 'api_data'):
                 image_analysis_for_relevance = extracted_data.get('image_analysis', '')
                 if image_analysis_for_relevance:
                     self.logger.info(
                         f'Including image analysis in relevance check ({len(image_analysis_for_relevance)} chars)'
                     )
-
-        self.logger.debug(
-            f'Relevance check: content_type={content_type}, '
-            f'extracted_data_type={type(extracted_data).__name__}, '
-            f'is_pdf_dict={isinstance(extracted_data, dict) and extracted_data.get("type") == "pdf" if isinstance(extracted_data, dict) else False}'
-        )
 
         is_relevant, relevance_reasoning = self._check_relevance(
             result,
@@ -899,7 +499,7 @@ Does this subtask require visual analysis (image recognition, screenshot analysi
             f'Proceeding with content summarization and visual analysis check.'
         )
 
-        # Step 4: Summarize the full content with subtask_description and problem context
+        # Step 6: Summarize the full content
         summarized_content = self.content_summarizer.summarize_single_result(
             full_content,
             subtask_description,
@@ -911,176 +511,39 @@ Does this subtask require visual analysis (image recognition, screenshot analysi
         # Update extracted_data with summarized content
         if isinstance(extracted_data, dict):
             extracted_data['summarized_content'] = summarized_content
-            # Keep original content for reference but use summarized for return
             extracted_data['content'] = summarized_content
         else:
-            # Convert to dict format
             extracted_data = {
                 'content': summarized_content,
                 'image_analysis': '',
             }
 
-        # Step 5: Check if subtask_description requires visual analysis
-        requires_visual = self._requires_visual_analysis(
+        # Step 7: Process visual analysis if required
+        requires_visual = self.visual_processor.requires_visual_analysis(
             subtask_description, problem, query_analysis
         )
 
-        # Step 6: If visual is required, use visual LLM to analyze data
         if requires_visual:
             self.logger.info(
                 'Visual analysis required for subtask. Processing with visual LLM...'
             )
-
-            if (
-                hasattr(self.tool_belt, 'image_recognition')
-                and self.tool_belt.image_recognition
-            ):
-                try:
-                    if (
-                        is_file
-                        and isinstance(extracted_data, dict)
-                        and extracted_data.get('type') == 'pdf'
-                    ):
-                        # Check if image analysis was already done before relevance check
-                        existing_image_analysis = extracted_data.get(
-                            'image_analysis', ''
-                        )
-                        if existing_image_analysis:
-                            self.logger.info(
-                                'Image analysis already completed before relevance check. Skipping duplicate processing.'
-                            )
-                            # Image analysis is already in extracted_data, no need to process again
-                        else:
-                            # Process PDF images (fallback if not done before relevance check)
-                            extracted_images = extracted_data.get(
-                                'extracted_images', []
-                            )
-                            if extracted_images:
-                                attachment = next(
-                                    (
-                                        a
-                                        for a in attachments
-                                        if a.filename
-                                        == extracted_data.get('filename', '')
-                                    ),
-                                    None,
-                                )
-                                if attachment:
-                                    image_analysis = self.tool_belt.image_recognition.process_pdf_images_after_relevance(
-                                        attachment,
-                                        extracted_images,
-                                        problem=problem,
-                                        context_text=full_content or '',
-                                    )
-                                    if image_analysis:
-                                        extracted_data['image_analysis'] = (
-                                            image_analysis
-                                        )
-                                        self.logger.info(
-                                            f'Processed {len(extracted_images)} image(s) from PDF with visual LLM'
-                                        )
-                    elif not is_file:
-                        # Process web page screenshot
-                        screenshot = self.browser.take_screenshot(as_base64=False)
-                        if screenshot:
-                            task_desc = f'Analyze this webpage screenshot and extract relevant information for: {subtask_description}'
-                            image_analysis = self.tool_belt.image_recognition.recognize_images_from_browser(
-                                screenshot,
-                                context={
-                                    'url': result.url,
-                                    'title': result.title,
-                                    'text': summarized_content[:1000]
-                                    if summarized_content
-                                    else '',
-                                },
-                                task_description=task_desc,
-                            )
-                            if image_analysis:
-                                if isinstance(extracted_data, dict):
-                                    extracted_data['image_analysis'] = image_analysis
-                                else:
-                                    # Convert to dict format
-                                    extracted_data = {
-                                        'content': extracted_data,
-                                        'image_analysis': image_analysis,
-                                    }
-                                self.logger.info(
-                                    'Processed webpage screenshot with visual LLM'
-                                )
-                except Exception as e:
-                    self.logger.warning(f'Failed to process visual analysis: {e}')
-            else:
-                self.logger.warning(
-                    'Visual analysis required but image_recognition tool not available'
-                )
+            extracted_data = self.visual_processor.process_visual_analysis(
+                is_file,
+                extracted_data,
+                attachments,
+                result,
+                subtask_description,
+                problem,
+                full_content,
+                summarized_content,
+            )
         else:
             self.logger.debug('Visual analysis not required for this subtask')
 
-        # Step 7: Return relevant summarized data with respect to subtask_description and problem
-        if is_file and extracted_data:
-            if isinstance(extracted_data, dict) and extracted_data.get('type') == 'pdf':
-                return {
-                    'type': 'pdf',
-                    'title': result.title,
-                    'url': result.url,
-                    'sections': extracted_data.get('sections', []),
-                    'image_analysis': extracted_data.get('image_analysis', ''),
-                    'content': summarized_content,  # Return summarized content
-                    'data': {
-                        'url': result.url,
-                        'type': file_type,
-                        'title': result.title,
-                        'sections': extracted_data.get('sections', []),
-                        'image_analysis': extracted_data.get('image_analysis', ''),
-                        'content': summarized_content,  # Return summarized content
-                    },
-                }
-            else:
-                return {
-                    'type': 'file',
-                    'title': result.title,
-                    'url': result.url,
-                    'content': summarized_content,  # Return summarized content
-                    'data': {
-                        'url': result.url,
-                        'type': file_type,
-                        'title': result.title,
-                        'content': summarized_content,  # Return summarized content
-                    },
-                }
-        elif not is_file and extracted_data:
-            if isinstance(extracted_data, dict):
-                # Content is already summarized
-                page_content = extracted_data.get('content', summarized_content)
-                image_analysis = extracted_data.get('image_analysis', '')
-                return {
-                    'type': 'web_page',
-                    'title': result.title,
-                    'url': result.url,
-                    'content': page_content,
-                    'image_analysis': image_analysis,
-                    'data': {
-                        'url': result.url,
-                        'title': result.title,
-                        'content': page_content,
-                        'image_analysis': image_analysis,
-                    },
-                }
-            else:
-                # Content is already summarized
-                return {
-                    'type': 'web_page',
-                    'title': result.title,
-                    'url': result.url,
-                    'content': summarized_content,
-                    'data': {
-                        'url': result.url,
-                        'title': result.title,
-                        'content': summarized_content,
-                    },
-                }
-
-        return None
+        # Step 8: Format and return result
+        return self.result_formatter.format_result(
+            result, is_file, file_type, extracted_data, summarized_content
+        )
 
     def _extract_web_page_sections(self, url: str) -> List[str]:
         """
@@ -1220,48 +683,6 @@ Does this subtask require visual analysis (image recognition, screenshot analysi
             attachment=attachment,
             image_analysis=image_analysis,
         )
-
-    def _classify_result_type(self, search_result: SearchResult) -> tuple[bool, str]:
-        """
-        Classify a search result as either a file or web page.
-
-        Args:
-            search_result: SearchResult to classify.
-
-        Returns:
-            Tuple of (is_file: bool, file_type: str)
-            file_type is one of: 'pdf', 'doc', 'spreadsheet', 'image', 'archive', 'text', 'webpage'
-        """
-        url = search_result.url.lower() if search_result.url else ''
-        title = search_result.title.lower() if search_result.title else ''
-
-        # Define file type mappings
-        file_type_patterns = {
-            'pdf': ['.pdf'],
-            'doc': ['.doc', '.docx', '.odt'],
-            'spreadsheet': ['.xls', '.xlsx', '.csv', '.ods'],
-            'image': ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.svg', '.webp'],
-            'archive': ['.zip', '.tar', '.gz', '.rar', '.7z'],
-            'text': ['.txt'],
-        }
-
-        # Check URL and title for file extensions
-        for file_type, patterns in file_type_patterns.items():
-            for pattern in patterns:
-                if pattern in url or pattern in title:
-                    return True, file_type
-
-        # Check for file download indicators in URL
-        file_indicators = ['/pdf/', '/download/', '/file/', '/attachment/', '/doc/']
-        if any(indicator in url for indicator in file_indicators):
-            # Try to determine specific type
-            for file_type, patterns in file_type_patterns.items():
-                if any(pattern.strip('.') in url for pattern in patterns):
-                    return True, file_type
-            return True, 'unknown'
-
-        # If no file indicators found, it's a web page
-        return False, 'webpage'
 
     def _handle_file_result(
         self,
@@ -1450,47 +871,27 @@ Does this subtask require visual analysis (image recognition, screenshot analysi
     ) -> Optional[Union[str, Dict[str, Any]]]:
         """
         Handle a search result that is a web page by navigating with the unified browser.
-        Includes image extraction/analysis.
+        Always uses Selenium for navigation. Includes image extraction/analysis.
 
         Returns:
             String content (backward compatibility) or dict with 'content' and 'image_analysis' keys.
         """
         try:
-            # Simple heuristic to decide if selenium is needed
-            use_selenium = True
-
             self.logger.info(
-                f'Navigating to web page: {search_result.url} (using_selenium={use_selenium})'
+                f'Navigating to web page: {search_result.url} (using Selenium)'
             )
 
-            nav_result = self.browser.navigate(
-                url=search_result.url, use_selenium=use_selenium
-            )
+            nav_result = self.browser.navigate(url=search_result.url, use_selenium=True)
 
             if not nav_result.get('success'):
                 error_msg = nav_result.get('error', 'Navigation failed')
                 self.logger.warning(
                     f'Failed to navigate to {search_result.url}: {error_msg}'
                 )
-                # If requests failed, try with selenium
-                if not use_selenium:
-                    self.logger.info(
-                        f'Retrying navigation with Selenium for {search_result.url}'
-                    )
-                    nav_result = self.browser.navigate(
-                        url=search_result.url, use_selenium=True
-                    )
-                    if not nav_result.get('success'):
-                        error_msg = nav_result.get('error', 'Navigation failed again')
-                        self.logger.warning(
-                            f'Failed to navigate to {search_result.url} with Selenium: {error_msg}'
-                        )
-                        return None
-                else:
-                    return None
+                return None
 
-            # Step 1.5: Detect and toggle expandable elements if needed
-            if use_selenium and self.llm_service:
+            # Detect and toggle expandable elements if needed
+            if self.llm_service:
                 nav_result = self._toggle_relevant_expandable_elements(
                     nav_result, subtask_description, problem, query_analysis
                 )
@@ -1792,6 +1193,103 @@ Are these URL parameters appropriate for completing the subtask? If not, what sh
             )
             return nav_result
 
+    def _preprocess_expandable_elements(
+        self,
+        expandable_elements: List[Dict[str, Any]],
+        subtask_description: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Preprocess expandable elements to extract only relevant information.
+        Filters out navigation/footer elements and extracts key fields.
+
+        Args:
+            expandable_elements: List of expandable element dictionaries.
+            subtask_description: Description of the subtask for filtering.
+
+        Returns:
+            List of preprocessed element dictionaries with only relevant fields.
+        """
+        if not expandable_elements:
+            return []
+
+        # Keywords that suggest navigation/footer elements (not relevant for content)
+        navigation_keywords = [
+            'menu',
+            'nav',
+            'navigation',
+            'footer',
+            'header',
+            'sidebar',
+            'cookie',
+            'privacy',
+            'terms',
+            'legal',
+            'about us',
+            'contact',
+            'login',
+            'sign in',
+            'register',
+            'account',
+            'profile',
+        ]
+
+        # Extract keywords from subtask for relevance filtering
+        subtask_lower = subtask_description.lower()
+        subtask_keywords = [
+            word
+            for word in subtask_lower.split()
+            if len(word) > 3 and word not in ['the', 'and', 'for', 'with', 'from']
+        ]
+
+        preprocessed = []
+        for elem in expandable_elements:
+            # Extract text and aria-label (most important fields)
+            text = elem.get('text', '').strip()
+            aria_label = elem.get('aria-label', '').strip()
+            combined_text = f'{text} {aria_label}'.lower().strip()
+
+            # Skip if empty or clearly navigation/footer
+            if not combined_text:
+                continue
+
+            # Filter out navigation elements
+            if any(keyword in combined_text for keyword in navigation_keywords):
+                continue
+
+            # Extract only relevant fields
+            preprocessed_elem = {
+                'text': text if text else aria_label,
+                'aria_expanded': elem.get('aria-expanded', 'N/A'),
+            }
+
+            # Only include type if it's informative (not generic)
+            elem_type = elem.get('type', '')
+            if elem_type and elem_type not in ['button', 'div']:
+                preprocessed_elem['type'] = elem_type
+
+            preprocessed.append(preprocessed_elem)
+
+        # If we have too many elements, prioritize collapsed ones and those with relevant keywords
+        if len(preprocessed) > 20:
+            # Prioritize collapsed elements
+            collapsed = [e for e in preprocessed if e.get('aria_expanded') == 'false']
+            expanded = [e for e in preprocessed if e.get('aria_expanded') != 'false']
+
+            # Further filter by keyword relevance if we still have too many
+            if len(collapsed) > 15:
+                # Keep elements with keywords matching subtask
+                relevant = [
+                    e
+                    for e in collapsed
+                    if any(kw in e['text'].lower() for kw in subtask_keywords)
+                ]
+                # If we found relevant ones, use them; otherwise use first 15 collapsed
+                collapsed = relevant[:15] if relevant else collapsed[:15]
+
+            preprocessed = collapsed + expanded[:5]  # Max 20 elements
+
+        return preprocessed
+
     def _determine_elements_to_toggle(
         self,
         expandable_elements: List[Dict[str, Any]],
@@ -1802,6 +1300,7 @@ Are these URL parameters appropriate for completing the subtask? If not, what sh
         """
         Use LLM to determine which expandable elements should be toggled
         to reveal information relevant to the subtask.
+        Uses preprocessing to reduce context size.
 
         Args:
             expandable_elements: List of expandable element dictionaries.
@@ -1815,37 +1314,46 @@ Are these URL parameters appropriate for completing the subtask? If not, what sh
         if not expandable_elements:
             return []
 
-        # Build context from query analysis
+        # Preprocess elements to extract only relevant information
+        preprocessed_elements = self._preprocess_expandable_elements(
+            expandable_elements, subtask_description
+        )
+
+        if not preprocessed_elements:
+            self.logger.debug('No relevant expandable elements after preprocessing')
+            return []
+
+        # Build minimal context from query analysis (only explicit requirements)
         requirements_context = ''
         if query_analysis:
             explicit_reqs = query_analysis.get('explicit_requirements', [])
             if explicit_reqs:
-                requirements_context += (
-                    f'\nExplicit Requirements: {", ".join(explicit_reqs)}'
+                # Limit to first 3 requirements to reduce context
+                reqs_to_include = explicit_reqs[:3]
+                requirements_context = (
+                    f'\nExplicit Requirements: {", ".join(reqs_to_include)}'
                 )
 
-        # Format elements for LLM
+        # Format preprocessed elements for LLM (simplified format)
         elements_text = []
-        for idx, elem in enumerate(expandable_elements, 1):
-            elem_info = f"""Element {idx}:
-- Text: {elem.get('text', 'N/A')}
-- Type: {elem.get('type', 'N/A')}
-- ID: {elem.get('id', 'N/A')}
-- Classes: {elem.get('classes', 'N/A')}
-- Aria Label: {elem.get('aria-label', 'N/A')}
-- Aria Expanded: {elem.get('aria-expanded', 'N/A')}"""
+        for idx, elem in enumerate(preprocessed_elements, 1):
+            elem_parts = [f'Text: {elem.get("text", "N/A")}']
+            if elem.get('type'):
+                elem_parts.append(f'Type: {elem.get("type")}')
+            elem_parts.append(f'State: {elem.get("aria_expanded", "N/A")}')
+            elem_info = f'Element {idx}: {" | ".join(elem_parts)}'
             elements_text.append(elem_info)
 
         system_prompt = """You are an expert at analyzing web pages to determine which expandable/collapsible elements (buttons, toggles) need to be clicked to reveal information relevant to a specific task.
 
-Given a subtask description and a list of expandable elements on a web page, determine which elements should be toggled (clicked) to reveal hidden information that is needed to complete the subtask.
+Given a subtask description and a list of preprocessed expandable elements on a web page, determine which elements should be toggled (clicked) to reveal hidden information that is needed to complete the subtask.
 
 Consider:
 - The subtask description and what information is being sought
-- The text, labels, and attributes of each expandable element
+- The text of each expandable element
 - Whether clicking an element would reveal information relevant to the subtask
-- Elements that are currently collapsed (aria-expanded="false") and need to be expanded
-- Elements whose text/labels suggest they contain relevant information
+- Elements that are currently collapsed (State: false) and need to be expanded
+- Elements whose text suggests they contain relevant information
 
 Return a JSON object with:
 - elements_to_toggle: array of element indices (1-based) that should be toggled, sorted by priority (most relevant first)
@@ -1853,15 +1361,13 @@ Return a JSON object with:
 
 IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
 
-        user_prompt = f"""Problem: {problem}
-
-Subtask: {subtask_description}
+        user_prompt = f"""Subtask: {subtask_description}
 {requirements_context}
 
-Expandable Elements on Page:
+Relevant Expandable Elements (preprocessed):
 {chr(10).join(elements_text)}
 
-Which expandable elements should be toggled to reveal information needed for this subtask? Consider elements that might contain hidden information relevant to the subtask description."""
+Which elements should be toggled to reveal information needed for this subtask?"""
 
         try:
             response = self.llm_service.call_with_system_prompt(
@@ -1878,16 +1384,37 @@ Which expandable elements should be toggled to reveal information needed for thi
             reasoning = result_data.get('reasoning', 'No reasoning provided')
 
             self.logger.info(
-                f'LLM selected {len(element_indices)} element(s) to toggle. Reasoning: {reasoning}'
+                f'LLM selected {len(element_indices)} element(s) to toggle from {len(preprocessed_elements)} preprocessed elements. Reasoning: {reasoning}'
             )
 
-            # Convert 1-based indices to 0-based and get elements
+            # Map preprocessed indices back to original elements
+            # Create a mapping from preprocessed text to original elements
+            text_to_original = {}
+            for orig_elem in expandable_elements:
+                text = orig_elem.get('text', '').strip()
+                aria_label = orig_elem.get('aria-label', '').strip()
+                key = text if text else aria_label
+                if key:
+                    text_to_original[key] = orig_elem
+
+            # Convert 1-based indices to 0-based and get original elements
             elements_to_toggle = []
             for idx in element_indices:
                 try:
                     idx_int = int(idx) - 1  # Convert to 0-based
-                    if 0 <= idx_int < len(expandable_elements):
-                        elements_to_toggle.append(expandable_elements[idx_int])
+                    if 0 <= idx_int < len(preprocessed_elements):
+                        preprocessed_elem = preprocessed_elements[idx_int]
+                        elem_text = preprocessed_elem.get('text', '')
+                        # Find matching original element
+                        if elem_text in text_to_original:
+                            elements_to_toggle.append(text_to_original[elem_text])
+                        else:
+                            # Fallback: try to find by matching text in original elements
+                            for orig_elem in expandable_elements:
+                                orig_text = orig_elem.get('text', '').strip()
+                                if orig_text == elem_text:
+                                    elements_to_toggle.append(orig_elem)
+                                    break
                 except (ValueError, TypeError):
                     continue
 

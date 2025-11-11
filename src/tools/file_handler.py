@@ -75,7 +75,9 @@ class FileHandler:
 
             # Handle PDF files
             if '.pdf' in filename_lower:
-                return self._read_pdf(attachment, options, problem, query_analysis, skip_image_processing)
+                return self._read_pdf(
+                    attachment, options, problem, query_analysis, skip_image_processing
+                )
 
             # Handle text files
             elif '.txt' in filename_lower:

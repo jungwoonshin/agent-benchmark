@@ -66,8 +66,9 @@ class QueryUnderstanding:
                     f'  Step {step_num} (id: {subtask.id}): {subtask.description}\n'
                 )
             subtasks_context += (
-                '\nIMPORTANT: Assign each requirement to the step number that matches the subtask ID. '
-                'For example, if subtask id is "step_1", assign requirements as "Step 1: requirement text".\n'
+                '\nIMPORTANT: Assign each requirement to the step number that matches the subtask ID AND matches what that subtask is actually doing/verifying. '
+                'Read each subtask description carefully to understand what it does, then assign requirements that must be satisfied BY THAT SPECIFIC STEP. '
+                'Do NOT assign requirements about extracting data to a step that is about verifying/searching in a different source.\n'
             )
 
         system_prompt = """You are an expert at analyzing complex problem queries.
@@ -98,31 +99,46 @@ CRITICAL RULES FOR EXPLICIT REQUIREMENTS:
 - Preserve exact quantities, counts, and structural relationships as stated in the problem
 - Do not simplify or reduce quantities when extracting requirements - maintain the full detail from the problem statement
 
+CRITICAL: ANSWER FORMAT AND UNIT REQUIREMENTS
+- The answer_format field must clearly specify the expected format and units for the final answer
+- If the problem asks for a number in specific units, include this in the answer_format using general language
+- Use natural, general language to describe unit requirements - avoid technical notation or abbreviations
+- If the problem shows an expected answer format, infer that the answer should be in thousands and state this clearly
+
 CRITICAL: STEP NUMBER ASSIGNMENT
 - If subtasks are provided, you MUST assign each requirement to the correct step number
-- Match requirements to subtasks based on which step the requirement applies to
+- Match requirements to subtasks based on WHAT EACH SUBTASK ACTUALLY DOES, not just the step number
+- Read each subtask description carefully to understand its purpose and what it verifies/processes
+- Assign requirements to the step that must satisfy/verify that requirement during its execution
 - Use the step number from the subtask ID (e.g., subtask id="step_1" → assign as "Step 1: requirement")
 - Each requirement should be tagged with "Step N:" where N matches the subtask step number
-- Requirements that apply to multiple steps should be assigned to the most relevant step
+- Requirements about extracting data from a source should go to the step that extracts from that source
+- Requirements about verifying/checking content in a different source should go to the step that checks that source
+- Requirements that apply to multiple steps should be assigned to the most relevant step based on what it verifies
 - If no subtasks are provided, analyze the problem and assign step numbers based on logical flow
 
 Return your analysis as a JSON object with these keys:
 - explicit_requirements: list of strings (constraints/conditions with step context, e.g., "Step 1: requirement text", "Step 2: requirement text")
 - dependencies: list of strings describing information needs
-- answer_format: string describing expected format
+- answer_format: string describing expected format with correct units
 - cross_references: list of strings describing cross-references
 - has_terminology_ambiguity: boolean (true if the answer might have multiple valid forms due to terminology)
 - terminology_context: string describing the domain/context where terminology matters
 
 Be thorough and precise. Assign requirements to the correct step numbers based on the provided subtasks.
-
+IMPORTANT: When specifying answer_format, use clear, general language to describe units
 IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
 
         user_prompt = f"""Problem: {problem}{attachment_info}{subtasks_context}
 
 Analyze this problem and assign requirements to the correct step numbers based on the generated subtasks.
 
-CRITICAL: Read the problem statement carefully and extract all quantitative details accurately. If the problem describes multiple items where each has multiple parts, ensure requirements reflect the correct total count. Preserve all structural relationships and quantities exactly as stated in the problem."""
+CRITICAL: Read the problem statement carefully and extract all quantitative details accurately. If the problem describes multiple items where each has multiple parts, ensure requirements reflect the correct total count. Preserve all structural relationships and quantities exactly as stated in the problem.
+
+CRITICAL: When assigning requirements to steps, carefully read each subtask description to understand what it does. Assign each requirement to the step that must satisfy/verify that requirement. For example:
+- If Step 1 extracts data from Source A, assign requirements about Source A data extraction to Step 1
+- If Step 2 verifies/checks content in Source B, assign requirements about verifying Source B content to Step 2
+- Do NOT assign requirements about Source B to Step 1 if Step 1 only works with Source A"""
 
         try:
             response = self.llm_service.call_with_system_prompt(

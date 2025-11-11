@@ -8,6 +8,7 @@ from ..llm import LLMService
 from ..models import SearchResult
 from ..utils import extract_json_from_text
 from ..utils.arxiv_utils import get_arxiv_submission_date
+from .authority_assessor import AuthorityAssessor
 
 
 class RelevanceRanker:
@@ -25,6 +26,7 @@ class RelevanceRanker:
         """
         self.llm_service = llm_service
         self.logger = logger or logging.getLogger(__name__)
+        self.authority_assessor = AuthorityAssessor(logger)
 
     def rank_by_relevance(
         self,
@@ -64,7 +66,13 @@ class RelevanceRanker:
                     f'\nExplicit Requirements: {", ".join(explicit_reqs)}'
                 )
 
-        # Format search results for LLM with submission_date for arXiv papers
+        # Extract authority signals for each result
+        authority_signals_list = [
+            self.authority_assessor.extract_authority_signals(result)
+            for result in search_results
+        ]
+
+        # Format search results for LLM with submission_date and authority signals
         results_text = []
         for idx, result in enumerate(search_results, 1):
             snippet_preview = (
@@ -75,11 +83,26 @@ class RelevanceRanker:
 
             # Get submission_date for arXiv papers using arxiv library
             submission_date = get_arxiv_submission_date(result.url, self.logger)
+            authority_signals = authority_signals_list[idx - 1]
 
-            # Build result text with submission_date on top if available
+            # Build result text with authority information
             result_lines = []
             if submission_date:
                 result_lines.append(f'Submission Date: {submission_date}')
+            result_lines.append(
+                f'Content Type: {authority_signals["content_type_quality"]}'
+            )
+            if authority_signals['domain_indicators']:
+                result_lines.append(
+                    f'Domain Type: {", ".join(authority_signals["domain_indicators"])}'
+                )
+            if authority_signals['publication_indicators']:
+                result_lines.append(
+                    f'Publication Type: {", ".join(authority_signals["publication_indicators"])}'
+                )
+            result_lines.append(
+                f'Authority Score: {authority_signals["authority_score"]:.2f}'
+            )
             result_lines.append(f'Title: {result.title}')
             result_lines.append(f'URL: {result.url}')
             result_lines.append(f'Snippet: {snippet_preview}')
@@ -87,17 +110,24 @@ class RelevanceRanker:
             results_text.append(f'[{idx}]\n' + '\n'.join(result_lines))
 
         system_prompt = """You are an expert at identifying search result candidates for a specific task.
-Given a subtask description and a list of search results (with title, URL, and snippet), determine which results are promising enough to be considered as candidates for further processing.
+Given a subtask description and a list of search results (with title, URL, snippet, and authority signals), determine which results are promising enough to be considered as candidates for further processing.
 
 Your task:
-1. Analyze each search result based on its title, URL, and snippet
-2. Determine if each result is a good CANDIDATE - meaning it appears relevant enough to potentially contain useful information for the subtask
-3. Include results that show promise or potential relevance, even if not perfectly aligned
-4. Exclude only results that are clearly irrelevant, completely off-topic, or obviously unrelated
-5. Rank the selected candidates from most promising to least promising
-6. Assign a candidate score from 0.0 to 1.0 for each selected result (indicating how promising it is as a candidate)
+1. Analyze each search result based on its title, URL, snippet, AND authority signals
+2. Prioritize results with:
+   - Higher authority scores (full documents > snippets, peer-reviewed > general web pages)
+   - Better content type quality (full documents preferred over snippets)
+   - Stronger publication indicators (peer-reviewed journals, official sources)
+3. Determine if each result is a good CANDIDATE - meaning it appears relevant enough AND authoritative enough
+4. Rank the selected candidates from most promising to least promising, considering BOTH relevance AND authority
+5. Assign a candidate score from 0.0 to 1.0 for each selected result
 
-CRITICAL: Focus on candidate selection, not strict relevance. Include results that are promising enough to warrant further investigation. It's better to include a reasonable set of candidates than to be overly restrictive.
+CRITICAL: When multiple results appear relevant, prioritize:
+- Full documents (PDFs, direct article pages) over snippets or abstracts
+- Primary sources (original papers, official documents) over secondary sources (summaries, news articles)
+- Sources with higher authority scores when relevance is similar
+
+Focus on candidate selection, not strict relevance. Include results that are promising enough to warrant further investigation. It's better to include a reasonable set of candidates than to be overly restrictive.
 
 IMPORTANT DATE HANDLING: When evaluating dates (especially for arXiv papers):
 - Use the Submission Date field if provided (this is the actual submission date from arXiv API)

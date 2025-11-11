@@ -468,6 +468,16 @@ class Executor:
                     if isinstance(result, dict)
                     else str(result)
                 )
+                # Filter out Hugging Face GAIA-Subset-Benchmark dataset URL
+                if (
+                    url
+                    and 'huggingface.co/datasets/Intelligent-Internet/GAIA-Subset-Benchmark'
+                    in url
+                ):
+                    self.logger.debug(
+                        f'Filtered out Hugging Face GAIA-Subset-Benchmark URL from search results: {url}'
+                    )
+                    continue
                 if url and url not in seen_urls:
                     seen_urls.add(url)
                     all_results.append(result)
@@ -746,14 +756,16 @@ class Executor:
     def _execute_api_tool(
         self,
         tool_name: str,
-        parameters: Dict[str, Any],
+        parameters: Dict[str, Any] | List[Dict[str, Any]],
     ) -> Any:
         """
         Execute an API tool.
 
         Args:
             tool_name: Name of the API tool (e.g., 'github_api', 'wikipedia_api')
-            parameters: Parameters for the API call, must include 'api_name' and 'method'
+            parameters: Parameters for the API call. Can be:
+                - A dict with 'method' and parameters (single call)
+                - A list of dicts, each with 'function' (or 'method') and 'parameters' (or direct parameters) (chained calls)
 
         Returns:
             API response
@@ -761,7 +773,11 @@ class Executor:
         # Extract API name from tool name (remove '_api' suffix)
         api_name = tool_name.replace('_api', '')
 
-        # Get method from parameters
+        # Check if parameters is a list (multiple API calls)
+        if isinstance(parameters, list):
+            return self._execute_chained_api_calls(api_name, parameters)
+
+        # Single API call (backward compatible)
         method = parameters.get('method')
         if not method:
             error_msg = f'API tool {tool_name} requires "method" parameter. Received parameters: {json.dumps(parameters, default=str)}'
@@ -800,6 +816,179 @@ class Executor:
                 'method': method,
                 'exception_type': type(e).__name__,
             }
+
+    def _execute_chained_api_calls(
+        self,
+        api_name: str,
+        api_calls: List[Dict[str, Any]],
+    ) -> Any:
+        """
+        Execute a chain of API calls, using results from previous calls.
+
+        Args:
+            api_name: Name of the API (e.g., 'wikipedia', 'github')
+            api_calls: List of API call specifications. Each dict can have:
+                - 'function' (method name) and 'parameters' (dict with method parameters)
+                - OR directly contain 'method' and parameters
+
+        Returns:
+            Final API response or error dict
+        """
+        self.logger.info(f'Executing {len(api_calls)} chained API calls for {api_name}')
+        previous_results = {}
+
+        for idx, call_spec in enumerate(api_calls, 1):
+            self.logger.info(f'Executing API call {idx}/{len(api_calls)}')
+
+            # Extract method name and parameters
+            if 'function' in call_spec:
+                method = call_spec['function']
+                call_params = call_spec.get('parameters', {})
+            elif 'method' in call_spec:
+                method = call_spec['method']
+                call_params = {k: v for k, v in call_spec.items() if k != 'method'}
+            else:
+                error_msg = f'API call {idx} missing "function" or "method" field. Call spec: {json.dumps(call_spec, default=str)}'
+                self.logger.error(error_msg)
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'api_name': api_name,
+                    'call_index': idx,
+                }
+
+            # Replace placeholders in parameters with results from previous calls
+            resolved_params = self._resolve_parameter_placeholders(
+                call_params, previous_results, api_name, method
+            )
+
+            self.logger.debug(
+                f'API call {idx}: {api_name}.{method} with params: {json.dumps(resolved_params, default=str)[:200]}...'
+            )
+
+            try:
+                result = self.tool_belt.call_api(api_name, method, **resolved_params)
+                if result is None:
+                    error_msg = f'API call {api_name}.{method} (call {idx}/{len(api_calls)}) returned None'
+                    self.logger.error(error_msg)
+                    return {
+                        'success': False,
+                        'error': error_msg,
+                        'api_name': api_name,
+                        'method': method,
+                        'call_index': idx,
+                    }
+
+                # Store result for next call
+                previous_results[f'call_{idx}'] = result
+                previous_results['last_result'] = result
+                previous_results['last_method'] = method
+
+                # For Wikipedia get_page_revisions, extract revision_id for next call
+                if (
+                    api_name == 'wikipedia'
+                    and method == 'get_page_revisions'
+                    and isinstance(result, list)
+                    and len(result) > 0
+                ):
+                    # Get the first revision (most recent in the date range)
+                    first_rev = result[0]
+                    if isinstance(first_rev, dict):
+                        rev_id = first_rev.get('revid') or first_rev.get('revision_id')
+                        if rev_id:
+                            previous_results['revision_id'] = rev_id
+                            self.logger.info(
+                                f'Extracted revision_id {rev_id} from get_page_revisions result'
+                            )
+
+                self.logger.info(f'API call {idx}/{len(api_calls)} succeeded')
+
+            except Exception as e:
+                error_msg = f'API call {api_name}.{method} (call {idx}/{len(api_calls)}) failed: {str(e)}'
+                self.logger.error(error_msg, exc_info=True)
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'api_name': api_name,
+                    'method': method,
+                    'call_index': idx,
+                    'exception_type': type(e).__name__,
+                }
+
+        # Return final result
+        final_result = previous_results.get('last_result')
+        if final_result is None:
+            return {
+                'success': False,
+                'error': 'No results from chained API calls',
+                'api_name': api_name,
+            }
+
+        return {
+            'success': True,
+            'api_name': api_name,
+            'method': previous_results.get('last_method', 'chained'),
+            'data': final_result,
+            'all_results': previous_results,
+        }
+
+    def _resolve_parameter_placeholders(
+        self,
+        params: Dict[str, Any],
+        previous_results: Dict[str, Any],
+        api_name: str,
+        method: str,
+    ) -> Dict[str, Any]:
+        """
+        Resolve parameter placeholders using results from previous API calls.
+
+        Args:
+            params: Parameters dict that may contain placeholders
+            previous_results: Results from previous API calls
+            api_name: Name of the API
+            method: Method name for this call
+
+        Returns:
+            Resolved parameters dict
+        """
+        resolved = {}
+        for key, value in params.items():
+            if isinstance(value, str):
+                # Check for placeholders like "<from previous call>" or "<revision_id>"
+                if value == '<from previous call>' or value == '<revision_id>':
+                    # Try to get revision_id from previous results
+                    rev_id = previous_results.get('revision_id')
+                    if rev_id:
+                        resolved[key] = rev_id
+                        self.logger.debug(
+                            f'Resolved {key} placeholder to revision_id: {rev_id}'
+                        )
+                    else:
+                        # Try to extract from last result
+                        last_result = previous_results.get('last_result')
+                        if isinstance(last_result, list) and len(last_result) > 0:
+                            first_item = last_result[0]
+                            if isinstance(first_item, dict):
+                                rev_id = first_item.get('revid') or first_item.get(
+                                    'revision_id'
+                                )
+                                if rev_id:
+                                    resolved[key] = rev_id
+                                    self.logger.debug(
+                                        f'Resolved {key} placeholder to revision_id: {rev_id}'
+                                    )
+                                    continue
+                        # If we can't resolve, keep the placeholder (will likely cause an error)
+                        resolved[key] = value
+                        self.logger.warning(
+                            f'Could not resolve placeholder {key}={value}'
+                        )
+                else:
+                    resolved[key] = value
+            else:
+                resolved[key] = value
+
+        return resolved
 
     def _format_and_store_result(
         self, subtask: Subtask, result: Any, state_before: Dict[str, Any]

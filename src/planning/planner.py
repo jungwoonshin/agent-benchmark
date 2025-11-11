@@ -72,10 +72,10 @@ Subtasks schema:
 - id: sequential step_1, step_2, ...
 - description: self-contained instruction including action, purpose, specific data to find/process (entities/dates), constraints, expected output.
 - tool: one of llm_reasoning, search, read_attachment, analyze_media, github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, arxiv_api, wayback_api, google_maps_api.
-- parameters: REQUIRED for API tools. Must include:
-  - "method": API method name
-  - All required parameters with actual values from the problem
-  - Relevant optional parameters (dates, filters, versions)
+- parameters: REQUIRED for API tools. Can be either:
+  - Single API call: A dict with "method" (API method name) and all required/optional parameters
+  - Multiple API calls: A list of dicts, each with "function" (API method name) and "parameters" (dict with method parameters), OR each dict can directly contain "method" and parameters. Use this when you need to chain calls (e.g., get_page_revisions then get_page for Wikipedia with year requirements).
+  - For Wikipedia with year requirements: Use list format with [{"function": "get_page_revisions", "parameters": {"title": "...", "start_date": "YYYY-01-01", "end_date": "YYYY-12-31", "limit": 1}}, {"function": "get_page", "parameters": {"title": "...", "revision_id": "<from previous call>"}}]
 - search_queries: ONLY for 'search'. Exactly 3 queries:
   - Complexity: simple, normal, complex (in this order)
   - Format: keyword-only, 3–5 words, no verbs/action words/descriptions/unnecessary words; separate with spaces; for research add "pdf"
@@ -108,7 +108,7 @@ Return: JSON object with 'subtasks' only."""
             retry_context += 'Create an IMPROVED plan that addresses these issues. CRITICAL REQUIREMENTS:\n'
             retry_context += "1. Each subtask description must be COMPLETE and SELF-CONTAINED, including what to do, why it's needed, what specific information/data to find/process, constraints, and expected output.\n"
             retry_context += "2. Each subtask with tool='search' MUST include a search_queries array with exactly 3 different search queries in KEYWORD-ONLY format (3-8 keywords each, no verbs, no action words, no descriptive phrases), ordered by complexity: simple (minimal keywords), normal (standard terms), complex (additional qualifiers). Use general, broad keywords rather than overly specific terms. CRITICAL: Do NOT add action words (count, find, get, retrieve, search, list, etc.) or measurement terms (number, total, amount, etc.) unless they are core to the topic itself. Focus on WHAT to search for (entities, topics, sources), not WHAT to do with the results. The search tool will automatically navigate and extract from archives.\n"
-            retry_context += '3. Each subtask with an API tool (github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, arxiv_api, wayback_api, google_maps_api) MUST include a \'parameters\' field with a dictionary containing: \'method\' (the API method name) and all required/optional parameters with actual values extracted from the problem. For example, for wikipedia_api with year requirement: {"method": "get_page_revisions", "title": "Page Title", "start_date": "2022-01-01", "end_date": "2022-12-31", "limit": 1}.\n'
+            retry_context += '3. Each subtask with an API tool (github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, arxiv_api, wayback_api, google_maps_api) MUST include a \'parameters\' field. For single API calls, use a dict with \'method\' and parameters. For chained calls (e.g., Wikipedia with year requirements), use a list of dicts, each with \'function\' (method name) and \'parameters\' (method parameters). For Wikipedia with year requirement: [{"function": "get_page_revisions", "parameters": {"title": "Page Title", "start_date": "2022-01-01", "end_date": "2022-12-31", "limit": 1}}, {"function": "get_page", "parameters": {"title": "Page Title", "revision_id": "<from previous call>"}}].\n'
 
         # Extract step classifications if available
         step_classifications_info = ''
@@ -240,7 +240,20 @@ Generate the smallest correct plan."""
                             f'Subtask {task_data.get("id", f"step_{i}")} uses API tool {tool_type} but missing parameters. '
                             f'Parameters will need to be determined during execution.'
                         )
+                    elif isinstance(parameters, list):
+                        # List format for chained API calls
+                        for call_idx, call_spec in enumerate(parameters, 1):
+                            if not isinstance(call_spec, dict):
+                                self.logger.warning(
+                                    f'Subtask {task_data.get("id", f"step_{i}")} API call {call_idx} is not a dict: {call_spec}'
+                                )
+                            elif 'function' not in call_spec and 'method' not in call_spec:
+                                self.logger.warning(
+                                    f'Subtask {task_data.get("id", f"step_{i}")} API call {call_idx} missing "function" or "method" field. '
+                                    f'Call spec: {call_spec}'
+                                )
                     elif 'method' not in parameters:
+                        # Single API call format
                         self.logger.warning(
                             f'Subtask {task_data.get("id", f"step_{i}")} uses API tool {tool_type} but parameters missing "method" field. '
                             f'Parameters: {parameters}'

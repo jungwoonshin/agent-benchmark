@@ -6,6 +6,7 @@ import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from ..utils import extract_json_from_text
+from .authority_assessor import AuthorityAssessor
 
 if TYPE_CHECKING:
     from src.tools import ToolBelt
@@ -289,7 +290,11 @@ def build_explicit_requirements_check(
                 try:
                     req_step_num = int(req_step_match.group(1))
                     if req_step_num == step_num:
-                        filtered_reqs.append(req)
+                        # Remove the "Step N:" prefix for cleaner display
+                        req_cleaned = re.sub(
+                            r'^step[_\s]*\d+[:\s]*', '', req_str, flags=re.IGNORECASE
+                        ).strip()
+                        filtered_reqs.append(req_cleaned)
                 except (ValueError, IndexError):
                     # If we can't parse step number, don't include it
                     pass
@@ -336,6 +341,12 @@ Criteria:
 - Section titles help indicate what topics are covered in the page/document
 - For explicit requirements: Identify which entity/source this result is about, then verify that ALL requirements for that entity are satisfied based on the full content and image analysis (if provided). Requirements for other entities do not need to be satisfied.
 
+IMPORTANT: When evaluating relevance, consider source authority:
+- Full documents (PDFs, complete articles) are more reliable than snippets or abstracts
+- Primary sources (original research, official documents) are preferable to secondary sources
+- Higher authority scores indicate more trustworthy sources
+- When information conflicts between sources, prefer information from more authoritative sources
+
 Return JSON only with:
 {"relevant": boolean, "reasoning": "1-2 sentences explaining why it is/isn't relevant, including which explicit requirements are/aren't satisfied", "confidence": 0.0-1.0, "explicit_requirements_satisfied": [list of requirement indices (1-based) that are satisfied, or empty array if no explicit requirements]}
 
@@ -348,6 +359,7 @@ def build_user_prompt(
     explicit_reqs_check: str,
     arxiv_metadata_info: str,
     content_info: str,
+    authority_info: str = '',
 ) -> str:
     """Build the user prompt for relevance checking."""
     # Ensure submission dates appear before content_info
@@ -359,7 +371,7 @@ def build_user_prompt(
 {requirements_context}{explicit_reqs_check}
 
 Search Result:
-{metadata_section}
+{metadata_section}{authority_info}
 - content_info: {content_info}
 
 Is this search result relevant to completing the subtask?"""
@@ -463,6 +475,7 @@ class RelevanceChecker:
         self.llm_service = llm_service
         self.tool_belt = tool_belt
         self.logger = logger
+        self.authority_assessor = AuthorityAssessor(logger)
 
     def check_relevance(
         self,
@@ -523,6 +536,18 @@ class RelevanceChecker:
                 self.tool_belt, self.llm_service, attachment, content_type, self.logger
             )
 
+            # Extract authority signals
+            authority_signals = self.authority_assessor.extract_authority_signals(
+                search_result
+            )
+            authority_info = f"""
+Source Authority Information:
+- Content Type Quality: {authority_signals.get('content_type_quality', 'unknown')}
+- Domain Indicators: {', '.join(authority_signals.get('domain_indicators', [])) or 'none'}
+- Publication Indicators: {', '.join(authority_signals.get('publication_indicators', [])) or 'none'}
+- Authority Score: {authority_signals.get('authority_score', 0.0):.2f}
+"""
+
             # Build context components
             requirements_context = build_requirements_context(query_analysis, step_num)
             content_info = build_content_info(
@@ -550,6 +575,7 @@ class RelevanceChecker:
                 explicit_reqs_check,
                 arxiv_metadata_info,
                 content_info,
+                authority_info,
             )
 
             # Call LLM

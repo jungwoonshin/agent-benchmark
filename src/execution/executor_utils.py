@@ -159,7 +159,8 @@ CRITICAL: For browser_navigate, the "url" field is REQUIRED and must be a valid 
 For read_attachment: {"attachment_index": 0, "options": {...}}
 For analyze_media: {"attachment_index": 0, "analysis_type": "auto"}
 For API tools (github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, arxiv_api, wayback_api, google_maps_api):
-  - REQUIRED: {"method": "method_name", ...method_specific_parameters}
+  - Single API call: {"method": "method_name", ...method_specific_parameters}
+  - Multiple chained API calls (for Wikipedia with year requirements): [{"function": "method1", "parameters": {...}}, {"function": "method2", "parameters": {...}}]
   - github_api methods:
     * search_issues: {"method": "search_issues", "repo": "owner/repo" (required), "state": "all|open|closed" (optional, default: "all"), "labels": ["label1"] (optional, list), "sort": "created|updated|comments" (optional, default: "created"), "order": "asc|desc" (optional, default: "asc"), "per_page": 100 (optional, default: 100, max: 100)}
     * get_issue: {"method": "get_issue", "repo": "owner/repo" (required), "issue_number": 123 (required, integer)}
@@ -167,8 +168,9 @@ For API tools (github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, 
     * get_repository_contents: {"method": "get_repository_contents", "repo": "owner/repo" (required), "path": "file/path" (optional, default: ""), "ref": "branch_name" (optional, string)}
   - wikipedia_api methods:
     * get_page: {"method": "get_page", "title": "Page Title" (required, string), "revision_id": 123 (optional, integer)}
-      - **CRITICAL**: If the subtask description mentions a specific year/version (e.g., "2022 version", "as of 2022"), you MUST first use get_page_revisions to find the revision_id from that year, OR use get_page_revisions with date filters to get revisions from that year
-      - For year-specific requirements: Use get_page_revisions with start_date and end_date to find revisions from the specified year, then use the revision_id with get_page
+      - **CRITICAL**: If the subtask description mentions a specific year/version (e.g., "2022 version", "as of 2022"), use LIST format with chained calls:
+        [{"function": "get_page_revisions", "parameters": {"title": "Page Title", "start_date": "2022-01-01", "end_date": "2022-12-31", "limit": 1}}, {"function": "get_page", "parameters": {"title": "Page Title", "revision_id": "<from previous call>"}}]
+      - The system will automatically extract revision_id from the first call and use it in the second call
     * search_pages: {"method": "search_pages", "query": "search terms" (required), "limit": 10 (optional, default: 10)}
     * get_page_revisions: {"method": "get_page_revisions", "title": "Page Title" (required), "start_date": "YYYY-MM-DD" (optional), "end_date": "YYYY-MM-DD" (optional), "limit": 500 (optional, default: 500)}
       - Use this to find revisions from a specific year when the problem requires a historical version
@@ -244,10 +246,10 @@ If the tool is 'llm_reasoning' and dependencies are listed above, describe in th
 If the tool is an API tool (ends with '_api'), you MUST include the "method" parameter and all required parameters for that method. Extract the API name, method, and parameters from the subtask description.
 
 **SPECIAL HANDLING FOR wikipedia_api WITH YEAR REQUIREMENTS**:
-- If the subtask description mentions a specific year/version (e.g., "2022 version", "as of 2022", "English Wikipedia (2022 version)"), you have two options:
-  1. Use get_page_revisions first with date filters (start_date="2022-01-01", end_date="2022-12-31") to find revisions from that year, then use get_page with the revision_id
-  2. OR use get_page_revisions with date filters to get all revisions from that year - the system can then select the appropriate revision
-- Always include the year requirement in your parameters (either as date filters for get_page_revisions, or as revision_id for get_page if you can determine it)"""
+- If the subtask description mentions a specific year/version (e.g., "2022 version", "as of 2022", "English Wikipedia (2022 version)"), you should use a LIST of API calls:
+  [{"function": "get_page_revisions", "parameters": {"title": "Page Title", "start_date": "2022-01-01", "end_date": "2022-12-31", "limit": 1}}, {"function": "get_page", "parameters": {"title": "Page Title", "revision_id": "<from previous call>"}}]
+- The system will automatically extract the revision_id from the first call and use it in the second call
+- For single API calls (without year requirements), use the standard format: {"method": "get_page", "title": "Page Title"}"""
 
     try:
         response = llm_service.call_with_system_prompt(
