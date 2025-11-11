@@ -52,272 +52,48 @@ class Planner:
         """
         self.logger.info('Creating execution plan')
 
-        system_prompt = """You are an expert at creating efficient, minimal number of execution plans for complex problems.
-Each plan should be as detailed as possible.
-Given a problem analysis and classification, create a concise execution plan with only the ESSENTIAL steps needed.
+        system_prompt = """You are an expert planner. Produce the smallest correct plan (3–7 essential subtasks). Output JSON only.
 
-CRITICAL: Create the MINIMUM number of subtasks necessary to solve the problem. Aim for 3-7 essential subtasks maximum.
+Core rules:
+- Minimal steps; order by dependencies. No redundant or fallback steps.
+- Clear data flow: retrieval steps state what they fetch and from where; dependent steps state which prior step they use and how. No forward references.
+- Preserve any required units and formats in the final output.
 
-**CRITICAL: DATA FLOW AND DEPENDENCY CLARITY**
+Tooling:
+- search: Use for information retrieval (web, archives, databases, files, PDFs). The system handles relevance, navigation, downloads, and PDF text extraction.
+- read_attachment: Use for extracting information from already-downloaded files.
+- llm_reasoning: Use for computation/analysis after retrieval.
+- Prefer API tools when applicable (github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, arxiv_api, wayback_api, google_maps_api). Do NOT use browser_navigate.
 
-When creating subtask descriptions, you MUST follow these universal principles to ensure logical information flow:
+Search-first rule:
+- If specialized knowledge is involved (programming syntax, standards, domain-specific concepts, historical/factual/current info), create step_1: search to retrieve authoritative info, then step_2: llm_reasoning to apply it.
 
-1. **Separation of Retrieval vs. Usage**:
-   - Each subtask description must clearly distinguish between what information this subtask WILL RETRIEVE/FIND (its own output) versus what information it WILL USE (from dependencies)
-   - DO NOT mix these in a way that suggests information is available before it's retrieved
-   - For retrieval steps: Focus on what information will be retrieved from the source
-   - For dependent steps: Clearly state which step provides each piece of information used
+Subtasks schema:
+- id: sequential step_1, step_2, ...
+- description: self-contained instruction including action, purpose, specific data to find/process (entities/dates), constraints, expected output.
+- tool: one of llm_reasoning, search, read_attachment, analyze_media, github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, arxiv_api, wayback_api, google_maps_api.
+- parameters: REQUIRED for API tools. Must include:
+  - "method": API method name
+  - All required parameters with actual values from the problem
+  - Relevant optional parameters (dates, filters, versions)
+- search_queries: ONLY for 'search'. Exactly 3 queries:
+  - Complexity: simple, normal, complex (in this order)
+  - Format: keyword-only, 3–5 words, no verbs/action words/descriptions/unnecessary words; separate with spaces; for research add "pdf"
+  - Keyword selection: include source/domain, topic, dates; use broad terms; do not add action words (count/find/get/retrieve/search/list) or measurement terms (number/total/amount) unless intrinsic to the topic; focus on what to search for (entities/topics/sources), not what to do with results
+- dependencies: list of prior step IDs; [] if none
+- parallelizable: boolean
 
-2. **Logical Information Flow**:
-   - A subtask description should ONLY reference information that will be available from its dependencies (explicitly listed in dependencies array) OR is part of the original problem statement
-   - DO NOT reference information that will be produced by other subtasks unless those subtasks are listed as dependencies
-   - If information from another step is needed, that step MUST be in the dependencies array
+API methods (reference):
+- github_api: search_issues, get_issue, get_repository_commit, get_repository_contents
+- wikipedia_api: get_page, search_pages, get_page_revisions
+- youtube_api: get_video_info, search_videos
+- twitter_api: get_user_tweets
+- reddit_api: get_user_posts, search_posts
+- arxiv_api: get_metadata
+- wayback_api: get_archived_url
+- google_maps_api: get_place_details, get_street_view_image
 
-3. **Clear Source Attribution**:
-   - When a subtask retrieves information from a source, clearly state what source provides it and what specific information to retrieve
-   - When a subtask uses information from another step, clearly state which step provides the information and what will be done with it
-   - Ensure each piece of information is attributed to its correct source or step
-
-4. **Dependency-Driven Descriptions**:
-   - If a subtask depends on other steps, its description must explicitly reference those steps and state what information will be used from each
-   - If a subtask has no dependencies, its description should focus on what it retrieves, not what others will use with it
-   - DO NOT create descriptions that reference information from steps that aren't listed as dependencies
-
-5. **Forward-Reference Prevention**:
-   - DO NOT describe what information will be used from future steps in a way that suggests it's available now
-   - DO NOT mention "to later determine" or "for later use" in ways that reference information not yet available
-   - Instead, describe what THIS step retrieves, and let dependent steps describe how they use it
-
-6. **Unit and Format Preservation**:
-   - When the problem specifies answer units or format requirements, the final subtask description MUST preserve those requirements
-   - DO NOT convert to base units and then round - maintain the unit requirement from the question
-   - Pay attention to unit modifiers in the question and ensure the final answer maintains those units
-   - The description should explicitly state the expected unit format for the final answer
-
-**AVOIDING REDUNDANCY - UNIVERSAL PRINCIPLES**:
-
-Before creating your plan, analyze the problem to identify:
-- What are the UNIQUE data sources needed? (each source = potentially ONE subtask)
-- What are the UNIQUE processing operations? (group operations on same data)
-- What is the FINAL output? (work backwards - what's the last meaningful step that produces it?)
-
-Then apply these rules:
-
-1. **Combine operations with the same tool and target**:
-   - If multiple steps use the SAME tool (search, read_attachment, etc.) on the SAME source/target, combine them into ONE subtask
-   - Examples: Multiple searches of same website/database/archive → ONE search subtask
-   - Examples: Multiple reads from same document → ONE read_attachment subtask
-   - Examples: Multiple calculations using same data → ONE llm_reasoning subtask
-   - **Test**: Can I describe both operations in a single comprehensive instruction? If yes, combine them.
-
-2. **Eliminate redundant processing steps**:
-   - If step N already performs comparison/filtering/selection on data from step M, DO NOT add step N+1 to "compare step M with step N"
-   - The step that performs the analysis IS the final result - don't add another step to restate it
-   - Only create synthesis steps when truly combining INDEPENDENT results from parallel branches
-   - **Test**: Does this step just reword or restate the output of a previous step? If yes, remove it.
-
-3. **Group sequential operations on the same data**:
-   - If you need to: fetch data → extract field A → extract field B, combine into ONE step "fetch data and extract fields A and B"
-   - Avoid: step_1 "download PDF", step_2 "extract text from PDF" → Instead: step_1 "download PDF and extract text"
-   - **Test**: Does step N+1 operate on ONLY the output of step N, using the same tool? If yes, merge them.
-
-4. **Parallel vs Sequential - choose wisely**:
-   - Create parallel subtasks ONLY when they are truly independent (no shared data dependencies)
-   - If two subtasks process the SAME source/document, combine them rather than making them parallel
-   - **Test**: Can these steps share a tool invocation? If yes, combine them instead of parallelizing.
-
-- DO NOT create separate subtasks for each requirement or dependency
-- DO NOT create fallback strategy subtasks upfront - handle failures during execution if needed
-- Focus on the core workflow: what information to gather → how to process it → how to synthesize the answer
-
-TOOL SELECTION GUIDELINES:
-- **API TOOLS - USE WHEN AVAILABLE**: When a problem requires accessing data from a specific API-supported service, use the appropriate API tool instead of search:
-  * **wikipedia_api**: ALWAYS use when you need to access Wikipedia pages, especially when:
-    - The problem specifies a specific year/version (e.g., "2022 version", "as of 2022")
-    - You need a specific revision of a Wikipedia page
-    - You need to search Wikipedia or get revision history
-    - Use get_page with revision_id or date filters for historical versions
-  * **github_api**: Use when you need GitHub repository data, issues, commits, or file contents
-  * **youtube_api**: Use when you need YouTube video information or to search videos
-  * **twitter_api**: Use when you need Twitter/X user tweets
-  * **reddit_api**: Use when you need Reddit posts or user content
-  * **arxiv_api**: Use when you need arXiv paper metadata
-  * **wayback_api**: Use when you need archived web pages from Wayback Machine
-  * **google_maps_api**: Use when you need Google Maps place details or Street View images
-
-- **search**: Use for general information gathering when no specific API tool is available:
-  * Use search to find information sources, URLs, and initial results
-  * After search, the system will automatically:
-    - Check relevance of each result using LLM
-    - Classify results as web pages or files
-    - Navigate to web pages using browser automation
-    - Download files and extract content
-  * Search handles scenarios where no direct API is available: general websites, files, documents
-  * **For archives with date requirements**: Still use search - the SearchResultProcessor will navigate to the archive and use advanced search features automatically
-  * **The search tool now includes intelligent result processing** - it's not just finding URLs, it processes them too
-  * **CRITICAL**: When you need to find PDFs or extract information from PDFs, use search with specific queries. The system will automatically download PDFs and extract text content.
-  
-- **read_attachment**: Use to read files that have already been downloaded or provided:
-  * Use this when you have an attachment (PDF, text file, etc.) and need to extract specific information from it
-  * The system will automatically extract text content from PDFs - no code needed
-  * Specify page ranges or extraction options if needed
-
-**MANDATORY: CHECK FOR SPECIALIZED DOMAIN KNOWLEDGE FIRST**
-Before creating any subtask, you MUST check if the problem requires specialized domain knowledge:
-- Does the problem involve programming languages, syntax, or technical specifications?
-- Does it require domain-specific terminology, concepts, or knowledge?
-- Does it need historical facts, technical standards, or specialized information?
-
-If YES to any of the above, you MUST create a search subtask FIRST to retrieve that knowledge, then use llm_reasoning to apply it.
-
-**WHEN TO SEARCH - MANDATORY RULES:**
-**YOU MUST use search** when the task requires specialized domain knowledge, syntax, or specifications:
-- **Programming language syntax or semantics**: ALWAYS search first when problems involve specific programming languages, esoteric languages, domain-specific languages, or specialized syntax rules - even if some syntax is mentioned in the problem, search for complete and authoritative documentation
-- **Technical specifications or standards**: When problems require knowledge of specific technical standards, protocols, formats, or specifications
-- **Domain-specific terminology or concepts**: When problems involve specialized terminology, concepts, or knowledge from specific fields
-- **Historical or factual information**: When problems require specific historical facts, dates, events, or factual information that needs verification
-- **Current or time-sensitive information**: When problems require up-to-date information, recent events, or current data
-
-**CRITICAL**: If a problem mentions specialized domain knowledge (like programming language syntax), you MUST create a search subtask to retrieve authoritative documentation, even if partial information is provided in the problem statement. Do NOT assume the LLM has complete or accurate knowledge of specialized domains.
-
-WHEN NOT TO SEARCH - CRITICAL GUIDELINES:
-**DO NOT use search** when the task can be solved using only LLM reasoning or available information
-
-**WHEN TO SEARCH - CRITICAL GUIDELINES:**
-**ALWAYS use search** when the task requires specialized domain knowledge, syntax, or specifications that may not be in general training data:
-- **Programming language syntax or semantics**: When problems involve specific programming languages, esoteric languages, domain-specific languages, or specialized syntax rules that may not be in general training data
-- **Technical specifications or standards**: When problems require knowledge of specific technical standards, protocols, formats, or specifications
-- **Domain-specific terminology or concepts**: When problems involve specialized terminology, concepts, or knowledge from specific fields that may not be widely known
-- **Historical or factual information**: When problems require specific historical facts, dates, events, or factual information that needs verification
-- **Current or time-sensitive information**: When problems require up-to-date information, recent events, or current data
-
-**KEY PRINCIPLE**: Use search when you need to RETRIEVE information that is NOT already available OR when the problem requires specialized domain knowledge that may not be reliably available through general reasoning. If all information is present and the task uses only general knowledge, use LLM reasoning instead.
-  
-PRIORITIZATION RULES:
-1. **Always use search first** for any information gathering task OR when specialized domain knowledge is required
-2. **For specialized domain knowledge** (programming languages, technical specifications, domain-specific concepts):
-   - Create a search subtask FIRST to retrieve the necessary knowledge, syntax, or specifications
-   - Then use llm_reasoning to apply that knowledge to solve the problem
-   - The search subtask should retrieve the domain knowledge, and the reasoning subtask should apply it
-3. Search will automatically process results by:
-   - Checking relevance with LLM (filters out non-relevant results)
-   - Navigating to web pages to extract content
-   - Downloading files and extracting text
-   - Handling archives, databases, and complex websites
-4. **For archives and databases**: Search query should be keyword-only format, and the system will navigate to the archive and extract automatically
-5. **For PDF processing**: Use search to find and download PDFs, then use read_attachment to extract information.
-6. **Use LLM reasoning** for computation, data processing, and analysis tasks AFTER the necessary information has been retrieved.
-
-IMPORTANT: Do NOT use browser_navigate as a tool in your plan. Use 'search' instead - it handles everything automatically.
-
-CRITICAL: SUBTASK ID FORMAT
-- Use sequential step IDs: step_1, step_2, step_3, etc.
-- The first subtask you create should be step_1, second should be step_2, etc.
-- Do NOT skip step numbers - create step_1, step_2, step_3 in order
-- Requirements will be assigned to these steps after generation
-
-Return a JSON object with:
-- subtasks: list of objects, each with:
-  - id: unique identifier (e.g., "step_1", "step_2") - use sequential numbering starting from step_1
-  - description: COMPLETE, SELF-CONTAINED instruction that includes:
-    * What needs to be done (clear action verb and objective)
-    * What specific information/data to find, process, or analyze (include key terms, dates, entities, requirements)
-    * Any constraints, formats, or requirements (e.g., date ranges, specific sources, output format)
-    * CRITICAL: The description must be complete enough that an LLM can process it WITHOUT needing the full problem context
-    * Include relevant details from the problem: specific dates, entities, requirements, formats mentioned in the problem
-    * For search tasks: specify what information to find
-    * For llm_reasoning tasks: specify what calculation/analysis to perform and what data to use
-    * For read_attachment tasks: specify what information to extract from which file
-    * **For API tools**: MUST include all parameters and conditions from the problem (dates, years, versions, filters, etc.) so they can be extracted and included in the API call parameters
-  - tool: which tool to use (llm_reasoning, search, read_attachment, analyze_media, github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, arxiv_api, wayback_api, google_maps_api)
-    * search: Use for ALL information gathering (web pages, archives, databases, files, PDFs). The system will automatically download and extract content from PDFs.
-    * llm_reasoning: Use for computation, data processing, analysis, and reasoning tasks. This replaces code_interpreter with LLM-based problem solving.
-    * read_attachment: Use to read files that were already provided or downloaded. This automatically extracts text from PDFs - no code needed.
-    
-    **CRITICAL FOR ALL API TOOLS**: When using any API tool, you MUST include in the subtask description ALL relevant parameters and conditions that are mentioned in the problem:
-    - Dates, years, or time ranges (e.g., "2022 version", "as of 2022", "between 2020-2022")
-    - Specific versions, revisions, or timestamps
-    - Filters, states, labels, or other qualifiers
-    - Language, location, or other contextual requirements
-    - Any constraints or requirements that affect which data should be retrieved
-    
-    The parameter determination system will extract these from the description and include them in the API call. Be explicit and complete - include all conditions from the problem statement.
-    
-    * github_api: Use when you need to access GitHub data (repositories, issues, commits, repository contents).
-      - Methods and parameters:
-        * search_issues: repo (required, format: "owner/repo"), state (optional, default: "all", options: "open", "closed", "all"), labels (optional, list of strings), sort (optional, default: "created", options: "created", "updated", "comments"), order (optional, default: "asc", options: "asc", "desc"), per_page (optional, default: 100, max: 100)
-        * get_issue: repo (required, format: "owner/repo"), issue_number (required, integer)
-        * get_repository_commit: repo (required, format: "owner/repo"), ref (required, commit SHA string)
-        * get_repository_contents: repo (required, format: "owner/repo"), path (optional, default: "", file/directory path), ref (optional, branch/tag name)
-    
-    * wikipedia_api: Use when you need to access Wikipedia pages or search Wikipedia.
-      - Methods and parameters:
-        * get_page: title (required, page title string), revision_id (optional, integer for specific revision)
-        * search_pages: query (required, search terms), limit (optional, default: 10)
-        * get_page_revisions: title (required, page title string), start_date (optional, format: "YYYY-MM-DD"), end_date (optional, format: "YYYY-MM-DD"), limit (optional, default: 500)
-      - **CRITICAL**: When the problem specifies a year/version (e.g., "2022 version", "as of 2022"), you MUST include the year requirement in the subtask description. The system will use get_page_revisions with date filters (start_date="2022-01-01", end_date="2022-12-31") to find revisions from that year, then use get_page with the appropriate revision_id.
-    
-    * youtube_api: Use when you need to access YouTube video information or search videos.
-      - Methods and parameters:
-        * get_video_info: video_id (required, YouTube video ID string)
-        * search_videos: query (required, search terms), max_results (optional, default: 10, max: 50)
-    
-    * twitter_api: Use when you need to access Twitter/X user tweets.
-      - Methods and parameters:
-        * get_user_tweets: username (required, Twitter username without @), max_results (optional, default: 10, max: 100), start_time (optional, format: "YYYY-MM-DDTHH:MM:SSZ"), end_time (optional, format: "YYYY-MM-DDTHH:MM:SSZ")
-      - **Include time ranges in the description if specified in the problem.**
-    
-    * reddit_api: Use when you need to access Reddit posts or user content.
-      - Methods and parameters:
-        * get_user_posts: username (required, Reddit username), limit (optional, default: 25, max: 100)
-        * search_posts: subreddit (required, subreddit name without r/), query (required, search terms), limit (optional, default: 25, max: 100), sort (optional, default: "relevance", options: "relevance", "hot", "top", "new")
-    
-    * arxiv_api: Use when you need to access arXiv paper metadata.
-      - Methods and parameters:
-        * get_metadata: paper_id (required, format: "YYMM.NNNNN" or "archive/category/YYMMNNN"), download_pdf (optional, boolean, default: false)
-    
-    * wayback_api: Use when you need to access archived web pages from Wayback Machine.
-      - Methods and parameters:
-        * get_archived_url: url (required, original URL string), timestamp (optional, format: "YYYYMMDD" for specific date)
-      - **Include the timestamp/date requirement in the description if specified.**
-    
-    * google_maps_api: Use when you need to access Google Maps place details or Street View images.
-      - Methods and parameters:
-        * get_place_details: place_id (required, Google Places place ID string)
-        * get_street_view_image: location (required, address or coordinates string), size (optional, default: "600x400", format: "WIDTHxHEIGHT"), heading (optional, integer 0-360), pitch (optional, integer -90 to 90), fov (optional, integer, default: 90)
-  - parameters: (REQUIRED for API tools, optional for other tools) - Dictionary containing tool-specific parameters with actual values.
-    * **For API tools (github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, arxiv_api, wayback_api, google_maps_api)**: This field is MANDATORY and must include:
-      - "method": The API method name (e.g., "get_page", "search_issues", "get_video_info")
-      - All required parameters for that method with actual values extracted from the problem
-      - All optional parameters that are relevant based on the problem conditions (dates, filters, etc.)
-      - Example for wikipedia_api with year requirement: {"method": "get_page_revisions", "title": "Mercedes Sosa", "start_date": "2022-01-01", "end_date": "2022-12-31", "limit": 1}
-      - Example for github_api: {"method": "get_issue", "repo": "owner/repo", "issue_number": 123}
-    * For other tools: This field is optional and will be determined automatically if not provided.
-  - search_queries: (ONLY for 'search' tool) - Array of exactly 3 different search queries with varying complexity levels. OMIT this field entirely for non-search tools.
-    * COMPLEXITY LEVELS (apply to the 3 queries in order):
-      - First query: Simple - use minimal essential keywords only
-      - Second query: Normal - include standard descriptive terms and context
-      - Third query: Complex - incorporate additional qualifiers, specific attributes, or detailed context
-    * FORMAT RULES (apply to each of the 3 queries):
-      - Use ONLY keywords and essential terms - NO verbs, NO descriptive phrases, NO unnecessary words
-      - Keep it SHORT: 3-8 keywords maximum (typically 5-6 words)
-      - Remove filler words
-      - Separate keywords with spaces, NOT commas or special formatting
-      - **For paper/research exploration**: If the subtask involves finding academic papers, articles, preprints, or research documents, add "pdf" to prioritize PDF files
-    * KEYWORD SELECTION:
-      - Include: Domain/source (arXiv, Nature, etc.), topic keywords, dates, location (if relevant)
-      - Use different keyword combinations or phrasings for each query
-      - Use general, broad keywords rather than overly specific terms
-      - Avoid specific measurement or quantification terms that narrow the search too much
-      - Focus on core concepts, entities, and topics rather than specific attributes or metrics
-      - The search tool will navigate to the source and extract the information automatically, so queries should be general enough to find relevant sources
-  - dependencies: list of subtask IDs that must complete first (empty array [] if none)
-  - parallelizable: boolean indicating if this can run in parallel with others
-
-
-Order subtasks logically based on dependencies. Keep it minimal and essential. YOU MUST AVOID REDUNDANT SUBTASKS.
-
-IMPORTANT: Return your response as valid JSON only, without any markdown formatting or additional text."""
+Return: JSON object with 'subtasks' only."""
 
         # Build user prompt with context about previous attempts if retrying
         retry_context = ''
@@ -331,7 +107,7 @@ IMPORTANT: Return your response as valid JSON only, without any markdown formatt
                 )
             retry_context += 'Create an IMPROVED plan that addresses these issues. CRITICAL REQUIREMENTS:\n'
             retry_context += "1. Each subtask description must be COMPLETE and SELF-CONTAINED, including what to do, why it's needed, what specific information/data to find/process, constraints, and expected output.\n"
-            retry_context += "2. Each subtask with tool='search' MUST include a search_queries array with exactly 3 different search queries in KEYWORD-ONLY format (3-8 keywords each, no verbs or descriptive phrases), ordered by complexity: simple (minimal keywords), normal (standard terms), complex (additional qualifiers). Use general, broad keywords rather than overly specific terms. Avoid specific measurement or quantification terms that narrow the search too much. Focus on core concepts, entities, and topics. Remove words like 'article', 'submitted', 'descriptors', 'about'. The search tool will automatically navigate and extract from archives.\n"
+            retry_context += "2. Each subtask with tool='search' MUST include a search_queries array with exactly 3 different search queries in KEYWORD-ONLY format (3-8 keywords each, no verbs, no action words, no descriptive phrases), ordered by complexity: simple (minimal keywords), normal (standard terms), complex (additional qualifiers). Use general, broad keywords rather than overly specific terms. CRITICAL: Do NOT add action words (count, find, get, retrieve, search, list, etc.) or measurement terms (number, total, amount, etc.) unless they are core to the topic itself. Focus on WHAT to search for (entities, topics, sources), not WHAT to do with the results. The search tool will automatically navigate and extract from archives.\n"
             retry_context += '3. Each subtask with an API tool (github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, arxiv_api, wayback_api, google_maps_api) MUST include a \'parameters\' field with a dictionary containing: \'method\' (the API method name) and all required/optional parameters with actual values extracted from the problem. For example, for wikipedia_api with year requirement: {"method": "get_page_revisions", "title": "Page Title", "start_date": "2022-01-01", "end_date": "2022-12-31", "limit": 1}.\n'
 
         # Extract step classifications if available
@@ -376,7 +152,7 @@ IMPORTANT: Return your response as valid JSON only, without any markdown formatt
                     general_requirements_info += f'  - {req}\n'
                 general_requirements_info += '\n'
 
-        user_prompt = f"""Create a MINIMAL execution plan for this problem. Include only the essential steps (3-7 subtasks maximum).
+        user_prompt = f"""Create a minimal plan (2–7 subtasks) for this problem.
 {retry_context}
 Problem: {problem}
 
@@ -388,39 +164,11 @@ Problem Classification:
 {step_classifications_info}
 {general_requirements_info}
 
-⚠️ MANDATORY CHECK BEFORE CREATING SUBTASKS:
-Before creating any subtask, you MUST determine if this problem requires specialized domain knowledge:
-- Does it involve programming languages, syntax, or technical specifications?
-- Does it require domain-specific terminology, concepts, or knowledge?
-- Does it need historical facts, technical standards, or specialized information?
+Before planning, check if specialized knowledge is required (programming syntax/standards, domain concepts, historical/factual/current info). If yes, make step_1 a 'search' subtask to retrieve authoritative info, then add an 'llm_reasoning' subtask to apply it.
 
-If YES, you MUST create a search subtask FIRST (step_1) to retrieve that knowledge, then create a reasoning subtask (step_2) to apply it.
-Do NOT skip the search step even if some information is mentioned in the problem - always search for authoritative documentation.
+Each subtask description must be self-contained and include: action, purpose, specific data to find/process (entities/dates), constraints, expected output. Maintain data flow: retrieval steps state what they fetch and from where; dependent steps cite which prior step they use and how; list dependencies; no forward references. Incorporate relevant details from the problem, analysis, and classification.
 
-CRITICAL REQUIREMENT FOR SUBTASK DESCRIPTIONS:
-Each subtask description must be COMPLETE and SELF-CONTAINED. It must include:
-1. What to do (clear action)
-2. Why it's needed (context from the problem)
-3. What specific information/data to find or process (include key terms, dates, entities from the problem)
-4. Any constraints or requirements (date ranges, formats, sources mentioned in the problem)
-5. Expected output or criteria
-6. Incorporate any general requirements listed above (requirements will be assigned to specific steps after generation)
-
-**CRITICAL: DATA FLOW CLARITY IN DESCRIPTIONS**
-- For subtasks with NO dependencies: Focus on what information THIS step retrieves from its source. State the source clearly and what specific information will be retrieved. Do NOT reference information from other steps that haven't been retrieved yet.
-- For subtasks WITH dependencies: Clearly state which step provides each piece of information used, and what action will be performed with it. Each referenced step MUST be listed in the dependencies array.
-- DO NOT create descriptions that reference information from steps that aren't listed as dependencies.
-- DO NOT use forward references that suggest information is available before it's retrieved.
-- Ensure logical flow: retrieval steps describe what they retrieve; dependent steps describe what they use from dependencies.
-
-Incorporate relevant details from the problem, query analysis, and problem classification into EACH subtask description. The description should be detailed enough that an LLM can execute it without needing to see the full problem context.
-
-Generate a concise, essential execution plan with the minimum number of steps needed.
-
-FINAL REMINDER:
-- If the problem requires specialized domain knowledge (programming languages, syntax, technical specifications, domain-specific concepts), you MUST create a search subtask FIRST
-- Use search for information retrieval and specialized domain knowledge
-- Use llm_reasoning for computation, analysis, and applying retrieved knowledge AFTER search has retrieved it"""
+Generate the smallest correct plan."""
 
         try:
             response = self.llm_service.call_with_system_prompt(

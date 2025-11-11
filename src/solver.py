@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from dotenv import load_dotenv
-from langfuse import observe, propagate_attributes
+from langfuse import get_client, observe, propagate_attributes
 
 from .core import Agent
 from .models import Attachment
@@ -85,7 +85,12 @@ class GAIASolver:
 
     @observe()
     def solve(
-        self, question: str, attachments: Optional[List[Attachment]] = None
+        self,
+        question: str,
+        attachments: Optional[List[Attachment]] = None,
+        problem_number: Optional[int] = None,
+        additional_tags: Optional[List[str]] = None,
+        expected_answer: Optional[str] = None,
     ) -> SolverAnswer:
         """
         Solve a question and return an answer object.
@@ -93,30 +98,41 @@ class GAIASolver:
         Args:
             question: The question to solve.
             attachments: Optional list of attachments.
+            problem_number: Optional problem number (case number) to tag the trace with.
+            additional_tags: Optional list of additional tags to add to the trace.
+            expected_answer: Optional expected answer for correctness evaluation and tagging.
 
         Returns:
             SolverAnswer object with answer, confidence, and sources.
         """
-        # Check if we've seen this question before in this session
-        # Same question in same session will reuse the same session_id
-        question_key = question.strip()
-        is_reusing = question_key in self._question_to_session_id
+        # Collect all tags to add (will be updated with correctness tag later if expected_answer is provided)
+        tags = []
+        if problem_number is not None:
+            tags.append(f'problem-{problem_number}')
+        if additional_tags:
+            tags.extend(additional_tags)
+
+        # Don't update trace here - we'll update it once at the end with all tags
+        # This ensures the correctness tag is included before trace finalizes
+
+        # Determine session_id based on problem_number if provided, otherwise use question text
+        # Same problem number will reuse the same session_id
+        if problem_number is not None:
+            session_key = f'problem-{problem_number}'
+        else:
+            session_key = question.strip()
+
+        is_reusing = session_key in self._question_to_session_id
 
         if is_reusing:
             # Reuse existing session_id
-            session_id = self._question_to_session_id[question_key]
-            self.logger.info(
-                f'Reusing session_id for same question: {session_id} '
-                f'[question: {question[:100]}...]'
-            )
+            session_id = self._question_to_session_id[session_key]
+            self.logger.info(f'Reusing session_id for {session_key}: {session_id}')
         else:
-            # Create new session_id for this question
+            # Create new session_id for this problem/question
             session_id = str(uuid.uuid4())
-            self._question_to_session_id[question_key] = session_id
-            self.logger.info(
-                f'Created new session_id for question: {session_id} '
-                f'[question: {question[:100]}...]'
-            )
+            self._question_to_session_id[session_key] = session_id
+            self.logger.info(f'Created new session_id for {session_key}: {session_id}')
 
         try:
             # Propagate session_id to all child observations
@@ -164,6 +180,50 @@ class GAIASolver:
             self.logger.info(f'Confidence: {confidence:.2f} [session_id: {session_id}]')
             self.logger.info(f'Sources: {len(sources)} [session_id: {session_id}]')
 
+            # Update trace with all tags (problem number + correctness if applicable)
+            all_tags = tags.copy() if tags else []
+
+            # Evaluate correctness and add tag if expected_answer is provided
+            if expected_answer is not None:
+                answer_str = str(final_answer) if final_answer is not None else ''
+                got_answer = answer_str.strip() if answer_str else ''
+                expected = expected_answer.strip()
+
+                # Check for refusal patterns
+                refusal_patterns = [
+                    'unable to answer',
+                    'cannot answer',
+                    'failed to',
+                    'task(s) failed',
+                    'prevented gathering',
+                ]
+                is_refusal = any(
+                    pattern in got_answer.lower() for pattern in refusal_patterns
+                )
+
+                # Success requires: non-empty answer, confidence > 0, and NOT a refusal message
+                is_successful = got_answer and confidence > 0.0 and not is_refusal
+
+                # Match requires both: exact match AND successful answer
+                answer_match = False
+                if is_successful:
+                    answer_match = (
+                        expected.lower().strip() == got_answer.lower().strip()
+                    )
+
+                # Add correctness tag to all_tags
+                correctness_tag = 'answer:correct' if answer_match else 'answer:wrong'
+                all_tags.append(correctness_tag)
+
+            # Update trace with all tags before it finalizes
+            if all_tags:
+                langfuse = get_client()
+                try:
+                    langfuse.update_current_trace(tags=all_tags)
+                    self.logger.info(f'Updated trace with tags: {all_tags}')
+                except Exception as e:
+                    self.logger.warning(f'Failed to update trace with tags: {e}')
+
             return SolverAnswer(
                 answer=final_answer or '', confidence=confidence, sources=sources
             )
@@ -172,5 +232,17 @@ class GAIASolver:
             self.logger.error(
                 f'Error solving question: {e} [session_id: {session_id}]', exc_info=True
             )
+
+            # Add error tag to trace before it finalizes
+            all_tags = tags.copy() if tags else []
+            all_tags.append('answer:wrong')
+            langfuse = get_client()
+            try:
+                langfuse.update_current_trace(tags=all_tags)
+                self.logger.info(f'Updated trace with error tags: {all_tags}')
+            except Exception as update_error:
+                self.logger.warning(
+                    f'Failed to update trace with error tag: {update_error}'
+                )
 
             return SolverAnswer(answer=f'Error: {str(e)}', confidence=0.0, sources=[])

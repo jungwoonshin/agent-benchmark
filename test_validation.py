@@ -72,7 +72,9 @@ def test_case(
 
     try:
         logging.info('Calling solver.solve()...')
-        answer = solver.solve(question)
+        answer = solver.solve(
+            question, problem_number=case_num, expected_answer=expected_answer
+        )
 
         print('\n--- RESULT ---')
         print(f'Answer: {answer.answer}')
@@ -125,7 +127,9 @@ def test_case(
         }
 
         print('\n--- EVALUATION ---')
-        print(f'Match: {"✓ YES" if answer_match else "✗ NO"}')
+        print(
+            f'Match: {"✓ YES" if answer_match else "✗ NO"}, Expected: {expected}, Got: {got_answer}'
+        )
         print(f'Success: {"✓ YES" if result["success"] else "✗ NO"}')
 
         logging.info(
@@ -140,6 +144,8 @@ def test_case(
         import traceback
 
         traceback.print_exc()
+
+        # Error tag is already added in solve() method before trace finalizes
 
         logging.error(f'TEST CASE {case_num} - ERROR: {str(e)}')
         logging.error('Traceback:', exc_info=True)
@@ -187,7 +193,7 @@ def main():
     cases = load_validation_cases(
         validation_file,
         num_cases=10,
-        indexes=[6],  # [2, 3, 5, 6, 7]
+        # indexes=[0,1],  # [2, 3, 5, 6, 7]
     )
     print(f'Loaded {len(cases)} cases')
 

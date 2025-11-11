@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Union
 
 import openai
 from dotenv import load_dotenv
+from langfuse import observe
 
 from ..utils import classify_error, retry_with_backoff
 
@@ -113,6 +114,7 @@ class LLMService:
             if 'content' not in msg:
                 raise ValueError(f'Message {i} missing required "content" field')
 
+    @observe()
     def call(
         self,
         messages: List[Dict[str, str]],
@@ -495,6 +497,7 @@ class LLMService:
         self.logger.info(f'Response:\n{content}')
         self.logger.info('=' * 80)
 
+    @observe()
     def call_with_system_prompt(
         self,
         system_prompt: str,
@@ -562,6 +565,7 @@ class LLMService:
                 return new_messages
         return messages
 
+    @observe()
     def call_with_images(
         self,
         messages: List[

@@ -92,33 +92,42 @@ class GitHubAPIRequester(BaseAPIRequester):
 
     def search_issues(
         self,
-        repo: str,
+        repo: Optional[str] = None,
         state: str = 'all',
         labels: Optional[List[str]] = None,
         sort: str = 'created',
         order: str = 'asc',
         per_page: int = 100,
+        q: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Search issues in a repository.
 
         Args:
-            repo: Repository in format "owner/repo"
+            repo: Repository in format "owner/repo" (required if q is not provided)
             state: Issue state (open, closed, all)
             labels: List of label names
             sort: Sort field (created, updated, comments)
             order: Sort order (asc, desc)
             per_page: Results per page (max 100)
+            q: Raw GitHub search query string (if provided, repo/state/labels are ignored)
 
         Returns:
             List of issue dictionaries
         """
-        query_parts = [f'repo:{repo}', f'state:{state}']
-        if labels:
-            for label in labels:
-                query_parts.append(f'label:{label}')
+        if q:
+            # Use raw query if provided
+            query = q
+        else:
+            # Construct query from structured parameters
+            if not repo:
+                raise ValueError("Either 'repo' or 'q' parameter must be provided")
+            query_parts = [f'repo:{repo}', f'state:{state}']
+            if labels:
+                for label in labels:
+                    query_parts.append(f'label:{label}')
+            query = ' '.join(query_parts)
 
-        query = ' '.join(query_parts)
         params = {
             'q': query,
             'sort': sort,
@@ -202,27 +211,69 @@ class WikipediaAPIRequester:
 
         try:
             page = self.site.pages[title]
+
+            # Check if page exists
+            if not page.exists:
+                self.logger.warning(f'Wikipedia page "{title}" does not exist')
+                return None
+
+            # Handle redirects - follow redirect to get actual content
+            if page.redirect:
+                redirect_target = page.redirects_to()
+                if redirect_target:
+                    self.logger.info(
+                        f'Page "{title}" is a redirect to "{redirect_target.name}"'
+                    )
+                    page = redirect_target
+                    if not page.exists:
+                        self.logger.warning(
+                            f'Redirect target "{redirect_target.name}" does not exist'
+                        )
+                        return None
+
+            # Get page content
+            page_text = page.text()
+            if page_text is None:
+                self.logger.warning(f'Wikipedia page "{title}" returned None content')
+                return None
+
             if revision_id:
-                # Get specific revision
+                # Get specific revision with content
                 rev = page.revisions(
-                    prop='ids|timestamp|content|user', limit=1, rvstartid=revision_id
+                    prop='ids|timestamp|content|user', limit=1, startid=revision_id
                 )
                 rev_data = next(rev, None)
                 if rev_data:
+                    # Get text from the revision data
+                    rev_text = rev_data.get('*')  # '*' contains the revision text
+                    if rev_text is None:
+                        # Fallback: try to get current page text
+                        self.logger.warning(
+                            f'Revision {revision_id} for page "{title}" did not include content, using current page text'
+                        )
+                        rev_text = page_text
+
                     return {
-                        'title': title,
+                        'title': page.name,
                         'revision_id': revision_id,
-                        'content': page.text(),
+                        'content': rev_text,
                         'timestamp': rev_data.get('timestamp'),
                     }
+                else:
+                    self.logger.warning(
+                        f'Revision {revision_id} not found for page "{title}"'
+                    )
+                    return None
             else:
                 return {
-                    'title': title,
-                    'content': page.text(),
+                    'title': page.name,
+                    'content': page_text,
                     'revision_id': page.revision,
                 }
         except Exception as e:
-            self.logger.warning(f'Failed to get Wikipedia page {title}: {e}')
+            self.logger.warning(
+                f'Failed to get Wikipedia page {title}: {e}', exc_info=True
+            )
             return None
 
     def search_pages(
@@ -269,13 +320,15 @@ class WikipediaAPIRequester:
                 # Handle both tuple and string formats from mwclient
                 if isinstance(timestamp, tuple):
                     # Convert tuple (year, month, day, hour, minute, second) to string
-                    rev_date = f"{timestamp[0]:04d}-{timestamp[1]:02d}-{timestamp[2]:02d}"
+                    rev_date = (
+                        f'{timestamp[0]:04d}-{timestamp[1]:02d}-{timestamp[2]:02d}'
+                    )
                 elif isinstance(timestamp, str):
                     rev_date = timestamp[:10]  # YYYY-MM-DD
                 else:
                     # Skip if timestamp format is unexpected
                     continue
-                
+
                 if start_date and rev_date < start_date:
                     break
                 if end_date and rev_date > end_date:

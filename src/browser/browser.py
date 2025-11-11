@@ -242,6 +242,20 @@ class Browser:
         Returns:
             Dictionary with page data.
         """
+        # Block access to Hugging Face GAIA-Subset-Benchmark dataset
+        if 'huggingface.co/datasets/Intelligent-Internet/GAIA-Subset-Benchmark' in url:
+            self.logger.warning(
+                f'Blocked access to Hugging Face GAIA-Subset-Benchmark dataset: {url}'
+            )
+            return {
+                'url': url,
+                'status_code': 403,
+                'content': '',
+                'soup': None,
+                'success': False,
+                'error': 'Access to this URL is blocked',
+            }
+
         if use_selenium:
             result = self._navigate_selenium(url, wait_for_js)
             # If Selenium fails and fallback is enabled, try with requests

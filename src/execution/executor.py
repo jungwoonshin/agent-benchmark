@@ -623,6 +623,7 @@ class Executor:
             subtask_description=subtask.description,
             problem=problem,
             query_analysis=query_analysis,
+            subtask_id=subtask.id,
         )
 
         # Store metadata
@@ -655,6 +656,7 @@ class Executor:
             subtask_description=subtask.description,
             problem=problem,
             query_analysis=query_analysis,
+            subtask_id=subtask.id,
         )
         subtask.metadata['search_analysis'] = llm_analysis
         return llm_analysis.get('content', 'No search results found.')
@@ -740,7 +742,7 @@ class Executor:
         attachment = attachments[parameters.get('attachment_index', 0)]
         analysis_type = parameters.get('analysis_type', 'auto')
         return self.tool_belt.analyze_media(attachment, analysis_type)
-    
+
     def _execute_api_tool(
         self,
         tool_name: str,
@@ -748,17 +750,17 @@ class Executor:
     ) -> Any:
         """
         Execute an API tool.
-        
+
         Args:
             tool_name: Name of the API tool (e.g., 'github_api', 'wikipedia_api')
             parameters: Parameters for the API call, must include 'api_name' and 'method'
-        
+
         Returns:
             API response
         """
         # Extract API name from tool name (remove '_api' suffix)
         api_name = tool_name.replace('_api', '')
-        
+
         # Get method from parameters
         method = parameters.get('method')
         if not method:
@@ -769,10 +771,10 @@ class Executor:
                 'error': error_msg,
                 'parameters_received': parameters,
             }
-        
+
         # Remove method from parameters before passing to API
         api_params = {k: v for k, v in parameters.items() if k != 'method'}
-        
+
         try:
             result = self.tool_belt.call_api(api_name, method, **api_params)
             if result is None:

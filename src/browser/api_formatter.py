@@ -3,7 +3,7 @@
 import base64
 import json
 import logging
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 if TYPE_CHECKING:
     from src.tools import ToolBelt
@@ -27,7 +27,14 @@ class APIFormatter:
         self.tool_belt = tool_belt
         self.logger = logger or logging.getLogger(__name__)
 
-    def format(self, api_data: Any, api_name: str, url: str) -> Optional[str]:
+    def format(
+        self,
+        api_data: Any,
+        api_name: str,
+        url: str,
+        problem: Optional[str] = None,
+        query_analysis: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         """
         Format API response data into readable text content.
 
@@ -35,6 +42,8 @@ class APIFormatter:
             api_data: Raw API response data.
             api_name: Name of the API (github, wikipedia, youtube, etc.).
             url: Original URL.
+            problem: Optional problem description (for PDF processing).
+            query_analysis: Optional query analysis (for PDF processing).
 
         Returns:
             Formatted text content or None if formatting fails.
@@ -59,7 +68,7 @@ class APIFormatter:
             elif api_name == 'reddit':
                 self._format_reddit(api_data, content_parts)
             elif api_name == 'arxiv':
-                self._format_arxiv(api_data, content_parts)
+                self._format_arxiv(api_data, content_parts, problem, query_analysis)
             else:
                 self._format_generic(api_data, content_parts)
 
@@ -185,7 +194,13 @@ class APIFormatter:
                     if selftext:
                         content_parts.append(f'Content: {selftext[:1000]}')
 
-    def _format_arxiv(self, api_data: Any, content_parts: list) -> None:
+    def _format_arxiv(
+        self,
+        api_data: Any,
+        content_parts: list,
+        problem: Optional[str] = None,
+        query_analysis: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Format arXiv API responses with full paper content."""
         if isinstance(api_data, dict):
             content_parts.append(f'Title: {api_data.get("title", "")}')
@@ -220,7 +235,12 @@ class APIFormatter:
                     self.logger.info(
                         f'Extracting full text from PDF: {pdf_attachment.filename}'
                     )
-                    pdf_content = self.tool_belt.read_attachment(pdf_attachment)
+                    # Pass problem/query_analysis to get structured dict with image_analysis
+                    pdf_content = self.tool_belt.read_attachment(
+                        pdf_attachment,
+                        problem=problem,
+                        query_analysis=query_analysis,
+                    )
 
                     if (
                         isinstance(pdf_content, dict)
@@ -231,6 +251,16 @@ class APIFormatter:
                             content_parts.append(
                                 f'\n\nFull Paper Content:\n{full_text}'
                             )
+
+                        # Store image analysis for relevance checking
+                        image_analysis = pdf_content.get('image_analysis', '')
+                        if image_analysis:
+                            # Store it in api_data for later retrieval
+                            api_data['_image_analysis'] = image_analysis
+                            self.logger.info(
+                                f'Stored image analysis from PDF ({len(image_analysis)} chars) for relevance checking'
+                            )
+
                         sections = pdf_content.get('sections', [])
                         if sections:
                             content_parts.append('\n\nPaper Sections:')

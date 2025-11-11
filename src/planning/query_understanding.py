@@ -93,6 +93,10 @@ CRITICAL RULES FOR EXPLICIT REQUIREMENTS:
 - Extract the constraints/conditions from the problem, not the action verbs
 - Each requirement should describe WHAT must be true/satisfied, not WHAT to do
 - Requirements should be verifiable conditions that can be checked against results
+- Carefully read and parse all quantitative details in the problem statement
+- Understand compound descriptions and relationships - if the problem describes multiple items where each has multiple parts, calculate the total correctly
+- Preserve exact quantities, counts, and structural relationships as stated in the problem
+- Do not simplify or reduce quantities when extracting requirements - maintain the full detail from the problem statement
 
 CRITICAL: STEP NUMBER ASSIGNMENT
 - If subtasks are provided, you MUST assign each requirement to the correct step number
@@ -108,7 +112,7 @@ Return your analysis as a JSON object with these keys:
 - answer_format: string describing expected format
 - cross_references: list of strings describing cross-references
 - has_terminology_ambiguity: boolean (true if the answer might have multiple valid forms due to terminology)
-- terminology_context: string describing the domain/context where terminology matters 
+- terminology_context: string describing the domain/context where terminology matters
 
 Be thorough and precise. Assign requirements to the correct step numbers based on the provided subtasks.
 
@@ -116,7 +120,9 @@ IMPORTANT: Return your response as valid JSON only, without any markdown formatt
 
         user_prompt = f"""Problem: {problem}{attachment_info}{subtasks_context}
 
-Analyze this problem and assign requirements to the correct step numbers based on the generated subtasks."""
+Analyze this problem and assign requirements to the correct step numbers based on the generated subtasks.
+
+CRITICAL: Read the problem statement carefully and extract all quantitative details accurately. If the problem describes multiple items where each has multiple parts, ensure requirements reflect the correct total count. Preserve all structural relationships and quantities exactly as stated in the problem."""
 
         try:
             response = self.llm_service.call_with_system_prompt(

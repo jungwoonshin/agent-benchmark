@@ -1,64 +1,21 @@
-"""Utility functions for arXiv paper metadata extraction."""
+"""High-level arXiv utility functions combining ID extraction and API access."""
 
 import logging
-import re
 from typing import Any, Dict, Optional
 
-try:
-    import arxiv
-except ImportError:
-    arxiv = None
-
-
-def extract_arxiv_id_from_url(url: str) -> Optional[str]:
-    """
-    Extract arXiv paper ID from a URL.
-
-    Args:
-        url: URL that may contain arXiv paper ID (e.g., arxiv.org/abs/2207.01510)
-
-    Returns:
-        arXiv paper ID (e.g., "2207.01510") without version suffix, or None if not found
-    """
-    if not url:
-        return None
-
-    arxiv_match = re.search(r'arxiv\.org/(?:abs|pdf)/([\d.]+)', url, re.IGNORECASE)
-    if not arxiv_match:
-        return None
-
-    paper_id = arxiv_match.group(1)
-    # Remove version suffix if present (e.g., 2207.01510v1 -> 2207.01510)
-    paper_id = re.sub(r'v\d+$', '', paper_id)
-    return paper_id
-
-
-def extract_arxiv_id_from_text(text: str) -> Optional[str]:
-    """
-    Extract arXiv paper ID from text content.
-
-    Args:
-        text: Text that may contain arXiv paper ID (e.g., "arXiv:2207.01510v1")
-
-    Returns:
-        arXiv paper ID (e.g., "2207.01510") without version suffix, or None if not found
-    """
-    if not text:
-        return None
-
-    # Look for arXiv ID in text (format: arXiv:YYMM.XXXXX or YYMM.XXXXX)
-    arxiv_id_match = re.search(r'arxiv[:\s]+([\d]{4}\.[\d]{5})', text, re.IGNORECASE)
-    if arxiv_id_match:
-        paper_id = arxiv_id_match.group(1)
-        # Remove version suffix if present
-        paper_id = re.sub(r'v\d+$', '', paper_id)
-        return paper_id
-
-    return None
+from .arxiv_api_client import (
+    extract_metadata_from_paper,
+    fetch_paper_from_api,
+    is_arxiv_available,
+)
+from .arxiv_id_extractor import (
+    extract_arxiv_id_from_text,
+    extract_arxiv_id_from_url,
+)
 
 
 def get_arxiv_metadata(
-    paper_id: str, 
+    paper_id: str,
     logger: Optional[logging.Logger] = None,
     download_pdf: bool = False,
     tool_belt: Optional[Any] = None,
@@ -95,7 +52,7 @@ def get_arxiv_metadata(
         - confidence: Confidence score (1.0 for API results)
         None if fetch fails or arxiv library not available
     """
-    if not arxiv:
+    if not is_arxiv_available():
         if logger:
             logger.warning(
                 'arxiv library not available. Install with: uv pip install arxiv'
@@ -105,123 +62,54 @@ def get_arxiv_metadata(
     if not paper_id:
         return None
 
-    try:
-        search = arxiv.Search(id_list=[paper_id])
-        paper = next(search.results(), None)
-
-        if not paper:
-            if logger:
-                logger.debug(f'No paper found for arXiv ID: {paper_id}')
-            return None
-
-        # Extract submission date (published date)
-        submission_date = None
-        submission_month = None
-        submission_date_text = None
-
-        if paper.published:
-            submission_date = paper.published.strftime('%Y-%m-%d')
-            submission_month = paper.published.strftime('%Y-%m')
-            submission_date_text = (
-                f'Submitted on {paper.published.strftime("%B %d, %Y")}'
-            )
-
-        # Extract updated date
-        updated_date = None
-        updated_date_text = None
-        if paper.updated:
-            updated_date = paper.updated.strftime('%Y-%m-%d')
-            updated_date_text = (
-                f'Updated on {paper.updated.strftime("%B %d, %Y")}'
-            )
-
-        # Get PDF URL
-        pdf_url = paper.pdf_url if hasattr(paper, 'pdf_url') else None
-        if not pdf_url:
-            # Construct PDF URL from paper ID
-            pdf_url = f'https://arxiv.org/pdf/{paper_id}.pdf'
-
-        # Download PDF if requested
-        pdf_attachment = None
-        if download_pdf and pdf_url:
-            if tool_belt:
-                try:
-                    if logger:
-                        logger.info(f'Downloading PDF from arXiv for paper {paper_id}: {pdf_url}')
-                    pdf_attachment = tool_belt.download_file_from_url(pdf_url)
-                    if logger:
-                        logger.info(
-                            f'Successfully downloaded PDF: {pdf_attachment.filename} '
-                            f'({len(pdf_attachment.data)} bytes)'
-                        )
-                except Exception as e:
-                    if logger:
-                        logger.warning(
-                            f'Failed to download PDF for paper {paper_id}: {e}'
-                        )
-            else:
-                if logger:
-                    logger.warning(
-                        'download_pdf=True but tool_belt not provided. '
-                        'Skipping PDF download.'
-                    )
-
-        result = {
-            'paper_id': paper_id,
-            'entry_id': paper.entry_id if hasattr(paper, 'entry_id') else None,
-            'submission_date': submission_date,
-            'submission_date_text': submission_date_text,
-            'submission_month': submission_month,
-            'updated_date': updated_date,
-            'updated_date_text': updated_date_text,
-            'title': paper.title,
-            'authors': [str(author) for author in paper.authors],
-            'categories': [str(cat) for cat in paper.categories],
-            'primary_category': (
-                str(paper.primary_category) 
-                if hasattr(paper, 'primary_category') and paper.primary_category 
-                else None
-            ),
-            'summary': paper.summary,
-            'comment': (
-                paper.comment 
-                if hasattr(paper, 'comment') and paper.comment 
-                else None
-            ),
-            'journal_ref': (
-                paper.journal_ref 
-                if hasattr(paper, 'journal_ref') and paper.journal_ref 
-                else None
-            ),
-            'doi': (
-                paper.doi 
-                if hasattr(paper, 'doi') and paper.doi 
-                else None
-            ),
-            'pdf_url': pdf_url,
-            'confidence': 1.0,  # High confidence from API
-        }
-
-        # Include PDF attachment if downloaded
-        if pdf_attachment:
-            result['pdf_attachment'] = pdf_attachment
-
-        if logger:
-            logger.debug(
-                f'Fetched arXiv metadata from API for {paper_id}: '
-                f'submission_date={submission_date}, '
-                f'updated_date={updated_date}, '
-                f'pdf_url={pdf_url}'
-            )
-
-        return result
-
-    except Exception as e:
-        if logger:
-            logger.warning(
-                f'Failed to fetch metadata from arXiv API for {paper_id}: {e}'
-            )
+    # Fetch paper from API
+    paper = fetch_paper_from_api(paper_id, logger)
+    if not paper:
         return None
+
+    # Extract metadata (pass paper_id for PDF URL construction)
+    metadata = extract_metadata_from_paper(paper, paper_id=paper_id)
+    metadata['paper_id'] = paper_id
+    metadata['confidence'] = 1.0  # High confidence from API
+
+    # Download PDF if requested
+    pdf_attachment = None
+    if download_pdf and metadata.get('pdf_url'):
+        if tool_belt:
+            try:
+                if logger:
+                    logger.info(
+                        f'Downloading PDF from arXiv for paper {paper_id}: {metadata["pdf_url"]}'
+                    )
+                pdf_attachment = tool_belt.download_file_from_url(metadata['pdf_url'])
+                if logger:
+                    logger.info(
+                        f'Successfully downloaded PDF: {pdf_attachment.filename} '
+                        f'({len(pdf_attachment.data)} bytes)'
+                    )
+            except Exception as e:
+                if logger:
+                    logger.warning(f'Failed to download PDF for paper {paper_id}: {e}')
+        else:
+            if logger:
+                logger.warning(
+                    'download_pdf=True but tool_belt not provided. '
+                    'Skipping PDF download.'
+                )
+
+    # Include PDF attachment if downloaded
+    if pdf_attachment:
+        metadata['pdf_attachment'] = pdf_attachment
+
+    if logger:
+        logger.debug(
+            f'Fetched arXiv metadata from API for {paper_id}: '
+            f'submission_date={metadata.get("submission_date")}, '
+            f'updated_date={metadata.get("updated_date")}, '
+            f'pdf_url={metadata.get("pdf_url")}'
+        )
+
+    return metadata
 
 
 def get_arxiv_submission_date(
@@ -246,3 +134,13 @@ def get_arxiv_submission_date(
         return metadata.get('submission_date')
 
     return None
+
+
+# Re-export ID extraction functions for backward compatibility
+__all__ = [
+    'extract_arxiv_id_from_url',
+    'extract_arxiv_id_from_text',
+    'get_arxiv_metadata',
+    'get_arxiv_submission_date',
+    'is_arxiv_available',
+]

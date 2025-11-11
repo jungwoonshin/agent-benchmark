@@ -233,6 +233,7 @@ Return as JSON with "resources" key containing an array of resource objects."""
         subtask_description: str,
         problem: str,
         query_analysis: Optional[Dict[str, Any]] = None,
+        subtask_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Use LLM to analyze processed search results and determine the answer based on subtask description.
@@ -243,21 +244,32 @@ Return as JSON with "resources" key containing an array of resource objects."""
             subtask_description: Description of the subtask being executed.
             problem: Original problem description.
             query_analysis: Optional query analysis results.
+            subtask_id: Optional subtask ID (e.g., "step_1", "step_2") to extract step number for filtering requirements.
 
         Returns:
             Dictionary with LLM analysis result as the primary content.
         """
         try:
-            # Extract step number from subtask_description (look for "step_1", "step_2", etc.)
+            # Extract step number from subtask_id first (most reliable), then fallback to subtask_description
             step_num = None
-            step_match = re.search(
-                r'step[_\s]*(\d+)', subtask_description, re.IGNORECASE
-            )
-            if step_match:
-                try:
-                    step_num = int(step_match.group(1))
-                except (ValueError, IndexError):
-                    pass
+            if subtask_id:
+                step_match = re.search(r'step[_\s]*(\d+)', subtask_id, re.IGNORECASE)
+                if step_match:
+                    try:
+                        step_num = int(step_match.group(1))
+                    except (ValueError, IndexError):
+                        pass
+
+            # Fallback to extracting from subtask_description if not found in subtask_id
+            if step_num is None:
+                step_match = re.search(
+                    r'step[_\s]*(\d+)', subtask_description, re.IGNORECASE
+                )
+                if step_match:
+                    try:
+                        step_num = int(step_match.group(1))
+                    except (ValueError, IndexError):
+                        pass
 
             # Build context from query analysis, filtering by step number if available
             requirements_context = ''
@@ -281,20 +293,42 @@ Return as JSON with "resources" key containing an array of resource objects."""
                                 try:
                                     req_step_num = int(req_step_match.group(1))
                                     if req_step_num == step_num:
-                                        filtered_reqs.append(req)
+                                        # Remove the "Step N:" prefix for cleaner display
+                                        req_text = re.sub(
+                                            r'step[_\s]*\d+[:\s]*',
+                                            '',
+                                            req_str,
+                                            flags=re.IGNORECASE,
+                                        ).strip()
+                                        filtered_reqs.append(req_text)
                                 except (ValueError, IndexError):
-                                    # If we can't parse step number, include it (fallback)
-                                    filtered_reqs.append(req)
-                            else:
-                                # If requirement doesn't have step tag, don't include it
-                                # (only include step-tagged requirements)
-                                pass
+                                    # If we can't parse step number, include it without prefix (fallback)
+                                    req_text = re.sub(
+                                        r'step[_\s]*\d+[:\s]*',
+                                        '',
+                                        req_str,
+                                        flags=re.IGNORECASE,
+                                    ).strip()
+                                    filtered_reqs.append(req_text)
+                            # If requirement doesn't have step tag, don't include it
+                            # (only include step-tagged requirements when filtering by step)
+
                         if filtered_reqs:
+                            self.logger.debug(
+                                f'Filtered {len(filtered_reqs)} requirement(s) for step {step_num}'
+                            )
                             requirements_context += (
                                 f'\nExplicit Requirements: {", ".join(filtered_reqs)}'
                             )
+                        else:
+                            self.logger.debug(
+                                f'No requirements found matching step {step_num}'
+                            )
                     else:
                         # If no step number found, include all requirements (backward compatibility)
+                        self.logger.debug(
+                            'No step number available, including all requirements'
+                        )
                         requirements_context += (
                             f'\nExplicit Requirements: {", ".join(explicit_reqs)}'
                         )

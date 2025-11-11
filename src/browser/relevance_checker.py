@@ -24,15 +24,49 @@ def get_content_type_label(content_type: Optional[str]) -> str:
         return 'File'
 
 
-def build_requirements_context(query_analysis: Optional[Dict[str, Any]]) -> str:
-    """Build requirements context string from query analysis."""
+def build_requirements_context(
+    query_analysis: Optional[Dict[str, Any]], step_num: Optional[int] = None
+) -> str:
+    """Build requirements context string from query analysis.
+
+    Args:
+        query_analysis: Optional query analysis results.
+        step_num: Optional step number to filter requirements. If provided, only
+                  requirements matching this step number will be included.
+
+    Returns:
+        String with requirements context, or empty string if no matching requirements found.
+    """
     if not query_analysis:
         return ''
 
     explicit_reqs = query_analysis.get('explicit_requirements', [])
-    if explicit_reqs:
-        return f'\nExplicit Requirements: {", ".join(explicit_reqs)}'
-    return ''
+    if not explicit_reqs:
+        return ''
+
+    # Filter requirements by step number if step number is provided
+    if step_num is not None:
+        filtered_reqs = []
+        for req in explicit_reqs:
+            req_str = str(req)
+            # Check if requirement matches this step number
+            req_step_match = re.search(r'step[_\s]*(\d+)[:\s]', req_str, re.IGNORECASE)
+            if req_step_match:
+                try:
+                    req_step_num = int(req_step_match.group(1))
+                    if req_step_num == step_num:
+                        filtered_reqs.append(req)
+                except (ValueError, IndexError):
+                    # If we can't parse step number, don't include it
+                    pass
+            # If requirement doesn't have step tag, don't include it
+            # (only include step-tagged requirements when filtering by step)
+
+        explicit_reqs = filtered_reqs
+        if not explicit_reqs:
+            return ''
+
+    return f'\nExplicit Requirements: {", ".join(explicit_reqs)}'
 
 
 def build_section_titles_info(
@@ -83,7 +117,7 @@ def build_arxiv_metadata_info(
     # Paper ID
     if metadata.get('paper_id'):
         info += f'- Paper ID: {metadata["paper_id"]}\n'
-    
+
     # Entry ID
     if metadata.get('entry_id'):
         info += f'- Entry ID: {metadata["entry_id"]}\n'
@@ -134,7 +168,7 @@ def build_arxiv_metadata_info(
     categories = metadata.get('categories')
     if categories and isinstance(categories, list) and len(categories) > 0:
         info += f'- Categories: {", ".join(categories)}\n'
-    
+
     # Primary category
     if metadata.get('primary_category'):
         info += f'- Primary Category: {metadata["primary_category"]}\n'
@@ -195,7 +229,7 @@ def build_full_content_info(
     if len(full_content) > max_length:
         content_preview = (
             full_content[:max_length]
-            + f'\n\n[... Content truncated: {len(full_content)} total characters ...]'
+            + f'\n\n[Note: Full content was extracted ({len(full_content)} total characters) but is shown truncated here for token limits. The complete document content is available and should be considered when evaluating relevance.]'
         )
 
     return f'\n\n{content_type_label} Full Content:\n{content_preview}'
@@ -285,6 +319,8 @@ Given the problem, subtask, decide if the page likely helps complete the subtask
 Full content of the search result is provided to help you make an accurate determination.
 For PDFs with images, visual LLM analysis of the images is also provided to help determine relevance.
 
+IMPORTANT: If the content shows a truncation note (e.g., "Full content was extracted but is shown truncated here for token limits"), this means the COMPLETE document content was successfully extracted and is available. The truncation is only for display purposes in this prompt due to token limits. You should treat the content as complete and evaluate relevance accordingly. A truncation note does NOT mean the content is incomplete - it means the full content was extracted but only a preview is shown here.
+
 CRITICAL RULE: If explicit requirements are provided, identify which entity/source/document this search result is about, then check if ALL requirements for that specific entity are satisfied.
 
 A result is relevant if it satisfies ALL requirements for ONE complete entity group. You do NOT need to satisfy requirements for other entities.
@@ -293,6 +329,7 @@ Criteria:
 - Match the subtask intent and problem requirements
 - Source appears trustworthy and offers actionable information
 - Use the full content provided to verify if the result actually contains the information needed
+- If content shows a truncation note, treat it as complete - the full document was extracted successfully
 - For PDFs: If image analysis from visual LLM is provided, use it to understand figures, charts, diagrams, and visual information that may be critical for relevance
 - For date checks: use dates only from the content_info provided, and treat dates within ±1 month of the required date as acceptable
 - Do not use dates from the title/snippet/url/id to determine relevance
@@ -487,7 +524,7 @@ class RelevanceChecker:
             )
 
             # Build context components
-            requirements_context = build_requirements_context(query_analysis)
+            requirements_context = build_requirements_context(query_analysis, step_num)
             content_info = build_content_info(
                 section_titles, image_analysis, full_content, content_type, self.logger
             )
@@ -566,9 +603,22 @@ class RelevanceChecker:
         )
 
         try:
+            # Extract step number from subtask_description (look for "step_1", "step_2", etc.)
+            step_num = None
+            step_match = re.search(
+                r'step[_\s]*(\d+)', subtask_description, re.IGNORECASE
+            )
+            if step_match:
+                try:
+                    step_num = int(step_match.group(1))
+                except (ValueError, IndexError):
+                    pass
+
             # Build requirements context
-            requirements_context = build_requirements_context(query_analysis)
-            explicit_reqs_check = build_explicit_requirements_check(query_analysis)
+            requirements_context = build_requirements_context(query_analysis, step_num)
+            explicit_reqs_check = build_explicit_requirements_check(
+                query_analysis, step_num
+            )
 
             # Format search results for batch evaluation
             results_text = []

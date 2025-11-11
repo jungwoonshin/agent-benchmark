@@ -308,7 +308,7 @@ class ToolBelt:
             max_retries,
             capture_screenshot,
         )
-    
+
     # API methods
     def try_api_for_search_result(
         self,
@@ -318,12 +318,12 @@ class ToolBelt:
     ) -> Optional[Dict[str, Any]]:
         """
         Try to use an API for a search result instead of web scraping.
-        
+
         Args:
             search_result_url: URL from search result
             problem: Problem description
             subtask_description: Subtask description
-        
+
         Returns:
             API response if API was used, None otherwise
         """
@@ -332,7 +332,7 @@ class ToolBelt:
         return self.api_tool.try_api_for_search_result(
             search_result_url, problem, subtask_description
         )
-    
+
     def call_api(
         self,
         api_name: str,
@@ -341,12 +341,12 @@ class ToolBelt:
     ) -> Any:
         """
         Call an external API directly.
-        
+
         Args:
             api_name: Name of API (github, wikipedia, youtube, twitter, reddit, arxiv, wayback, google_maps, usgs, census)
             method: Method name to call
             **kwargs: Arguments for the method
-        
+
         Returns:
             API response
         """

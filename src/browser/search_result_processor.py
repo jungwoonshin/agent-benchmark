@@ -475,8 +475,9 @@ Does this subtask require visual analysis (image recognition, screenshot analysi
             api_name = api_result.get('api_name')
 
             # Format API data into content format
+            # Pass problem/query_analysis so PDFs can return structured data with image_analysis
             formatted_content = self.api_formatter.format(
-                api_data, api_name, result.url
+                api_data, api_name, result.url, problem, query_analysis
             )
             if formatted_content:
                 full_content = formatted_content
@@ -487,6 +488,9 @@ Does this subtask require visual analysis (image recognition, screenshot analysi
                     'url': result.url,
                     'content': formatted_content,
                     'raw_data': api_data,
+                    'image_analysis': api_data.get(
+                        '_image_analysis', ''
+                    ),  # Include image analysis if available
                 }
                 section_titles = None
                 # Skip download/navigation since we have API data
@@ -855,14 +859,16 @@ Does this subtask require visual analysis (image recognition, screenshot analysi
                 f'has_attachments={attachments is not None and len(attachments) > 0 if attachments else False}'
             )
 
-        # Get image analysis if it was extracted before relevance check (for PDFs)
+        # Get image analysis if it was extracted before relevance check (for PDFs and API data)
         image_analysis_for_relevance = ''
-        if (
-            is_file
-            and isinstance(extracted_data, dict)
-            and extracted_data.get('type') == 'pdf'
-        ):
-            image_analysis_for_relevance = extracted_data.get('image_analysis', '')
+        if isinstance(extracted_data, dict):
+            # Check both PDF files and API data (which may contain PDF content with images)
+            if extracted_data.get('type') in ('pdf', 'api_data'):
+                image_analysis_for_relevance = extracted_data.get('image_analysis', '')
+                if image_analysis_for_relevance:
+                    self.logger.info(
+                        f'Including image analysis in relevance check ({len(image_analysis_for_relevance)} chars)'
+                    )
 
         self.logger.debug(
             f'Relevance check: content_type={content_type}, '

@@ -183,6 +183,13 @@ class FileHandler:
         Raises:
             Exception: If download fails after all retries, with improved error message.
         """
+        # Block access to Hugging Face GAIA-Subset-Benchmark dataset
+        if 'huggingface.co/datasets/Intelligent-Internet/GAIA-Subset-Benchmark' in url:
+            self.logger.warning(
+                f'Blocked download from Hugging Face GAIA-Subset-Benchmark dataset: {url}'
+            )
+            raise ValueError('Access to this URL is blocked')
+
         self.logger.info(f'Downloading file from URL: {url} (timeout: {timeout}s)')
 
         # Default headers with user-agent
