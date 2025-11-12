@@ -7,7 +7,10 @@ from typing import Any, Dict, List, Optional
 from ..llm import LLMService
 from ..models import SearchResult
 from ..utils import extract_json_from_text
-from ..utils.arxiv_utils import get_arxiv_submission_date
+from ..utils.arxiv_utils import (
+    get_arxiv_submission_date,
+    get_arxiv_submission_dates_batch,
+)
 from .authority_assessor import AuthorityAssessor
 
 
@@ -72,6 +75,14 @@ class RelevanceRanker:
             for result in search_results
         ]
 
+        # Batch fetch arXiv submission dates for all search results
+        all_urls = [result.url for result in search_results]
+        submission_dates_cache = get_arxiv_submission_dates_batch(all_urls, self.logger)
+        if submission_dates_cache:
+            self.logger.info(
+                f'Batch fetched submission dates for {len(submission_dates_cache)} arXiv papers'
+            )
+
         # Format search results for LLM with submission_date and authority signals
         results_text = []
         for idx, result in enumerate(search_results, 1):
@@ -81,8 +92,11 @@ class RelevanceRanker:
                 else result.snippet
             )
 
-            # Get submission_date for arXiv papers using arxiv library
-            submission_date = get_arxiv_submission_date(result.url, self.logger)
+            # Get submission_date from batch cache, or fetch individually if not in cache
+            submission_date = submission_dates_cache.get(result.url)
+            if submission_date is None:
+                # Fallback to individual fetch if not in batch cache (non-arXiv URL)
+                submission_date = get_arxiv_submission_date(result.url, self.logger)
             authority_signals = authority_signals_list[idx - 1]
 
             # Build result text with authority information

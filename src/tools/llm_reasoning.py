@@ -55,11 +55,15 @@ class LLMReasoningTool:
         if context:
             # Format context in a readable way
             context_items = []
+            # Track which step IDs we've already processed from dependency_results
+            processed_step_ids = set()
+
             for key, value in context.items():
                 if key == 'dependency_results':
                     # Handle dependency results specially
                     if isinstance(value, dict):
                         for dep_id, dep_result in value.items():
+                            processed_step_ids.add(dep_id)
                             # Extract summary if available (contains full result including image analysis)
                             if isinstance(dep_result, dict) and 'summary' in dep_result:
                                 summary = dep_result.get('summary', '')
@@ -69,6 +73,9 @@ class LLMReasoningTool:
                                 context_items.append(
                                     f'{dep_id}: {json.dumps(dep_result, indent=2)[:500]}'
                                 )
+                elif key in processed_step_ids:
+                    # Skip individual step entries that are already in dependency_results
+                    continue
                 elif isinstance(value, dict):
                     # For structured context entries, extract summary if available
                     # This preserves full results including image analysis

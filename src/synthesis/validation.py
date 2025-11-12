@@ -68,10 +68,18 @@ class AnswerValidator:
                 # For search results, include more context
                 if 'search_results' in result_str or 'SearchResult' in result_str:
                     result_preview = result_str[
-                        :1500
+                        :5000
                     ]  # More context for search results
+                elif 'wikipedia' in result_str.lower() or 'api' in subtask.metadata.get(
+                    'tool', ''
+                ):
+                    # For API results (like Wikipedia), include more context
+                    result_preview = result_str[:5000]
+                elif 'llm_reasoning' in subtask.metadata.get('tool', ''):
+                    # For LLM reasoning results, include full context (they're usually important)
+                    result_preview = result_str[:8000]
                 else:
-                    result_preview = result_str[:1000]  # More context for other results
+                    result_preview = result_str[:3000]  # More context for other results
 
                 execution_summary.append(
                     {
@@ -84,12 +92,16 @@ class AnswerValidator:
                 )
 
         # Truncate execution summary and reasoning summary to prevent prompt from being too long
-        # Limit execution summary to avoid API errors
+        # Limit execution summary to avoid API errors, but allow more space for important results
         execution_summary_json = json.dumps(
             execution_summary, indent=2, ensure_ascii=False
         )
-        max_execution_length = 8000  # Limit execution summary length
+        max_execution_length = (
+            20000  # Increased limit to preserve more execution step information
+        )
         if len(execution_summary_json) > max_execution_length:
+            # Try to preserve complete results by truncating from the end of the JSON
+            # rather than cutting off mid-result
             execution_summary_json = (
                 execution_summary_json[:max_execution_length] + '\n... [truncated]'
             )

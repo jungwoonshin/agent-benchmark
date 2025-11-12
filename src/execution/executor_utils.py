@@ -183,6 +183,7 @@ For API tools (github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, 
     * search_posts: {"method": "search_posts", "subreddit": "subreddit_name" (required, without r/), "query": "search terms" (required), "limit": 25 (optional, default: 25, max: 100), "sort": "relevance|hot|top|new" (optional, default: "relevance")}
   - arxiv_api methods:
     * get_metadata: {"method": "get_metadata", "paper_id": "YYMM.NNNNN" or "archive/category/YYMMNNN" (required), "download_pdf": false (optional, boolean, default: false)}
+    * extract_id_from_url: {"method": "extract_id_from_url", "url": "https://arxiv.org/abs/YYMM.NNNNN" (required, string)}
   - wayback_api methods:
     * get_archived_url: {"method": "get_archived_url", "url": "https://example.com" (required), "timestamp": "YYYYMMDD" (optional, string)}
   - google_maps_api methods:
@@ -200,7 +201,7 @@ For API tools (github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, 
     * Use placeholder "<from previous call>" in parameters to reference results from earlier calls in the chain
     * Extract the appropriate API name, method names, and required parameters from the subtask description and available API documentation
   """
-  
+
     attachment_info = ''
     if attachments:
         attachment_info = (

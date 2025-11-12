@@ -195,6 +195,16 @@ class WikipediaAPIRequester:
             import mwclient
 
             self.site = mwclient.Site(f'{language}.wikipedia.org')
+            # Verify site is accessible by attempting a simple API call
+            try:
+                # Try to get site info via API - this will raise an exception if not accessible
+                _ = self.site.api('query', meta='siteinfo', siprop='general')
+                logger.debug(f'Wikipedia API initialized for {language}.wikipedia.org')
+            except Exception as conn_error:
+                logger.warning(
+                    f'Wikipedia site connection verification failed: {conn_error}. '
+                    'Search may still work, but connection could not be verified.'
+                )
         except ImportError:
             self.site = None
             logger.warning(
@@ -302,20 +312,68 @@ class WikipediaAPIRequester:
     ) -> List[Dict[str, Any]]:
         """Search Wikipedia pages."""
         if not self.site:
+            self.logger.warning(
+                'Wikipedia site not initialized (mwclient may not be installed)'
+            )
+            return []
+
+        if not query or not query.strip():
+            self.logger.warning('Wikipedia search called with empty query')
             return []
 
         try:
-            results = []
-            for page in self.site.search(query, limit=limit):
-                results.append(
-                    {
-                        'title': page.name,
-                        'url': f'https://{self.language}.wikipedia.org/wiki/{page.name.replace(" ", "_")}',
-                    }
+            self.logger.debug(f'Searching Wikipedia for: "{query}" with limit={limit}')
+            # Use max_items instead of limit to avoid deprecation warning
+            search_result = self.site.search(query, max_items=limit)
+
+            # Check if search returned None (shouldn't happen, but handle it)
+            if search_result is None:
+                self.logger.warning(
+                    f'Wikipedia search() returned None for query: "{query}"'
                 )
+                return []
+
+            results = []
+            page_count = 0
+            for page in search_result:
+                try:
+                    # mwclient.search() returns dictionaries, not page objects
+                    if isinstance(page, dict):
+                        page_name = page.get('title', '')
+                    elif hasattr(page, 'name'):
+                        page_name = page.name
+                    elif hasattr(page, 'title'):
+                        page_name = page.title
+                    else:
+                        page_name = str(page)
+
+                    if not page_name:
+                        self.logger.warning(
+                            f'Wikipedia search result missing title: {page}'
+                        )
+                        continue
+
+                    results.append(
+                        {
+                            'title': page_name,
+                            'url': f'https://{self.language}.wikipedia.org/wiki/{page_name.replace(" ", "_")}',
+                        }
+                    )
+                    page_count += 1
+                except Exception as page_error:
+                    self.logger.warning(
+                        f'Error processing Wikipedia search result page: {page_error}'
+                    )
+                    continue
+
+            self.logger.debug(
+                f'Wikipedia search returned {page_count} results for query: "{query}"'
+            )
             return results
         except Exception as e:
-            self.logger.warning(f'Wikipedia search failed: {e}')
+            self.logger.warning(
+                f'Wikipedia search failed for query "{query}": {e}', exc_info=True
+            )
             return []
 
     def get_page_revisions(
@@ -781,7 +839,12 @@ class UnifiedAPIRequester:
             elif method == 'extract_id_from_url':
                 url = kwargs.get('url')
                 return extract_arxiv_id_from_url(url)
-            return None
+            else:
+                self.logger.warning(
+                    f'Unknown method "{method}" for arxiv API. '
+                    f'Available methods: get_metadata, extract_id_from_url'
+                )
+                return None
 
         api = api_map.get(api_name.lower())
         if not api:

@@ -508,10 +508,6 @@ class AnswerSynthesizer:
         # Build comprehensive but condensed execution summary
         execution_summary = execution_results.get('execution_summary', {})
 
-        execution_summary_str = self._build_execution_summary_str(
-            execution_summary, query_analysis
-        )
-
         # Format knowledge graph facts (limited)
         knowledge_facts_str = self._build_knowledge_facts_str()
 
@@ -520,7 +516,7 @@ class AnswerSynthesizer:
             query_analysis=query_analysis,
             requirements_str=requirements_str,
             attachment_info=attachment_info,
-            execution_summary_str=execution_summary_str,
+            execution_summary_str=execution_summary,
             knowledge_facts_str=knowledge_facts_str,
         )
 

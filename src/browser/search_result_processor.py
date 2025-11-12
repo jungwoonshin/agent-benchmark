@@ -336,19 +336,6 @@ class SearchResultProcessor:
 
         return result_summary
 
-    def _summarize_single_result_content(
-        self,
-        content: str,
-        subtask_description: str,
-        problem: str,
-        query_analysis: Optional[Dict[str, Any]] = None,
-        content_type: str = 'general',
-    ) -> str:
-        """Summarize single result content (delegates to ContentSummarizer)."""
-        return self.content_summarizer.summarize_single_result(
-            content, subtask_description, problem, query_analysis, content_type
-        )
-
     def _process_single_result(
         self,
         result: Union[SearchResult, Dict],
@@ -476,7 +463,7 @@ class SearchResultProcessor:
                         f'Including image analysis in relevance check ({len(image_analysis_for_relevance)} chars)'
                     )
 
-        is_relevant, relevance_reasoning = self._check_relevance(
+        is_relevant, relevance_reasoning, summary = self._check_relevance(
             result,
             subtask_description,
             problem,
@@ -496,25 +483,16 @@ class SearchResultProcessor:
 
         self.logger.info(
             f'Result {result_info} is RELEVANT. Reason: {relevance_reasoning}. '
-            f'Proceeding with content summarization and visual analysis check.'
+            f'Proceeding with visual analysis check.'
         )
 
-        # Step 6: Summarize the full content
-        summarized_content = self.content_summarizer.summarize_single_result(
-            full_content,
-            subtask_description,
-            problem,
-            query_analysis,
-            content_type=content_type or 'general',
-        )
-
-        # Update extracted_data with summarized content
+        # Update extracted_data with summary from relevance checker
         if isinstance(extracted_data, dict):
-            extracted_data['summarized_content'] = summarized_content
-            extracted_data['content'] = summarized_content
+            extracted_data['summarized_content'] = summary
+            extracted_data['content'] = summary
         else:
             extracted_data = {
-                'content': summarized_content,
+                'content': summary,
                 'image_analysis': '',
             }
 
@@ -535,14 +513,14 @@ class SearchResultProcessor:
                 subtask_description,
                 problem,
                 full_content,
-                summarized_content,
+                summary,
             )
         else:
             self.logger.debug('Visual analysis not required for this subtask')
 
         # Step 8: Format and return result
         return self.result_formatter.format_result(
-            result, is_file, file_type, extracted_data, summarized_content
+            result, is_file, file_type, extracted_data, summary
         )
 
     def _extract_web_page_sections(self, url: str) -> List[str]:
@@ -670,7 +648,7 @@ class SearchResultProcessor:
             image_analysis: Optional visual LLM analysis of images from PDF (extracted before relevance check).
 
         Returns:
-            Tuple of (is_relevant: bool, reasoning: str)
+            Tuple of (is_relevant: bool, reasoning: str, summary: str)
         """
         return self.relevance_checker.check_relevance(
             search_result=search_result,

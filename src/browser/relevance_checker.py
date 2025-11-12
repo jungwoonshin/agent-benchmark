@@ -348,9 +348,10 @@ IMPORTANT: When evaluating relevance, consider source authority:
 - When information conflicts between sources, prefer information from more authoritative sources
 
 Return JSON only with:
-{"relevant": boolean, "reasoning": "1-2 sentences explaining why it is/isn't relevant, including which explicit requirements are/aren't satisfied", "confidence": 0.0-1.0, "explicit_requirements_satisfied": [list of requirement indices (1-based) that are satisfied, or empty array if no explicit requirements]}
+{"relevant": boolean, "reasoning": "1-2 sentences explaining why it is/isn't relevant, including which explicit requirements are/aren't satisfied", "confidence": 0.0-1.0, "explicit_requirements_satisfied": [list of requirement indices (1-based) that are satisfied, or empty array if no explicit requirements], "summary": "A concise summary of the content with respect to the subtask description and explicit requirements. Focus on information that is directly relevant to completing the subtask."}
 
-If explicit requirements exist, your reasoning MUST explicitly state which requirements are satisfied and which are not."""
+If explicit requirements exist, your reasoning MUST explicitly state which requirements are satisfied and which are not.
+The summary should highlight key information from the content that is relevant to the subtask and any explicit requirements that need to be satisfied."""
 
 
 def build_user_prompt(
@@ -379,8 +380,8 @@ Is this search result relevant to completing the subtask?"""
 
 def parse_relevance_response(
     response: str, explicit_reqs: List[str], logger: logging.Logger
-) -> Tuple[bool, str]:
-    """Parse LLM response and return relevance result."""
+) -> Tuple[bool, str, str]:
+    """Parse LLM response and return relevance result with summary."""
     json_text = extract_json_from_text(response)
     result_data = json.loads(json_text)
 
@@ -388,6 +389,7 @@ def parse_relevance_response(
     reasoning = result_data.get('reasoning', 'No reasoning provided')
     confidence = result_data.get('confidence', 0.5)
     explicit_reqs_satisfied = result_data.get('explicit_requirements_satisfied', [])
+    summary = result_data.get('summary', '')
 
     # Log explicit requirements satisfaction
     if explicit_reqs:
@@ -402,8 +404,10 @@ def parse_relevance_response(
         f'Relevance check: {is_relevant} (confidence: {confidence:.2f}). '
         f'Reasoning: {reasoning}'
     )
+    if summary:
+        logger.debug(f'Summary extracted: {len(summary)} characters')
 
-    return is_relevant, reasoning
+    return is_relevant, reasoning, summary
 
 
 def extract_arxiv_metadata_safely(
@@ -504,7 +508,7 @@ class RelevanceChecker:
             image_analysis: Optional visual LLM analysis of images from PDF.
 
         Returns:
-            Tuple of (is_relevant: bool, reasoning: str)
+            Tuple of (is_relevant: bool, reasoning: str, summary: str)
         """
         self.logger.info(
             f'Search result: Title: {search_result.title},\n '
@@ -599,7 +603,7 @@ Source Authority Information:
                 f'Failed to determine relevance using LLM: {e}. '
                 f'Defaulting to relevant=True.'
             )
-            return True, 'LLM check failed, assuming relevant'
+            return True, 'LLM check failed, assuming relevant', ''
 
     def check_relevance_batch(
         self,

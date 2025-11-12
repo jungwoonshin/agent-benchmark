@@ -59,40 +59,13 @@ Core rules:
 - Clear data flow: retrieval steps state what they fetch and from where; dependent steps state which prior step they use and how. No forward references.
 - Preserve any required units and formats in the final output.
 
-Tooling:
-- search: Use for information retrieval (web, archives, databases, files, PDFs). The system handles relevance, navigation, downloads, and PDF text extraction.
-- read_attachment: Use for extracting information from already-downloaded files.
-- llm_reasoning: Use for computation/analysis after retrieval.
-- Prefer API tools when applicable (github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, arxiv_api, wayback_api, google_maps_api). Do NOT use browser_navigate.
-
-Search-first rule:
-- If specialized knowledge is involved (programming syntax, standards, domain-specific concepts, historical/factual/current info), create step_1: search to retrieve authoritative info, then step_2: llm_reasoning to apply it.
+IMPORTANT: Do NOT include tool calls, parameters, or search_queries in your response. Only generate subtask descriptions and dependencies. Tool calls will be added later based on requirements.
 
 Subtasks schema:
 - id: sequential step_1, step_2, ...
-- description: self-contained instruction including action, purpose, specific data to find/process (entities/dates), constraints, expected output.
-- tool: one of llm_reasoning, search, read_attachment, analyze_media, github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, arxiv_api, wayback_api, google_maps_api.
-- parameters: REQUIRED for API tools. MUST be a list of dicts, each with "function" (API method name) and "parameters" (dict with method parameters).
-  - Single API call: [{"function": "method_name", "parameters": {...}}]
-  - Multiple chained API calls: [{"function": "method1", "parameters": {...}}, {"function": "method2", "parameters": {...}}]
-  - For Wikipedia with year requirements: [{"function": "get_page_revisions", "parameters": {"title": "...", "start_date": "YYYY-01-01", "end_date": "YYYY-12-31", "limit": 1}}, {"function": "get_page", "parameters": {"title": "...", "revision_id": "<from previous call>"}}]
-  - CRITICAL: Always use list format, even for single API calls. Each dict must have "function" and "parameters" keys.
-- search_queries: ONLY for 'search'. Exactly 3 queries:
-  - Complexity: simple, normal, complex (in this order)
-  - Format: keyword-only, 3–5 words, no verbs/action words/descriptions/unnecessary words; separate with spaces; for research add "pdf"
-  - Keyword selection: include source/domain, topic, dates; use broad terms; do not add action words (count/find/get/retrieve/search/list) or measurement terms (number/total/amount) unless intrinsic to the topic; focus on what to search for (entities/topics/sources), not what to do with results
+- description: self-contained instruction including action, purpose, specific data to find/process (entities/dates), constraints, expected output. The description should clearly indicate what type of operation is needed (search, API call, computation, file reading, etc.) without explicitly naming tools.
 - dependencies: list of prior step IDs; [] if none
 - parallelizable: boolean
-
-API methods (reference):
-- github_api: search_issues, get_issue, get_repository_commit, get_repository_contents
-- wikipedia_api: get_page, search_pages, get_page_revisions
-- youtube_api: get_video_info, search_videos
-- twitter_api: get_user_tweets
-- reddit_api: get_user_posts, search_posts
-- arxiv_api: get_metadata
-- wayback_api: get_archived_url
-- google_maps_api: get_place_details, get_street_view_image
 
 Return: JSON object with 'subtasks' only."""
 
@@ -108,8 +81,7 @@ Return: JSON object with 'subtasks' only."""
                 )
             retry_context += 'Create an IMPROVED plan that addresses these issues. CRITICAL REQUIREMENTS:\n'
             retry_context += "1. Each subtask description must be COMPLETE and SELF-CONTAINED, including what to do, why it's needed, what specific information/data to find/process, constraints, and expected output.\n"
-            retry_context += "2. Each subtask with tool='search' MUST include a search_queries array with exactly 3 different search queries in KEYWORD-ONLY format (3-8 keywords each, no verbs, no action words, no descriptive phrases), ordered by complexity: simple (minimal keywords), normal (standard terms), complex (additional qualifiers). Use general, broad keywords rather than overly specific terms. CRITICAL: Do NOT add action words (count, find, get, retrieve, search, list, etc.) or measurement terms (number, total, amount, etc.) unless they are core to the topic itself. Focus on WHAT to search for (entities, topics, sources), not WHAT to do with the results. The search tool will automatically navigate and extract from archives.\n"
-            retry_context += '3. Each subtask with an API tool (github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, arxiv_api, wayback_api, google_maps_api) MUST include a \'parameters\' field as a LIST of dicts. Each dict must have "function" (method name) and "parameters" (method parameters). For single API calls: [{"function": "method_name", "parameters": {...}}]. For chained calls: [{"function": "method1", "parameters": {...}}, {"function": "method2", "parameters": {...}}]. For Wikipedia with year requirement: [{"function": "get_page_revisions", "parameters": {"title": "Page Title", "start_date": "2022-01-01", "end_date": "2022-12-31", "limit": 1}}, {"function": "get_page", "parameters": {"title": "Page Title", "revision_id": "<from previous call>"}}].\n'
+            retry_context += '2. Do NOT include tool calls, parameters, or search_queries. Only provide descriptions and dependencies. Tool calls will be added later based on requirements.\n'
 
         # Extract step classifications if available
         step_classifications_info = ''
@@ -165,9 +137,9 @@ Problem Classification:
 {step_classifications_info}
 {general_requirements_info}
 
-Before planning, check if specialized knowledge is required (programming syntax/standards, domain concepts, historical/factual/current info). If yes, make step_1 a 'search' subtask to retrieve authoritative info, then add an 'llm_reasoning' subtask to apply it.
-
 Each subtask description must be self-contained and include: action, purpose, specific data to find/process (entities/dates), constraints, expected output. Maintain data flow: retrieval steps state what they fetch and from where; dependent steps cite which prior step they use and how; list dependencies; no forward references. Incorporate relevant details from the problem, analysis, and classification.
+
+IMPORTANT: Do NOT include tool names, parameters, or search_queries in your response. Only provide subtask descriptions and dependencies. Tool calls will be determined later based on requirements.
 
 Generate the smallest correct plan."""
 
@@ -188,157 +160,14 @@ Generate the smallest correct plan."""
                     description=task_data.get('description', ''),
                     dependencies=task_data.get('dependencies', []),
                 )
-                # Extract search_queries from LLM response (prefer new format, fallback to old)
-                search_queries = task_data.get('search_queries', [])
-                tool_type = task_data.get('tool', 'unknown')
-
-                # Handle backward compatibility: if search_query (singular) exists, convert to array
-                if not search_queries:
-                    old_search_query = task_data.get('search_query', '')
-                    if old_search_query:
-                        search_queries = [old_search_query]
-                        self.logger.debug(
-                            f'Subtask {task_data.get("id", f"step_{i}")} uses old search_query format. '
-                            f'Converted to search_queries array with 1 query.'
-                        )
-
-                # Only warn if it's a search tool without search queries
-                if tool_type == 'search' and not search_queries:
-                    self.logger.warning(
-                        f'Subtask {task_data.get("id", f"step_{i}")} uses search tool but missing search_queries. '
-                        f'Using description as fallback for single query.'
-                    )
-                    search_queries = [task_data.get('description', '')]
-
-                # Ensure we have exactly 3 queries for search tools
-                if tool_type == 'search' and len(search_queries) < 3:
-                    # If we have fewer than 3, duplicate the last one to reach 3
-                    while len(search_queries) < 3:
-                        search_queries.append(
-                            search_queries[-1]
-                            if search_queries
-                            else task_data.get('description', '')
-                        )
-                    self.logger.warning(
-                        f'Subtask {task_data.get("id", f"step_{i}")} has only {len([q for q in search_queries if q])} unique search queries. '
-                        f'Padded to 3 queries.'
-                    )
-                elif tool_type == 'search' and len(search_queries) > 3:
-                    # If we have more than 3, take the first 3
-                    search_queries = search_queries[:3]
-                    self.logger.debug(
-                        f'Subtask {task_data.get("id", f"step_{i}")} has {len(search_queries)} search queries. '
-                        f'Using first 3.'
-                    )
-
-                # Extract parameters
-                parameters = task_data.get('parameters', {})
-
-                # Normalize API tool parameters to list format
-                if tool_type.endswith('_api'):
-                    if not parameters:
-                        self.logger.warning(
-                            f'Subtask {task_data.get("id", f"step_{i}")} uses API tool {tool_type} but missing parameters. '
-                            f'Parameters will need to be determined during execution.'
-                        )
-                    elif isinstance(parameters, dict):
-                        # Convert single API call dict to list format
-                        if 'method' in parameters:
-                            # Old format: {"method": "...", ...params}
-                            method = parameters.pop('method')
-                            params = parameters
-                            parameters = [{'function': method, 'parameters': params}]
-                            self.logger.debug(
-                                f'Converted single API call to list format: {method}'
-                            )
-                        elif 'function' in parameters:
-                            # Already has function, wrap in list
-                            parameters = [parameters]
-                            self.logger.debug(
-                                'Wrapped API call with function in list format'
-                            )
-                        else:
-                            # No method/function, try to infer or keep as-is (will be handled later)
-                            self.logger.warning(
-                                f'Subtask {task_data.get("id", f"step_{i}")} API tool parameters missing "function" or "method". '
-                                f'Will attempt to infer during execution. Parameters: {parameters}'
-                            )
-                            # Wrap in list format anyway
-                            parameters = [{'function': None, 'parameters': parameters}]
-                    elif isinstance(parameters, list):
-                        # List format - validate and normalize each call
-                        normalized_list = []
-                        for call_idx, call_spec in enumerate(parameters, 1):
-                            if not isinstance(call_spec, dict):
-                                self.logger.warning(
-                                    f'Subtask {task_data.get("id", f"step_{i}")} API call {call_idx} is not a dict: {call_spec}'
-                                )
-                                normalized_list.append(call_spec)
-                                continue
-
-                            # Normalize to {function, parameters} format
-                            if 'function' in call_spec:
-                                # Already in correct format
-                                if 'parameters' not in call_spec:
-                                    # Move all other keys to parameters
-                                    func = call_spec['function']
-                                    params = {
-                                        k: v
-                                        for k, v in call_spec.items()
-                                        if k != 'function'
-                                    }
-                                    normalized_list.append(
-                                        {'function': func, 'parameters': params}
-                                    )
-                                else:
-                                    normalized_list.append(call_spec)
-                            elif 'method' in call_spec:
-                                # Convert method to function
-                                method = call_spec['method']
-                                if 'parameters' in call_spec:
-                                    normalized_list.append(
-                                        {
-                                            'function': method,
-                                            'parameters': call_spec['parameters'],
-                                        }
-                                    )
-                                else:
-                                    # Move all other keys to parameters
-                                    params = {
-                                        k: v
-                                        for k, v in call_spec.items()
-                                        if k != 'method'
-                                    }
-                                    normalized_list.append(
-                                        {'function': method, 'parameters': params}
-                                    )
-                            else:
-                                # No function/method - will need to infer
-                                self.logger.warning(
-                                    f'Subtask {task_data.get("id", f"step_{i}")} API call {call_idx} missing "function" or "method". '
-                                    f'Will attempt to infer during execution.'
-                                )
-                                normalized_list.append(
-                                    {'function': None, 'parameters': call_spec}
-                                )
-                        parameters = normalized_list
-
+                # Initialize metadata without tool calls - these will be added later
                 subtask.metadata = {
-                    'tool': task_data.get('tool', 'unknown'),
                     'parallelizable': task_data.get('parallelizable', False),
-                    'parameters': parameters,
-                    'search_queries': search_queries,  # Store LLM-generated search queries (array of 3)
                 }
                 subtasks.append(subtask)
                 self.state_manager.add_subtask(subtask)
-                queries_preview = (
-                    ', '.join([f'"{q[:30]}..."' for q in search_queries[:3]])
-                    if search_queries
-                    else 'none'
-                )
                 self.logger.debug(
-                    f'Created subtask {subtask.id}: tool={subtask.metadata.get("tool")}, '
-                    f'search_queries=[{queries_preview}]'
+                    f'Created subtask {subtask.id}: {subtask.description[:100]}...'
                 )
 
             # Note: Step-tagged requirements validation is skipped at planning time
@@ -355,8 +184,192 @@ Generate the smallest correct plan."""
                 description='Analyze problem and determine approach',
                 dependencies=[],
             )
-            fallback_subtask.metadata = {'tool': 'unknown', 'parallelizable': False}
+            fallback_subtask.metadata = {'parallelizable': False}
             return [fallback_subtask]
         except Exception as e:
             self.logger.error(f'Plan creation failed: {e}', exc_info=True)
             raise
+
+    def append_tool_calls_to_subtasks(
+        self,
+        subtasks: List[Subtask],
+        problem: str,
+        query_analysis: Dict[str, Any],
+    ) -> List[Subtask]:
+        """
+        Append tool calls, parameters, and search_queries to subtasks based on
+        external requirements and subtask descriptions.
+
+        Args:
+            subtasks: List of subtasks without tool calls.
+            problem: The problem description.
+            query_analysis: Query analysis with external requirements.
+
+        Returns:
+            List of subtasks with tool calls appended.
+        """
+        self.logger.info('Appending tool calls to subtasks based on requirements')
+
+        # Get requirements for each step
+        explicit_requirements = query_analysis.get('explicit_requirements', [])
+        step_requirements = {}
+        general_requirements = []
+
+        for req in explicit_requirements:
+            req_str = str(req)
+            if req_str.startswith('Step '):
+                # Extract step number
+                parts = req_str.split(':', 1)
+                if len(parts) == 2:
+                    step_part = parts[0].strip()
+                    req_text = parts[1].strip()
+                    # Extract step number (e.g., "Step 1" -> "step_1")
+                    step_num = step_part.replace('Step', '').strip()
+                    step_id = f'step_{step_num}'
+                    if step_id not in step_requirements:
+                        step_requirements[step_id] = []
+                    step_requirements[step_id].append(req_text)
+            else:
+                general_requirements.append(req_str)
+
+        system_prompt = """You are an expert at determining appropriate tools and parameters for subtasks.
+
+Given a subtask description and requirements, determine:
+1. The appropriate tool to use
+2. Tool parameters (if needed)
+3. Search queries (if using search tool)
+
+Available tools:
+- search: For information retrieval (web, archives, databases, files, PDFs)
+- read_attachment: For extracting information from already-downloaded files
+- llm_reasoning: For computation/analysis after retrieval
+- github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, arxiv_api, wayback_api, google_maps_api: For API-based information retrieval
+
+For search tool:
+- Generate exactly 3 search queries in KEYWORD-ONLY format (3-8 keywords each)
+- No verbs, action words, or descriptive phrases
+- Ordered by complexity: simple, normal, complex
+- Include source/domain, topic, dates when relevant
+- For research add "pdf"
+
+For API tools:
+- Provide parameters as a LIST of dicts
+- Each dict: {"function": "method_name", "parameters": {...}}
+- For chained calls: [{"function": "method1", "parameters": {...}}, {"function": "method2", "parameters": {...}}]
+- Use "<from previous call>" placeholder for values from previous calls in chain
+
+Return JSON with:
+- tool: tool name
+- parameters: dict or list (for API tools)
+- search_queries: list of 3 queries (only for search tool)"""
+
+        for subtask in subtasks:
+            # Get requirements for this specific step
+            step_reqs = step_requirements.get(subtask.id, [])
+            all_reqs = step_reqs + general_requirements
+
+            requirements_context = ''
+            if all_reqs:
+                requirements_context = '\n\nRequirements for this subtask:\n'
+                for req in all_reqs:
+                    requirements_context += f'  - {req}\n'
+
+            user_prompt = f"""Problem: {problem}
+
+Subtask ID: {subtask.id}
+Subtask Description: {subtask.description}
+Dependencies: {subtask.dependencies}
+{requirements_context}
+
+Determine the appropriate tool, parameters, and search queries (if applicable) for this subtask."""
+
+            try:
+                response = self.llm_service.call_with_system_prompt(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    temperature=0.3,  # Lower temperature for consistent tool selection
+                    response_format={'type': 'json_object'},
+                )
+                json_text = extract_json_from_text(response)
+                tool_data = json.loads(json_text)
+
+                tool_name = tool_data.get('tool', 'unknown')
+                parameters = tool_data.get('parameters', {})
+                search_queries = tool_data.get('search_queries', [])
+
+                # Normalize search_queries
+                if tool_name == 'search':
+                    if not search_queries:
+                        # Fallback: use subtask description
+                        search_queries = [subtask.description]
+                    # Ensure exactly 3 queries
+                    while len(search_queries) < 3:
+                        search_queries.append(
+                            search_queries[-1]
+                            if search_queries
+                            else subtask.description
+                        )
+                    if len(search_queries) > 3:
+                        search_queries = search_queries[:3]
+
+                # Normalize API tool parameters to list format
+                if tool_name.endswith('_api'):
+                    if not parameters:
+                        self.logger.warning(
+                            f'Subtask {subtask.id} uses API tool {tool_name} but missing parameters.'
+                        )
+                        parameters = []
+                    elif isinstance(parameters, dict):
+                        # Convert single API call dict to list format
+                        if 'function' in parameters:
+                            parameters = [parameters]
+                        elif 'method' in parameters:
+                            method = parameters.pop('method')
+                            params = parameters
+                            parameters = [{'function': method, 'parameters': params}]
+                        else:
+                            # No function/method, wrap as-is
+                            parameters = [{'function': None, 'parameters': parameters}]
+                    elif isinstance(parameters, list):
+                        # Validate list format
+                        normalized_list = []
+                        for call_spec in parameters:
+                            if isinstance(call_spec, dict):
+                                if (
+                                    'function' not in call_spec
+                                    and 'method' in call_spec
+                                ):
+                                    # Convert method to function
+                                    method = call_spec.pop('method')
+                                    params = call_spec
+                                    normalized_list.append(
+                                        {'function': method, 'parameters': params}
+                                    )
+                                else:
+                                    normalized_list.append(call_spec)
+                            else:
+                                normalized_list.append(call_spec)
+                        parameters = normalized_list
+
+                # Append to subtask metadata
+                subtask.metadata['tool'] = tool_name
+                if parameters:
+                    subtask.metadata['parameters'] = parameters
+                if search_queries:
+                    subtask.metadata['search_queries'] = search_queries
+
+                self.logger.info(
+                    f'Appended tool calls to {subtask.id}: tool={tool_name}, '
+                    f'has_parameters={bool(parameters)}, '
+                    f'has_search_queries={bool(search_queries)}'
+                )
+
+            except Exception as e:
+                self.logger.error(
+                    f'Failed to append tool calls to {subtask.id}: {e}', exc_info=True
+                )
+                # Fallback: set unknown tool
+                subtask.metadata['tool'] = 'unknown'
+
+        self.logger.info('Finished appending tool calls to all subtasks')
+        return subtasks

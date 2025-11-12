@@ -136,6 +136,15 @@ class Agent:
                 f'Query analysis structure: {json.dumps(query_analysis, indent=2)[:500]}...'
             )
 
+            # Step 3.5: Append tool calls to subtasks based on external requirements
+            self.logger.info('=== Phase 3.5: APPEND TOOL CALLS ===')
+            plan = self.planner.append_tool_calls_to_subtasks(
+                plan, problem, query_analysis
+            )
+            self.logger.info(
+                f'Tool calls appended to {len(plan)} subtasks based on requirements'
+            )
+
             # Step 4: EXECUTE - Run tool operations
             self.logger.info('=== Phase 4: EXECUTE ===')
             execution_results = self.executor.execute_plan(
@@ -272,6 +281,19 @@ class Agent:
                             if improved_plan:
                                 self.logger.info(
                                     f'Improved plan created with {len(improved_plan)} subtasks'
+                                )
+
+                                # Append tool calls to improved plan
+                                self.logger.info(
+                                    '=== Phase 3.5 (RETRY): APPEND TOOL CALLS ==='
+                                )
+                                improved_plan = (
+                                    self.planner.append_tool_calls_to_subtasks(
+                                        improved_plan, problem, query_analysis
+                                    )
+                                )
+                                self.logger.info(
+                                    f'Tool calls appended to {len(improved_plan)} subtasks'
                                 )
 
                                 # Execute the new plan
