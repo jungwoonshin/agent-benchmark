@@ -247,9 +247,11 @@ Available tools:
 
 For search tool:
 - Generate exactly 3 search queries in KEYWORD-ONLY format (3-8 keywords each)
-- No verbs, action words, or descriptive phrases
+- NO action verbs: exclude "count", "find", "search", "get", "retrieve", "list", "show", "calculate", "analyze", "compare", "determine"
+- NO task descriptors: exclude "how many", "number of", "total", "statistics about", "information on"
+- NO question words: exclude "what", "where", "when", "how", "why", "which"
+- ONLY include: source/domain names, specific topics, entities, dates, document types
 - Ordered by complexity: simple, normal, complex
-- Include source/domain, topic, dates when relevant
 - For research add "pdf"
 
 For API tools:
