@@ -884,22 +884,8 @@ class Executor:
                 previous_results['last_result'] = result
                 previous_results['last_method'] = method
 
-                # For Wikipedia get_page_revisions, extract revision_id for next call
-                if (
-                    api_name == 'wikipedia'
-                    and method == 'get_page_revisions'
-                    and isinstance(result, list)
-                    and len(result) > 0
-                ):
-                    # Get the first revision (most recent in the date range)
-                    first_rev = result[0]
-                    if isinstance(first_rev, dict):
-                        rev_id = first_rev.get('revid') or first_rev.get('revision_id')
-                        if rev_id:
-                            previous_results['revision_id'] = rev_id
-                            self.logger.info(
-                                f'Extracted revision_id {rev_id} from get_page_revisions result'
-                            )
+                # Extract common fields from result for use in subsequent calls
+                self._extract_common_fields(result, previous_results)
 
                 self.logger.info(f'API call {idx}/{len(api_calls)} succeeded')
 
@@ -932,6 +918,67 @@ class Executor:
             'all_results': previous_results,
         }
 
+    def _extract_common_fields(
+        self,
+        result: Any,
+        previous_results: Dict[str, Any],
+    ) -> None:
+        """
+        Extract common fields from API result for use in subsequent calls.
+
+        This method automatically extracts commonly used fields from API results
+        and stores them in previous_results for use in chained API calls.
+
+        Args:
+            result: The API result to extract fields from
+            previous_results: Dict to store extracted fields
+        """
+        if isinstance(result, list) and len(result) > 0:
+            # If result is a list, extract from first item
+            first_item = result[0]
+            if isinstance(first_item, dict):
+                # Extract common ID fields
+                for field_name in [
+                    'revid',
+                    'revision_id',
+                    'id',
+                    'identifier',
+                    'rev_id',
+                ]:
+                    if field_name in first_item:
+                        value = first_item[field_name]
+                        # Validate: must not be None, empty string, or empty value
+                        if value is not None and value != '' and value != []:
+                            # Store with both specific and generic names
+                            previous_results[field_name] = value
+                            # Also store as generic 'id' if it's a common identifier
+                            if field_name in ['revid', 'revision_id', 'rev_id']:
+                                previous_results['revision_id'] = value
+                            self.logger.debug(
+                                f'Extracted {field_name}={value} from result for use in subsequent calls'
+                            )
+        elif isinstance(result, dict):
+            # Extract common fields directly from dict result
+            for field_name in [
+                'revid',
+                'revision_id',
+                'id',
+                'identifier',
+                'rev_id',
+                'revision',
+            ]:
+                if field_name in result:
+                    value = result[field_name]
+                    # Validate: must not be None, empty string, or empty value
+                    if value is not None and value != '' and value != []:
+                        previous_results[field_name] = value
+                        # Also store as generic 'id' if it's a common identifier
+                        if field_name in ['revid', 'revision_id', 'rev_id', 'revision']:
+                            previous_results['revision_id'] = value
+                        self.logger.debug(
+                            f'Extracted {field_name}={value} from result for use in subsequent calls'
+                        )
+
     def _resolve_parameter_placeholders(
         self,
         params: Dict[str, Any],
@@ -941,6 +988,11 @@ class Executor:
     ) -> Dict[str, Any]:
         """
         Resolve parameter placeholders using results from previous API calls.
+
+        Supports general placeholders:
+        - "<from previous call>" or "<field_name>" - extracts field from previous results
+        - "<last_result>" - uses the entire last result
+        - "<last_result[0].field>" - extracts nested field from last result
 
         Args:
             params: Parameters dict that may contain placeholders
@@ -953,42 +1005,308 @@ class Executor:
         """
         resolved = {}
         for key, value in params.items():
-            if isinstance(value, str):
-                # Check for placeholders like "<from previous call>" or "<revision_id>"
-                if value == '<from previous call>' or value == '<revision_id>':
-                    # Try to get revision_id from previous results
-                    rev_id = previous_results.get('revision_id')
-                    if rev_id:
-                        resolved[key] = rev_id
-                        self.logger.debug(
-                            f'Resolved {key} placeholder to revision_id: {rev_id}'
-                        )
-                    else:
-                        # Try to extract from last result
-                        last_result = previous_results.get('last_result')
-                        if isinstance(last_result, list) and len(last_result) > 0:
-                            first_item = last_result[0]
-                            if isinstance(first_item, dict):
-                                rev_id = first_item.get('revid') or first_item.get(
-                                    'revision_id'
-                                )
-                                if rev_id:
-                                    resolved[key] = rev_id
-                                    self.logger.debug(
-                                        f'Resolved {key} placeholder to revision_id: {rev_id}'
-                                    )
-                                    continue
-                        # If we can't resolve, keep the placeholder (will likely cause an error)
-                        resolved[key] = value
-                        self.logger.warning(
-                            f'Could not resolve placeholder {key}={value}'
-                        )
+            if isinstance(value, str) and value.startswith('<') and value.endswith('>'):
+                # This is a placeholder
+                placeholder = value[1:-1].strip()  # Remove < and >
+
+                # Try to resolve the placeholder
+                resolved_value = self._resolve_single_placeholder(
+                    placeholder, previous_results, key
+                )
+
+                if resolved_value is not None:
+                    resolved[key] = resolved_value
+                    self.logger.debug(
+                        f'Resolved {key} placeholder "{value}" to: {resolved_value}'
+                    )
                 else:
-                    resolved[key] = value
+                    # If we can't resolve, skip this parameter to avoid passing invalid value
+                    self.logger.warning(
+                        f'Could not resolve placeholder {key}={value}, skipping parameter'
+                    )
+                    continue
             else:
                 resolved[key] = value
 
         return resolved
+
+    def _resolve_single_placeholder(
+        self,
+        placeholder: str,
+        previous_results: Dict[str, Any],
+        param_name: str,
+    ) -> Any:
+        """
+        Resolve a single placeholder string to a value from previous results.
+
+        Supports general placeholders:
+        - Direct key lookup: "<field_name>" - looks for field_name in previous_results
+        - Step-specific: "<field_name_from_step_N>" - looks for field_name_from_step_N in previous_results
+        - Generic: "<from previous call>" - tries to infer field from parameter name
+        - Nested: "<last_result[0].field>" - extracts nested field from last result
+
+        Args:
+            placeholder: The placeholder text (without < >)
+            previous_results: Results from previous API calls and previous subtasks
+            param_name: Name of the parameter (for context)
+
+        Returns:
+            Resolved value or None if cannot be resolved
+        """
+        # Direct key lookup (handles both generic and step-specific keys)
+        if placeholder in previous_results:
+            value = previous_results[placeholder]
+            # Convert to appropriate type if needed
+            return self._convert_value_for_parameter(value, param_name)
+
+        # Handle step-specific placeholders (e.g., "revision_id_from_step_1")
+        # This pattern is already handled by direct lookup above, but we can also
+        # try to extract from the step result if the key doesn't exist
+        if '_from_' in placeholder:
+            # Try to extract step number and field name
+            # Format: "field_name_from_step_N" or "field_name_from_stepN"
+            parts = placeholder.split('_from_')
+            if len(parts) == 2:
+                field_name = parts[0]
+                step_ref = parts[1]
+
+                # Try to find the step result and extract the field
+                if step_ref in previous_results:
+                    step_result = previous_results[step_ref]
+                    # Extract field from step result
+                    extracted = self._extract_field_from_any_structure(
+                        step_result, field_name
+                    )
+                    if extracted is not None:
+                        return self._convert_value_for_parameter(extracted, param_name)
+
+        # Special cases
+        if placeholder == 'from previous call':
+            # Try common field names based on parameter name
+            if 'revision' in param_name.lower() or 'rev' in param_name.lower():
+                # Try to find revision_id
+                for field in ['revision_id', 'revid', 'rev_id']:
+                    if field in previous_results:
+                        return self._convert_value_for_parameter(
+                            previous_results[field], param_name
+                        )
+                # Try to extract from last_result
+                return self._extract_from_last_result(
+                    previous_results, ['revid', 'revision_id', 'rev_id'], param_name
+                )
+            else:
+                # Generic: try to extract from last_result
+                last_result = previous_results.get('last_result')
+                if last_result is not None:
+                    return last_result
+
+        # Try nested extraction: "last_result[0].field"
+        if placeholder.startswith('last_result'):
+            return self._extract_nested_value(placeholder, previous_results, param_name)
+
+        # Try to extract from last_result with field name
+        if placeholder in ['id', 'identifier', 'revision_id', 'revid']:
+            return self._extract_from_last_result(
+                previous_results, [placeholder], param_name
+            )
+
+        return None
+
+    def _extract_field_from_any_structure(
+        self,
+        data: Any,
+        field_name: str,
+    ) -> Any:
+        """
+        Extract a field from any data structure (dict, list, API response, etc.).
+
+        This is a general method that works for any field name without hardcoding
+        specific field variations.
+
+        Args:
+            data: The data structure to extract from
+            field_name: Name of the field to extract (supports dot notation for nested fields)
+
+        Returns:
+            Extracted value or None
+        """
+        # Handle API response structure: {'success': True, 'data': {...}}
+        if isinstance(data, dict) and 'data' in data:
+            data = data['data']
+
+        # Handle dot notation for nested fields (e.g., "user.id")
+        if '.' in field_name:
+            parts = field_name.split('.')
+            current = data
+            for part in parts:
+                if isinstance(current, dict) and part in current:
+                    current = current[part]
+                elif isinstance(current, list) and len(current) > 0:
+                    # Try first item in list
+                    if isinstance(current[0], dict) and part in current[0]:
+                        current = current[0][part]
+                    else:
+                        return None
+                else:
+                    return None
+            return current
+
+        # If data is a list, check first item
+        if isinstance(data, list) and len(data) > 0:
+            first_item = data[0]
+            if isinstance(first_item, dict):
+                # Try exact match first
+                if field_name in first_item:
+                    return first_item[field_name]
+                # Try case-insensitive match
+                for key in first_item.keys():
+                    if key.lower() == field_name.lower():
+                        return first_item[key]
+
+        # If data is a dict, check directly
+        if isinstance(data, dict):
+            # Try exact match first
+            if field_name in data:
+                return data[field_name]
+            # Try case-insensitive match
+            for key in data.keys():
+                if key.lower() == field_name.lower():
+                    return data[key]
+
+        return None
+
+    def _extract_from_last_result(
+        self,
+        previous_results: Dict[str, Any],
+        field_names: List[str],
+        param_name: str,
+    ) -> Any:
+        """
+        Extract a field from the last_result in previous_results.
+
+        Args:
+            previous_results: Results from previous API calls
+            field_names: List of field names to try
+            param_name: Name of the parameter (for context)
+
+        Returns:
+            Extracted value or None
+        """
+        last_result = previous_results.get('last_result')
+        if last_result is None:
+            return None
+
+        # If last_result is a list, check first item
+        if isinstance(last_result, list) and len(last_result) > 0:
+            first_item = last_result[0]
+            if isinstance(first_item, dict):
+                for field_name in field_names:
+                    if field_name in first_item:
+                        value = first_item[field_name]
+                        return self._convert_value_for_parameter(value, param_name)
+
+        # If last_result is a dict, check directly
+        if isinstance(last_result, dict):
+            for field_name in field_names:
+                if field_name in last_result:
+                    value = last_result[field_name]
+                    return self._convert_value_for_parameter(value, param_name)
+
+        return None
+
+    def _extract_nested_value(
+        self,
+        placeholder: str,
+        previous_results: Dict[str, Any],
+        param_name: str,
+    ) -> Any:
+        """
+        Extract a nested value from previous results using dot notation.
+
+        Args:
+            placeholder: Placeholder like "last_result[0].revid"
+            previous_results: Results from previous API calls
+            param_name: Name of the parameter (for context)
+
+        Returns:
+            Extracted value or None
+        """
+        try:
+            # Parse "last_result[0].field" or "last_result.field"
+            parts = placeholder.replace('[', '.').replace(']', '').split('.')
+            if parts[0] == 'last_result':
+                last_result = previous_results.get('last_result')
+                if last_result is None:
+                    return None
+
+                # Navigate through the structure
+                current = last_result
+                for part in parts[1:]:
+                    if part.isdigit():
+                        # Array index
+                        idx = int(part)
+                        if isinstance(current, list) and 0 <= idx < len(current):
+                            current = current[idx]
+                        else:
+                            return None
+                    else:
+                        # Dict key
+                        if isinstance(current, dict):
+                            current = current.get(part)
+                            if current is None:
+                                return None
+                        else:
+                            return None
+
+                return self._convert_value_for_parameter(current, param_name)
+        except Exception as e:
+            self.logger.debug(f'Error extracting nested value {placeholder}: {e}')
+            return None
+
+    def _convert_value_for_parameter(self, value: Any, param_name: str) -> Any:
+        """
+        Convert a value to the appropriate type for a parameter.
+
+        Args:
+            value: The value to convert
+            param_name: Name of the parameter (for type hints)
+
+        Returns:
+            Converted value, or None if value is invalid
+        """
+        if value is None:
+            return None
+
+        # Reject empty strings and empty collections
+        if value == '' or value == []:
+            self.logger.warning(
+                f'Empty value encountered for parameter {param_name}, returning None'
+            )
+            return None
+
+        # If parameter name suggests it should be an integer, try to convert
+        if any(
+            keyword in param_name.lower()
+            for keyword in ['id', 'number', 'count', 'index']
+        ):
+            try:
+                converted = int(value)
+                # Ensure it's a valid positive integer (IDs should be positive)
+                if converted > 0:
+                    return converted
+                else:
+                    self.logger.warning(
+                        f'Invalid ID value {converted} for parameter {param_name}, returning None'
+                    )
+                    return None
+            except (ValueError, TypeError):
+                # If conversion fails, log and return None instead of original value
+                self.logger.warning(
+                    f'Could not convert value {value} to integer for parameter {param_name}, returning None'
+                )
+                return None
+
+        return value
 
     def _format_and_store_result(
         self, subtask: Subtask, result: Any, state_before: Dict[str, Any]
@@ -1221,274 +1539,6 @@ class Executor:
 
             self.logger.error(f'Subtask execution failed: {e}', exc_info=True)
             raise
-
-    def _serialize_result_for_code(self, result: Any) -> Any:
-        """
-        Serialize result objects for use in LLM reasoning.
-
-        Converts SearchResult dataclass objects to dictionaries to avoid
-        iteration errors in RestrictedPython execution environment.
-
-        Args:
-            result: The result to serialize (can be dict, list, SearchResult, or other types)
-
-        Returns:
-            Serialized result with SearchResult objects converted to dictionaries
-        """
-        from ..models import SearchResult
-
-        # If result is a SearchResult object, convert to dict
-        if isinstance(result, SearchResult):
-            return {
-                'snippet': result.snippet,
-                'url': result.url,
-                'title': result.title,
-                'relevance_score': result.relevance_score,
-            }
-
-        # If result is a dictionary, recursively serialize values
-        if isinstance(result, dict):
-            serialized = {}
-            for key, value in result.items():
-                if isinstance(value, SearchResult):
-                    serialized[key] = {
-                        'snippet': value.snippet,
-                        'url': value.url,
-                        'title': value.title,
-                        'relevance_score': value.relevance_score,
-                    }
-                elif isinstance(value, list):
-                    # Recursively serialize list items
-                    serialized[key] = [
-                        self._serialize_result_for_code(item) for item in value
-                    ]
-                elif isinstance(value, dict):
-                    # Recursively serialize nested dictionaries
-                    serialized[key] = self._serialize_result_for_code(value)
-                else:
-                    serialized[key] = value
-            return serialized
-
-        # If result is a list, recursively serialize items
-        if isinstance(result, list):
-            return [self._serialize_result_for_code(item) for item in result]
-
-        # For other types (str, int, etc.), return as-is
-        return result
-
-    def _execute_code_with_retry(
-        self,
-        code: str,
-        context: Dict[str, Any],
-        problem: str,
-        subtask: Subtask,
-        max_retries: int = 10,
-    ) -> Any:
-        """
-        Execute code with automatic retry and error fixing.
-
-        Args:
-            code: Python code to execute
-            context: Context dictionary with variables
-            problem: Original problem description
-            subtask: Subtask being executed
-            max_retries: Maximum number of retry attempts
-
-        Returns:
-            Execution result (successful result or error dict)
-        """
-        retry_count = subtask.metadata.get('code_fix_retry_count', 0)
-        current_code = code
-        last_error = None
-
-        # Execute initial code
-        result = self.tool_belt.code_interpreter(current_code, context)
-
-        # Keep retrying until success or max retries reached
-        while retry_count < max_retries:
-            # Check if result is an error
-            is_error = ExecutionResultAnalyzer.is_error_result(result)
-
-            if not is_error:
-                # Success! Handle success and return
-                return self._handle_code_execution_success(result, retry_count, subtask)
-
-            # Error detected - extract error message and try to fix
-            error_reason = ExecutionResultAnalyzer.extract_error_message(result)
-            if error_reason is None:
-                error_reason = str(result)[:500]
-            last_error = error_reason[:500]
-
-            self.logger.warning(
-                f'Code execution failed (attempt {retry_count + 1}/{max_retries}): {error_reason}'
-            )
-
-            # Attempt to fix the code
-            fixed_code = self._fix_code_error(
-                current_code, error_reason, context, problem, subtask
-            )
-
-            if not fixed_code or fixed_code == current_code:
-                # Could not fix the code or fix didn't change anything
-                self.logger.warning(
-                    'Could not fix code error or fix produced identical code. Stopping retries.'
-                )
-                break
-
-            # Update retry count and metadata
-            retry_count += 1
-            self._update_code_retry_metadata(
-                subtask, code, retry_count, error_reason, fixed_code
-            )
-
-            self.logger.info(
-                f'Retrying code execution with fixed code (attempt {retry_count}/{max_retries})'
-            )
-
-            # Update current_code for next iteration
-            current_code = fixed_code
-
-            # Retry with fixed code
-            result = self.tool_belt.code_interpreter(fixed_code, context)
-
-        # Check if we still have an error after all retries
-        return self._handle_code_execution_failure(
-            result, last_error, retry_count, subtask
-        )
-
-    def _serialize_result_for_code(self, result: Any) -> Any:
-        """
-        Serialize result objects for use in LLM reasoning.
-
-        Converts SearchResult dataclass objects to dictionaries to avoid
-        iteration errors in RestrictedPython execution environment.
-
-        Args:
-            result: The result to serialize (can be dict, list, SearchResult, or other types)
-
-        Returns:
-            Serialized result with SearchResult objects converted to dictionaries
-        """
-        from ..models import SearchResult
-
-        # If result is a SearchResult object, convert to dict
-        if isinstance(result, SearchResult):
-            return {
-                'snippet': result.snippet,
-                'url': result.url,
-                'title': result.title,
-                'relevance_score': result.relevance_score,
-            }
-
-        # If result is a dictionary, recursively serialize values
-        if isinstance(result, dict):
-            serialized = {}
-            for key, value in result.items():
-                if isinstance(value, SearchResult):
-                    serialized[key] = {
-                        'snippet': value.snippet,
-                        'url': value.url,
-                        'title': value.title,
-                        'relevance_score': value.relevance_score,
-                    }
-                elif isinstance(value, list):
-                    # Recursively serialize list items
-                    serialized[key] = [
-                        self._serialize_result_for_code(item) for item in value
-                    ]
-                elif isinstance(value, dict):
-                    # Recursively serialize nested dictionaries
-                    serialized[key] = self._serialize_result_for_code(value)
-                else:
-                    serialized[key] = value
-            return serialized
-
-        # If result is a list, recursively serialize items
-        if isinstance(result, list):
-            return [self._serialize_result_for_code(item) for item in result]
-
-        # For other types (str, int, etc.), return as-is
-        return result
-
-    def _execute_code_with_retry(
-        self,
-        code: str,
-        context: Dict[str, Any],
-        problem: str,
-        subtask: Subtask,
-        max_retries: int = 10,
-    ) -> Any:
-        """
-        Execute code with automatic retry and error fixing.
-
-        Args:
-            code: Python code to execute
-            context: Context dictionary with variables
-            problem: Original problem description
-            subtask: Subtask being executed
-            max_retries: Maximum number of retry attempts
-
-        Returns:
-            Execution result (successful result or error dict)
-        """
-        retry_count = subtask.metadata.get('code_fix_retry_count', 0)
-        current_code = code
-        last_error = None
-
-        # Execute initial code
-        result = self.tool_belt.code_interpreter(current_code, context)
-
-        # Keep retrying until success or max retries reached
-        while retry_count < max_retries:
-            # Check if result is an error
-            is_error = ExecutionResultAnalyzer.is_error_result(result)
-
-            if not is_error:
-                # Success! Handle success and return
-                return self._handle_code_execution_success(result, retry_count, subtask)
-
-            # Error detected - extract error message and try to fix
-            error_reason = ExecutionResultAnalyzer.extract_error_message(result)
-            if error_reason is None:
-                error_reason = str(result)[:500]
-            last_error = error_reason[:500]
-
-            self.logger.warning(
-                f'Code execution failed (attempt {retry_count + 1}/{max_retries}): {error_reason}'
-            )
-
-            # Attempt to fix the code
-            fixed_code = self._fix_code_error(
-                current_code, error_reason, context, problem, subtask
-            )
-
-            if not fixed_code or fixed_code == current_code:
-                # Could not fix the code or fix didn't change anything
-                self.logger.warning(
-                    'Could not fix code error or fix produced identical code. Stopping retries.'
-                )
-                break
-
-            # Update retry count and metadata
-            retry_count += 1
-            self._update_code_retry_metadata(
-                subtask, code, retry_count, error_reason, fixed_code
-            )
-
-            self.logger.info(
-                f'Retrying code execution with fixed code (attempt {retry_count}/{max_retries})'
-            )
-
-            # Update current_code for next iteration
-            current_code = fixed_code
-
-            # Retry with fixed code
-            result = self.tool_belt.code_interpreter(fixed_code, context)
-
-        # Check if we still have an error after all retries
-        return self._handle_code_execution_failure(
-            result, last_error, retry_count, subtask
-        )
 
     def _serialize_result_for_code(self, result: Any) -> Any:
         """

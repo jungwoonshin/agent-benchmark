@@ -108,7 +108,7 @@ class GAIASolver:
         # Collect all tags to add (will be updated with correctness tag later if expected_answer is provided)
         tags = []
         if problem_number is not None:
-            tags.append(f'problem-{problem_number}')
+            tags.append(f'problem #{problem_number}')
         if additional_tags:
             tags.extend(additional_tags)
 

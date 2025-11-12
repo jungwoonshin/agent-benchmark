@@ -72,10 +72,11 @@ Subtasks schema:
 - id: sequential step_1, step_2, ...
 - description: self-contained instruction including action, purpose, specific data to find/process (entities/dates), constraints, expected output.
 - tool: one of llm_reasoning, search, read_attachment, analyze_media, github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, arxiv_api, wayback_api, google_maps_api.
-- parameters: REQUIRED for API tools. Can be either:
-  - Single API call: A dict with "method" (API method name) and all required/optional parameters
-  - Multiple API calls: A list of dicts, each with "function" (API method name) and "parameters" (dict with method parameters), OR each dict can directly contain "method" and parameters. Use this when you need to chain calls (e.g., get_page_revisions then get_page for Wikipedia with year requirements).
-  - For Wikipedia with year requirements: Use list format with [{"function": "get_page_revisions", "parameters": {"title": "...", "start_date": "YYYY-01-01", "end_date": "YYYY-12-31", "limit": 1}}, {"function": "get_page", "parameters": {"title": "...", "revision_id": "<from previous call>"}}]
+- parameters: REQUIRED for API tools. MUST be a list of dicts, each with "function" (API method name) and "parameters" (dict with method parameters).
+  - Single API call: [{"function": "method_name", "parameters": {...}}]
+  - Multiple chained API calls: [{"function": "method1", "parameters": {...}}, {"function": "method2", "parameters": {...}}]
+  - For Wikipedia with year requirements: [{"function": "get_page_revisions", "parameters": {"title": "...", "start_date": "YYYY-01-01", "end_date": "YYYY-12-31", "limit": 1}}, {"function": "get_page", "parameters": {"title": "...", "revision_id": "<from previous call>"}}]
+  - CRITICAL: Always use list format, even for single API calls. Each dict must have "function" and "parameters" keys.
 - search_queries: ONLY for 'search'. Exactly 3 queries:
   - Complexity: simple, normal, complex (in this order)
   - Format: keyword-only, 3–5 words, no verbs/action words/descriptions/unnecessary words; separate with spaces; for research add "pdf"
@@ -108,7 +109,7 @@ Return: JSON object with 'subtasks' only."""
             retry_context += 'Create an IMPROVED plan that addresses these issues. CRITICAL REQUIREMENTS:\n'
             retry_context += "1. Each subtask description must be COMPLETE and SELF-CONTAINED, including what to do, why it's needed, what specific information/data to find/process, constraints, and expected output.\n"
             retry_context += "2. Each subtask with tool='search' MUST include a search_queries array with exactly 3 different search queries in KEYWORD-ONLY format (3-8 keywords each, no verbs, no action words, no descriptive phrases), ordered by complexity: simple (minimal keywords), normal (standard terms), complex (additional qualifiers). Use general, broad keywords rather than overly specific terms. CRITICAL: Do NOT add action words (count, find, get, retrieve, search, list, etc.) or measurement terms (number, total, amount, etc.) unless they are core to the topic itself. Focus on WHAT to search for (entities, topics, sources), not WHAT to do with the results. The search tool will automatically navigate and extract from archives.\n"
-            retry_context += '3. Each subtask with an API tool (github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, arxiv_api, wayback_api, google_maps_api) MUST include a \'parameters\' field. For single API calls, use a dict with \'method\' and parameters. For chained calls (e.g., Wikipedia with year requirements), use a list of dicts, each with \'function\' (method name) and \'parameters\' (method parameters). For Wikipedia with year requirement: [{"function": "get_page_revisions", "parameters": {"title": "Page Title", "start_date": "2022-01-01", "end_date": "2022-12-31", "limit": 1}}, {"function": "get_page", "parameters": {"title": "Page Title", "revision_id": "<from previous call>"}}].\n'
+            retry_context += '3. Each subtask with an API tool (github_api, wikipedia_api, youtube_api, twitter_api, reddit_api, arxiv_api, wayback_api, google_maps_api) MUST include a \'parameters\' field as a LIST of dicts. Each dict must have "function" (method name) and "parameters" (method parameters). For single API calls: [{"function": "method_name", "parameters": {...}}]. For chained calls: [{"function": "method1", "parameters": {...}}, {"function": "method2", "parameters": {...}}]. For Wikipedia with year requirement: [{"function": "get_page_revisions", "parameters": {"title": "Page Title", "start_date": "2022-01-01", "end_date": "2022-12-31", "limit": 1}}, {"function": "get_page", "parameters": {"title": "Page Title", "revision_id": "<from previous call>"}}].\n'
 
         # Extract step classifications if available
         step_classifications_info = ''
@@ -233,31 +234,94 @@ Generate the smallest correct plan."""
                 # Extract parameters
                 parameters = task_data.get('parameters', {})
 
-                # Validate API tools have parameters with method
+                # Normalize API tool parameters to list format
                 if tool_type.endswith('_api'):
                     if not parameters:
                         self.logger.warning(
                             f'Subtask {task_data.get("id", f"step_{i}")} uses API tool {tool_type} but missing parameters. '
                             f'Parameters will need to be determined during execution.'
                         )
+                    elif isinstance(parameters, dict):
+                        # Convert single API call dict to list format
+                        if 'method' in parameters:
+                            # Old format: {"method": "...", ...params}
+                            method = parameters.pop('method')
+                            params = parameters
+                            parameters = [{'function': method, 'parameters': params}]
+                            self.logger.debug(
+                                f'Converted single API call to list format: {method}'
+                            )
+                        elif 'function' in parameters:
+                            # Already has function, wrap in list
+                            parameters = [parameters]
+                            self.logger.debug(
+                                'Wrapped API call with function in list format'
+                            )
+                        else:
+                            # No method/function, try to infer or keep as-is (will be handled later)
+                            self.logger.warning(
+                                f'Subtask {task_data.get("id", f"step_{i}")} API tool parameters missing "function" or "method". '
+                                f'Will attempt to infer during execution. Parameters: {parameters}'
+                            )
+                            # Wrap in list format anyway
+                            parameters = [{'function': None, 'parameters': parameters}]
                     elif isinstance(parameters, list):
-                        # List format for chained API calls
+                        # List format - validate and normalize each call
+                        normalized_list = []
                         for call_idx, call_spec in enumerate(parameters, 1):
                             if not isinstance(call_spec, dict):
                                 self.logger.warning(
                                     f'Subtask {task_data.get("id", f"step_{i}")} API call {call_idx} is not a dict: {call_spec}'
                                 )
-                            elif 'function' not in call_spec and 'method' not in call_spec:
+                                normalized_list.append(call_spec)
+                                continue
+
+                            # Normalize to {function, parameters} format
+                            if 'function' in call_spec:
+                                # Already in correct format
+                                if 'parameters' not in call_spec:
+                                    # Move all other keys to parameters
+                                    func = call_spec['function']
+                                    params = {
+                                        k: v
+                                        for k, v in call_spec.items()
+                                        if k != 'function'
+                                    }
+                                    normalized_list.append(
+                                        {'function': func, 'parameters': params}
+                                    )
+                                else:
+                                    normalized_list.append(call_spec)
+                            elif 'method' in call_spec:
+                                # Convert method to function
+                                method = call_spec['method']
+                                if 'parameters' in call_spec:
+                                    normalized_list.append(
+                                        {
+                                            'function': method,
+                                            'parameters': call_spec['parameters'],
+                                        }
+                                    )
+                                else:
+                                    # Move all other keys to parameters
+                                    params = {
+                                        k: v
+                                        for k, v in call_spec.items()
+                                        if k != 'method'
+                                    }
+                                    normalized_list.append(
+                                        {'function': method, 'parameters': params}
+                                    )
+                            else:
+                                # No function/method - will need to infer
                                 self.logger.warning(
-                                    f'Subtask {task_data.get("id", f"step_{i}")} API call {call_idx} missing "function" or "method" field. '
-                                    f'Call spec: {call_spec}'
+                                    f'Subtask {task_data.get("id", f"step_{i}")} API call {call_idx} missing "function" or "method". '
+                                    f'Will attempt to infer during execution.'
                                 )
-                    elif 'method' not in parameters:
-                        # Single API call format
-                        self.logger.warning(
-                            f'Subtask {task_data.get("id", f"step_{i}")} uses API tool {tool_type} but parameters missing "method" field. '
-                            f'Parameters: {parameters}'
-                        )
+                                normalized_list.append(
+                                    {'function': None, 'parameters': call_spec}
+                                )
+                        parameters = normalized_list
 
                 subtask.metadata = {
                     'tool': task_data.get('tool', 'unknown'),

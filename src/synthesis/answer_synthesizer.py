@@ -9,6 +9,7 @@ from ..llm import LLMService
 from ..models import Attachment
 from ..state import InformationStateManager
 from ..utils import extract_json_from_text
+from .result_summarizer import ResultSummarizer
 
 
 class AnswerSynthesizer:
@@ -37,6 +38,11 @@ class AnswerSynthesizer:
         self.MAX_REASONING_SECTION = 1200
         self.MAX_KNOWLEDGE_FACTS = 20
         self.MAX_FIELD_SNIPPET = 160
+
+        self.result_summarizer = ResultSummarizer(
+            max_context_per_subtask=self.MAX_CONTEXT_PER_SUBTASK,
+            max_field_snippet=self.MAX_FIELD_SNIPPET,
+        )
 
     def _extract_numeric_value(self, text: str) -> Optional[float]:
         """
@@ -180,110 +186,14 @@ class AnswerSynthesizer:
         """
         Produce a compact, high-signal summary of a subtask result prioritizing
         extracted fields used by synthesis. This greatly reduces token usage.
+
+        Args:
+            result: Result to summarize (dict or string).
+
+        Returns:
+            Compact summary string.
         """
-        if isinstance(result, dict):
-            lines: List[str] = []
-
-            # 1) Primary: extracted_counts
-            extracted_counts = result.get('extracted_counts') or []
-            if isinstance(extracted_counts, list) and extracted_counts:
-                for item in extracted_counts[:3]:
-                    value = item.get('value')
-                    ctx = self._truncate(
-                        item.get('context', ''), self.MAX_FIELD_SNIPPET
-                    )
-                    conf = item.get('confidence')
-                    conf_str = (
-                        f' (confidence: {conf:.2f})'
-                        if isinstance(conf, (int, float))
-                        else ''
-                    )
-                    lines.append(f'COUNT: {value}{conf_str} - {ctx}'.strip())
-
-            # 2) Secondary: llm_extraction
-            llm_extraction = result.get('llm_extraction') or {}
-            if (
-                isinstance(llm_extraction, dict)
-                and llm_extraction.get('extracted_value') is not None
-            ):
-                ev = llm_extraction.get('extracted_value')
-                conf = llm_extraction.get('confidence')
-                reas = self._truncate(
-                    llm_extraction.get('reasoning', ''), self.MAX_FIELD_SNIPPET
-                )
-                # Truncate context field to avoid including full page content
-                ctx = self._truncate(
-                    llm_extraction.get('context', ''), self.MAX_FIELD_SNIPPET
-                )
-                conf_str = (
-                    f' (confidence: {conf:.2f})'
-                    if isinstance(conf, (int, float))
-                    else ''
-                )
-                # Only include context if it's different from reasoning and adds value
-                if ctx and ctx != reas and len(ctx) > 10:
-                    lines.append(
-                        f'LLM_EXTRACT: {ev}{conf_str} - {reas} [context: {ctx}]'.strip()
-                    )
-                else:
-                    lines.append(f'LLM_EXTRACT: {ev}{conf_str} - {reas}'.strip())
-
-            # 3) Tertiary: numeric_data.counts
-            numeric_data = result.get('numeric_data') or {}
-            counts = numeric_data.get('counts') or []
-            if isinstance(counts, list) and counts:
-                for item in counts[:2]:
-                    value = item.get('value')
-                    ctx = self._truncate(
-                        item.get('context', ''), self.MAX_FIELD_SNIPPET
-                    )
-                    lines.append(f'REGEX_COUNT: {value} - {ctx}'.strip())
-
-            # 4) Image analysis (high priority for visual answers)
-            image_analysis = result.get('image_analysis')
-            if image_analysis and isinstance(image_analysis, str):
-                # Preserve image analysis prominently
-                image_analysis_summary = self._truncate(
-                    image_analysis, self.MAX_CONTEXT_PER_SUBTASK
-                )
-                lines.append(f'IMAGE_ANALYSIS: {image_analysis_summary}')
-
-            if lines:
-                return '\n'.join(lines[:6])
-
-            # Fallback: compact JSON dump, truncated
-            try:
-                compact = json.dumps(result, ensure_ascii=False, separators=(',', ':'))
-            except Exception:
-                compact = str(result)
-            return self._truncate(compact, self.MAX_CONTEXT_PER_SUBTASK)
-
-        # If it's a plain string, check for image analysis and preserve it
-        result_str = str(result)
-        image_analysis_marker = 'IMAGE ANALYSIS (from visual LLM):'
-
-        if image_analysis_marker in result_str:
-            # Extract image analysis section
-            marker_idx = result_str.find(image_analysis_marker)
-            text_before = result_str[:marker_idx].strip()
-            image_analysis = result_str[marker_idx:].strip()
-
-            # Truncate text before analysis, but preserve full image analysis
-            text_before_summary = self._truncate(
-                text_before, self.MAX_CONTEXT_PER_SUBTASK // 2
-            )
-            # Preserve image analysis (it's usually the key answer)
-            image_analysis_summary = self._truncate(
-                image_analysis, self.MAX_CONTEXT_PER_SUBTASK
-            )
-
-            if text_before_summary:
-                return f'{text_before_summary}\n\n{image_analysis_summary}'
-            else:
-                return image_analysis_summary
-
-        # If no image analysis, just truncate
-        return self._truncate(result_str, self.MAX_CONTEXT_PER_SUBTASK)
+        return self.result_summarizer.summarize(result, max_lines=6)
 
     def _build_requirements_str(self, explicit_requirements: List[str]) -> str:
         all_requirements = explicit_requirements or []

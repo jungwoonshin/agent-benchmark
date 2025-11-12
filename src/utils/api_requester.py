@@ -239,6 +239,24 @@ class WikipediaAPIRequester:
                 return None
 
             if revision_id:
+                # Ensure revision_id is valid (not empty string, None, or invalid)
+                try:
+                    # Convert to int and validate
+                    revision_id_int = int(revision_id)
+                    if revision_id_int <= 0:
+                        self.logger.warning(
+                            f'Invalid revision_id {revision_id} (must be positive), using current page'
+                        )
+                        revision_id = None
+                    else:
+                        revision_id = revision_id_int
+                except (ValueError, TypeError):
+                    self.logger.warning(
+                        f'Invalid revision_id {revision_id} (not an integer), using current page'
+                    )
+                    revision_id = None
+
+            if revision_id:
                 # Get specific revision with content
                 rev = page.revisions(
                     prop='ids|timestamp|content|user', limit=1, startid=revision_id
@@ -779,21 +797,6 @@ class UnifiedAPIRequester:
 
         try:
             return getattr(api, method)(**filtered_kwargs)
-        except TypeError as e:
-            # Specifically handle unexpected keyword argument errors
-            error_msg = str(e)
-            if 'unexpected keyword argument' in error_msg.lower():
-                # Extract the parameter name from the error message if possible
-                self.logger.warning(
-                    f'Unexpected keyword argument error for {api_name}.{method}(): {e}. '
-                    f'This should have been filtered by _filter_parameters. '
-                    f'Provided kwargs: {list(kwargs.keys())}, '
-                    f'Filtered kwargs: {list(filtered_kwargs.keys())}'
-                )
-            else:
-                # Other TypeError (e.g., missing required arguments)
-                self.logger.error(f'TypeError calling {api_name}.{method}: {e}')
-            return None
         except Exception as e:
             self.logger.error(f'Error calling {api_name}.{method}: {e}', exc_info=True)
             return None
@@ -803,7 +806,6 @@ class UnifiedAPIRequester:
     ) -> Dict[str, Any]:
         """
         Filter out parameters that are not accepted by the method signature.
-        Handles methods with **kwargs (which accept all parameters) and other edge cases.
 
         Args:
             api: API instance
@@ -814,57 +816,26 @@ class UnifiedAPIRequester:
         Returns:
             Filtered keyword arguments
         """
-        try:
-            method_obj = getattr(api, method)
-            sig = inspect.signature(method_obj)
+        method_obj = getattr(api, method)
+        sig = inspect.signature(method_obj)
+        param_names = set(sig.parameters.keys())
 
-            # Check if method accepts **kwargs (var_keyword parameter)
-            accepts_kwargs = False
-            param_names = set()
+        # Remove 'self' if present (instance method)
+        param_names.discard('self')
 
-            for param_name, param in sig.parameters.items():
-                # Skip 'self' parameter
-                if param_name == 'self':
-                    continue
+        filtered_kwargs = {}
+        removed_params = []
 
-                # Check if this parameter is **kwargs (var_keyword)
-                if param.kind == inspect.Parameter.VAR_KEYWORD:
-                    accepts_kwargs = True
-                    # If method accepts **kwargs, it accepts all parameters
-                    break
-                else:
-                    param_names.add(param_name)
+        for key, value in kwargs.items():
+            if key in param_names:
+                filtered_kwargs[key] = value
+            else:
+                removed_params.append(key)
 
-            # If method accepts **kwargs, pass all parameters
-            if accepts_kwargs:
-                return kwargs
-
-            # Otherwise, filter to only accepted parameters
-            filtered_kwargs = {}
-            removed_params = []
-
-            for key, value in kwargs.items():
-                if key in param_names:
-                    filtered_kwargs[key] = value
-                else:
-                    removed_params.append(key)
-
-            if removed_params:
-                self.logger.debug(
-                    f'Removed unsupported parameters from {api_name}.{method}(): {", ".join(removed_params)}. '
-                    f'Accepted parameters: {", ".join(sorted(param_names))}'
-                )
-
-            return filtered_kwargs
-
-        except (AttributeError, ValueError, TypeError) as e:
-            # If we can't inspect the signature, try to be conservative
-            # but still attempt the call - the outer try-except will handle any errors
-            self.logger.warning(
-                f'Could not inspect signature for {api_name}.{method}(): {e}. '
-                f'Attempting call with all provided parameters. '
-                f'If this fails, the error will be caught and logged.'
+        if removed_params:
+            self.logger.debug(
+                f'Removed unsupported parameters from {api_name}.{method}(): {", ".join(removed_params)}. '
+                f'Accepted parameters: {", ".join(sorted(param_names))}'
             )
-            # Return kwargs as-is - let the method call handle validation
-            # The outer try-except in request() will catch TypeError for unexpected kwargs
-            return kwargs
+
+        return filtered_kwargs

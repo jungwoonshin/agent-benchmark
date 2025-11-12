@@ -21,7 +21,8 @@ def load_validation_cases(
                  those specific cases instead of first num_cases.
 
     Returns:
-        List of selected validation cases
+        List of tuples (case_dict, original_index) where original_index is the
+        original question number from the validation file (1-indexed)
     """
     logging.info(f'Loading validation cases from {file_path}')
     with open(file_path, 'r') as f:
@@ -35,7 +36,8 @@ def load_validation_cases(
             raise ValueError(
                 f'Invalid indexes: {invalid_indexes}. Valid range is 0-{max_index}'
             )
-        selected_cases = [cases[idx] for idx in indexes]
+        # Return tuples of (case, original_index) where original_index is 1-indexed
+        selected_cases = [(cases[idx], idx + 1) for idx in indexes]
         logging.info(
             f'Loaded {len(cases)} total cases, selected {len(selected_cases)} '
             f'cases at indexes: {indexes}'
@@ -43,7 +45,8 @@ def load_validation_cases(
         return selected_cases
     else:
         logging.info(f'Loaded {len(cases)} total cases, using first {num_cases}')
-        return cases[:num_cases]
+        # Return tuples of (case, original_index) where original_index is 1-indexed
+        return [(case, idx + 1) for idx, case in enumerate(cases[:num_cases])]
 
 
 def test_case(
@@ -199,8 +202,8 @@ def main():
 
     # Test each case
     results = []
-    for i, case in enumerate(cases, 1):
-        result = test_case(solver, case, i)
+    for case, original_index in cases:
+        result = test_case(solver, case, original_index)
         results.append(result)
 
     # Summary
